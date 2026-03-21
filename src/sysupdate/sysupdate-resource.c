@@ -435,10 +435,6 @@ static int process_magic_file(
 
         usec_t best_before;
         r = parse_calendar_date(e, &best_before);
-        if (r < 0) {
-                log_warning_errno(r, "Found best before marker with an invalid date, ignoring: %s", fn);
-                return 0;
-        }
 
         usec_t nw = now(CLOCK_REALTIME);
         if (best_before < nw) {

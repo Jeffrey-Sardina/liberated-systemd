@@ -1,3 +1,9 @@
+# Liberated `systemd`
+Mass surveillance is bad, acctually. So here's a fork of `systemd` with surveillance enablement removed. However you use this, or do not, is your choice and yours alone.
+
+
+The original readme is included below.
+
 ![Systemd](http://brand.systemd.io/assets/page-logo.png)
 
 System and Service Manager
