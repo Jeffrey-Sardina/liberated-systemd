@@ -7,6 +7,9 @@ The purpose of Liberated `systemd` is to do exactly one thing, and do it well: r
 
 What this also means is that Liberated `systemd` is not a divergent development project. It will not introduce new features, correct bugs or security issues, or implement optimizations. If you want to contribute to any of those things, teh correct way to do so is to raise a PR against the base `systemd/systemd` repo. This repo exists only to remove surveillance enablement.
 
+## How often is this updates (or, "why is Liberated `systemd` behind by X commits?)
+Liberated `systemd` will be updated at least weekly. I hope to automate this process soon, at which point updates will be near real-time. (If you want to help automate this, please feel free to raise a PR against  https://github.com/Jeffrey-Sardina/systemd-suite, which is where I am implementing testing and update automation).
+
 ## How is Liberated `systemd` implemented?
 It's quite simple: `systemd`, very nicely, has atomic comits. There is exactly one commit (https://github.com/systemd/systemd/commit/acb6624fa19ddd68f9433fb0838db119fe18c3ed) that added in all tooling (both functional and data-wise) needed to enable age verification. I reversed this commit, and have kept all other changes since.
 
