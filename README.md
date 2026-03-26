@@ -7,11 +7,49 @@ The purpose of Liberated `systemd` is to do exactly one thing, and do it well: r
 
 What this also means is that Liberated `systemd` is not a divergent development project. It will not introduce new features, correct bugs or security issues, or implement optimizations. If you want to contribute to any of those things, the correct way to do so is to raise a PR against the base `systemd/systemd` repo. This repo exists only to remove surveillance enablement.
 
+## Distribution/users maintainers, please read
+
+Systemd choice a path to centralizing the "age-verification" process.
+
+This itself is a little part of the well-planned operation to sabotage whole OpenSource.
+
+At first, the distributions like Ubuntu and RHEL, will implement systemd age-check integration.
+
+The other distros like Arch, Nix etc, may follow this, for software-compatibility.
+
+**HUGE BUT!**
+
+This inevitable creates much easier adoption process in whole linux community.
+
+And the governments acknowledged it.
+
+They will inevitable start implementing "phase 2", forcing the systemd to integrate hardware based age check (like TPM?).
+
+Unlike a soft-one, the hardware level will completely handle the internal crypto-based logic, accept the incoming device-encrypted private key for proving personal data integrity with no way for user to escape forger it.
+
+This sabotages the whole computing, because after implementing all of that, the software will know not only your age, but obviously:
+- Unique identity key associated with you
+- Your country
+- Your passpord ID
+- etc.
+
+And will inevitable use it for survelliance, geo-restrictions, geo-based attacks and et cetera.
+
+The worst of that, is that systemd decided to assist in implementing this miserable future for all of us.
+
+We understand, that many distributions are dependent on systemd and cannot simply move out of it.
+
+We suggest such distribution users & maintainers to:
+- Use this fork instead of systemd by default
+- Assist in this fork development
+- Unity and communicate for future action coordination
+- Protest against any form of age-verification
+
 ## How often is this updated (or, "why is Liberated `systemd` behind by X commits?")
 Liberated `systemd` will be updated at least weekly. I hope to automate this process soon, at which point updates will be near real-time. (If you want to help automate this, please feel free to raise a PR against  https://github.com/Jeffrey-Sardina/systemd-suite, which is where I am implementing testing and update automation).
 
 ## How is Liberated `systemd` implemented?
-It's quite simple: `systemd`, very nicely, has atomic comits. There is exactly one commit (https://github.com/systemd/systemd/commit/acb6624fa19ddd68f9433fb0838db119fe18c3ed) that added in all tooling (both functional and data-wise) needed to enable age verification. I reversed this commit, and have kept all other changes since.
+It's quite simple: `systemd`, very nicely, has atomic commits. There is exactly one commit (https://github.com/systemd/systemd/commit/acb6624fa19ddd68f9433fb0838db119fe18c3ed) that added in all tooling (both functional and data-wise) needed to enable age verification. I reversed this commit, and have kept all other changes since.
 
 Since age collection is not needed for any aspect of `systemd`, this does not affect other aspects of `systemd`. Any downstream systems that attempt to call age-verifiaction-related functions on Liberated `systemd` will therefore encounter an error. This is done bey design. This is also why I have not simply created a "default age" as a lie -- it's about denying applications the ability to assume the presence of an API that enables mass surveillance.
 
