@@ -266,9 +266,6 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (!sd_id128_is_null(hr->uuid))
                 printf("        UUID: " SD_ID128_UUID_FORMAT_STR "\n", SD_ID128_FORMAT_VAL(hr->uuid));
 
-        if (hr->real_name && !streq(hr->real_name, hr->user_name))
-                printf("   Real Name: %s\n", hr->real_name);
-
         hd = user_record_home_directory(hr);
         if (hd) {
                 printf("   Directory: %s", hd);

@@ -737,7 +737,6 @@ static int synthetic_foreign_user_build(uid_t foreign_uid, UserRecord **ret) {
         return user_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR_STRING("userName", un),
-                        SD_JSON_BUILD_PAIR_STRING("realName", rn),
                         SD_JSON_BUILD_PAIR_UNSIGNED("uid", FOREIGN_UID_BASE + foreign_uid),
                         SD_JSON_BUILD_PAIR_UNSIGNED("gid", FOREIGN_UID_BASE + foreign_uid),
                         SD_JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
@@ -765,7 +764,6 @@ static int synthetic_numeric_user_build(uid_t uid, UserRecord **ret) {
         return user_record_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR_STRING("userName", un),
-                        SD_JSON_BUILD_PAIR_STRING("realName", rn),
                         SD_JSON_BUILD_PAIR_UNSIGNED("uid", uid),
                         SD_JSON_BUILD_PAIR_STRING("disposition", "system"));
 }

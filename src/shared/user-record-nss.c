@@ -73,22 +73,6 @@ int nss_passwd_to_user_record(
          * something we can output in /etc/passwd compatible format, since these are record separators
          * there. We normally refuse that, but we need to maintain compatibility with arbitrary NSS modules,
          * hence let's do what glibc does: mangle the data to fit the format. */
-        if (isempty(pwd->pw_gecos) || streq_ptr(pwd->pw_gecos, hr->user_name))
-                hr->real_name = mfree(hr->real_name);
-        else if (valid_gecos(pwd->pw_gecos)) {
-                r = free_and_strdup(&hr->real_name, pwd->pw_gecos);
-                if (r < 0)
-                        return r;
-        } else {
-                _cleanup_free_ char *mangled = NULL;
-
-                mangled = mangle_gecos(pwd->pw_gecos);
-                if (!mangled)
-                        return -ENOMEM;
-
-                free_and_replace(hr->real_name, mangled);
-        }
-
         r = free_and_strdup(&hr->home_directory, utf8_only(empty_to_null(pwd->pw_dir)));
         if (r < 0)
                 return r;
@@ -152,7 +136,6 @@ int nss_passwd_to_user_record(
                         SD_JSON_BUILD_PAIR_STRING("userName", hr->user_name),
                         SD_JSON_BUILD_PAIR_UNSIGNED("uid", hr->uid),
                         SD_JSON_BUILD_PAIR_UNSIGNED("gid", user_record_gid(hr)),
-                        SD_JSON_BUILD_PAIR_CONDITION(!!hr->real_name, "realName", SD_JSON_BUILD_STRING(hr->real_name)),
                         SD_JSON_BUILD_PAIR_CONDITION(!!hr->home_directory, "homeDirectory", SD_JSON_BUILD_STRING(hr->home_directory)),
                         SD_JSON_BUILD_PAIR_CONDITION(!!hr->shell, "shell", SD_JSON_BUILD_STRING(hr->shell)),
                         SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(hr->hashed_password), "privileged", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_STRV("hashedPassword", hr->hashed_password))),

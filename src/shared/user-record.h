@@ -261,7 +261,6 @@ typedef struct UserRecord {
         char *user_name_and_realm_auto; /* the user_name field concatenated with '@' and the realm, if the latter is defined */
         char **aliases;
         sd_id128_t uuid;
-        char *real_name;
         char *email_address;
         char *password_hint;
         char *icon_name;
@@ -437,7 +436,6 @@ const char* user_record_image_path(UserRecord *h);
 unsigned long user_record_mount_flags(UserRecord *h);
 const char* user_record_cifs_user_name(UserRecord *h);
 const char* user_record_shell(UserRecord *h);
-const char* user_record_real_name(UserRecord *h);
 bool user_record_luks_discard(UserRecord *h);
 bool user_record_luks_offline_discard(UserRecord *h);
 const char* user_record_luks_cipher(UserRecord *h);

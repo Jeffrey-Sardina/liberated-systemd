@@ -150,7 +150,6 @@ static UserRecord* user_record_free(UserRecord *h) {
         free(h->realm);
         free(h->user_name_and_realm_auto);
         strv_free(h->aliases);
-        free(h->real_name);
         free(h->email_address);
         erase_and_free(h->password_hint);
         free(h->location);
@@ -1498,7 +1497,7 @@ int user_group_record_mangle(
                        "secret",
 
                        /* Personally Identifiable Information (PII) — avoid leaking in logs */
-                       "realName",
+                       
                        "location",
                        "emailAddress")
                 sd_json_variant_sensitive(sd_json_variant_by_key(v, key));
@@ -1591,7 +1590,6 @@ int user_record_load(UserRecord *h, sd_json_variant *v, UserRecordLoadFlags load
                 { "uuid",                       SD_JSON_VARIANT_STRING,        sd_json_dispatch_id128,               offsetof(UserRecord, uuid),                          0              },
                 { "blobDirectory",              SD_JSON_VARIANT_STRING,        json_dispatch_path,                   offsetof(UserRecord, blob_directory),                SD_JSON_STRICT },
                 { "blobManifest",               SD_JSON_VARIANT_OBJECT,        dispatch_blob_manifest,               offsetof(UserRecord, blob_manifest),                 0              },
-                { "realName",                   SD_JSON_VARIANT_STRING,        json_dispatch_gecos,                  offsetof(UserRecord, real_name),                     0              },
                 { "emailAddress",               SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,              offsetof(UserRecord, email_address),                 SD_JSON_STRICT },
                 { "iconName",                   SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,              offsetof(UserRecord, icon_name),                     SD_JSON_STRICT },
                 { "location",                   SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,              offsetof(UserRecord, location),                      0              },
@@ -1888,12 +1886,6 @@ const char* user_record_shell(UserRecord *h) {
                 return is_nologin_shell(shell) ? NOLOGIN : h->fallback_shell;
 
         return shell;
-}
-
-const char* user_record_real_name(UserRecord *h) {
-        assert(h);
-
-        return h->real_name ?: h->user_name;
 }
 
 bool user_record_luks_discard(UserRecord *h) {
@@ -2227,7 +2219,6 @@ const char** user_record_self_modifiable_fields(UserRecord *h) {
          * a given system. */
         static const char *const default_fields[] = {
                 /* For display purposes */
-                "realName",
                 "emailAddress", /* Just the $EMAIL env var */
                 "iconName",
                 "location",
@@ -2818,7 +2809,6 @@ bool user_record_match(UserRecord *u, const UserDBMatch *match) {
                 const char* names[] = {
                         u->user_name,
                         user_record_user_name_and_realm(u),
-                        u->real_name,
                         u->email_address,
                         u->cifs_user_name,
                 };
