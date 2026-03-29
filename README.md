@@ -1,3 +1,45 @@
+# Liberated `systemd`
+
+Mass surveillance is bad, actually. So here's a fork of `systemd` with surveillance enablement removed, which will be kept up-to-date with other changes in `systemd/main`. However you use this, or do not, is your choice and yours alone.
+
+## Purpose
+The purpose of Liberated `systemd` is to do exactly one thing, and do it well: removing surveillance enablement from base `systemd`. Specifically, here is what I mean by surveillance: **surveillance is the tooling that enables or facilitates collection of any personal information that does not arise from technical needs for `systemd`**. The primary offender of this is, of course, age verification. If `systemd` later adds in support for other surveillance mechanisms, those will also be removed.
+
+What this also means is that Liberated `systemd` is not a divergent development project. It will not introduce new features, correct bugs or security issues, or implement optimizations. If you want to contribute to any of those things, the correct way to do so is to raise a PR against the base `systemd/systemd` repo. This repo exists only to remove surveillance enablement.
+
+## How often is this updated (or, "why is Liberated `systemd` behind by X commits?")
+Liberated `systemd` will be updated at least weekly. I hope to automate this process soon, at which point updates will be near real-time. (If you want to help automate this, please feel free to raise a PR against  https://github.com/Jeffrey-Sardina/systemd-suite, which is where I am implementing testing and update automation).
+
+## How is Liberated `systemd` implemented?
+It's quite simple: `systemd`, very nicely, has atomic commits. There is exactly one commit (https://github.com/systemd/systemd/commit/acb6624fa19ddd68f9433fb0838db119fe18c3ed) that added in all tooling (both functional and data-wise) needed to enable age verification. I reversed this commit, and have kept all other changes since.
+
+Since age collection is not needed for any aspect of `systemd`, this does not affect other aspects of `systemd`. Any downstream systems that attempt to call age-verification-related functions on Liberated `systemd` will therefore encounter an error. This is done by design. This is also why I have not simply created a "default age" as a lie -- it's about denying applications the ability to assume the presence of an API that enables mass surveillance.
+
+## How is Liberated `systemd` tested?
+To see how I run testing for this fork, see: https://github.com/Jeffrey-Sardina/systemd-suite. (In short, I run their CI pipeline before pushing changes.)
+
+## Where else can I find Liberated `systemd`?
+In order to allow users to avoid MicroSlop's ecosystem, this repository is made available via Gitea and Codeberg, on top of GitHub. The contents of all repositories are identical, and updated at the same time.
+- github - https://github.com/Jeffrey-Sardina/systemd
+- codeberg (mirror) - https://codeberg.org/Jeffrey-Sardina/systemd
+- gitea (mirror) - https://gitea.com/Jeffrey-Sardina/systemd
+
+## Have any other changes been made?
+Only in meta-data files. Specifically, aside from code changes needed to liberate systemd from surveillance tooling, I have edited:
+- this README (`/README.md`)
+- the Code of Conduct (`docs/CODE_OF_CONDUCT.md`)
+    - the section giving contacts of base `systemd` devs has been removed -- since the moderators of base `systemd` are, obviously, not a part of Liberated `systemd`.
+- the Contributing page (`docs/CONTRIBUTING.md`)
+    - this has been edited to explain how to contribute to Liberated `systemd`.
+- the Security page (`docs/SECURITY.md`)
+    - this has been edited to direct all security-related concerns to base `systemd`.
+- the Citation file (`CITATION.cff`)
+    - this has been edited to correctly identify this repo as Liberated `systemd`, a fork of `systemd/systemd`.
+
+The original `systemd` readme is included below for reference.
+
+---
+
 ![Systemd](http://brand.systemd.io/assets/page-logo.png)
 
 System and Service Manager
