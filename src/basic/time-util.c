@@ -1892,3 +1892,47 @@ TimestampStyle timestamp_style_from_string(const char *s) {
                 return TIMESTAMP_US_UTC;
         return t;
 }
+
+int parse_calendar_date_full(const char *s, bool allow_pre_epoch, usec_t *ret_usec, struct tm *ret_tm) {
+        struct tm parsed_tm = {}, copy_tm;
+        const char *k;
+        int r;
+
+        assert(s);
+
+        k = strptime(s, "%Y-%m-%d", &parsed_tm);
+        if (!k || *k)
+                return -EINVAL;
+
+        copy_tm = parsed_tm;
+
+        usec_t usec = USEC_INFINITY;
+
+        if (allow_pre_epoch) {
+                /* This part of the function was for birthday surveillance. It therefore must be removed.
+                 * This function does have legitimate uses, however, so we don't delete the whole thing .*/
+                return 0;
+        } else {
+                r = mktime_or_timegm_usec(&copy_tm, /* utc= */ true, &usec);
+                if (r < 0)
+                        return r;
+        }
+
+        /* Refuse non-normalized dates, e.g. Feb 30 */
+        if (copy_tm.tm_mday != parsed_tm.tm_mday ||
+            copy_tm.tm_mon  != parsed_tm.tm_mon  ||
+            copy_tm.tm_year != parsed_tm.tm_year)
+                return -EINVAL;
+
+        if (ret_usec)
+                *ret_usec = usec;
+        if (ret_tm) {
+                /* Reset to unset, then fill in only the date fields we parsed and validated */
+                *ret_tm = BIRTH_DATE_UNSET;
+                ret_tm->tm_mday = parsed_tm.tm_mday;
+                ret_tm->tm_mon = parsed_tm.tm_mon;
+                ret_tm->tm_year = parsed_tm.tm_year;
+        }
+
+        return 0;
+}
