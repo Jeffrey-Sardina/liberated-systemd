@@ -347,6 +347,10 @@ executables += [
                 'dependencies' : libm,
         },
         test_template + {
+                'sources' : files('test-kexec.c'),
+                'link_with' : [libshared],
+        },
+        test_template + {
                 'sources' : files('test-libcrypt-util.c'),
                 'conditions' : ['HAVE_LIBCRYPT'],
                 'timeout' : 120,
@@ -492,6 +496,9 @@ executables += [
         test_template + {
                 'sources' : files('test-varlink-idl.c'),
                 'dependencies' : threads,
+        },
+        core_test_template + {
+                'sources' : files('test-varlink-idl-unit.c'),
         },
         test_template + {
                 'sources' : files('test-watchdog.c'),

@@ -11,6 +11,16 @@ CHANGES WITH 261 in spe:
           has been repurposed as a standalone switch (without argument) to select
           the user service manager scope, matching --system.
 
+        * Several configuration fields in the io.systemd.Unit varlink interface
+          that were previously exposed as plain strings have been converted to
+          proper enum types. This adds type safety and IDL-level validation.
+          The output wire format now uses underscores instead of dashes and
+          plus signs in enum values (e.g. "tty-force" becomes "tty_force",
+          "kmsg+console" becomes "kmsg_console"). The previous use of plain
+          strings for these well-defined enumerations is considered a bug.
+          Affected enum types: ExecInputType, ExecOutputType, ProtectHome,
+          CGroupController, CollectMode, EmergencyAction, JobMode.
+
         * It was discovered that systemd-stub does not measure all the events
           it measures to the TPM to the hardware CC registers (e.g. Intel TDX
           RTMRs) using EFI_CC_MEASUREMENT_PROTOCOL. In particular, devicetree,
@@ -19,6 +29,13 @@ CHANGES WITH 261 in spe:
           register values are now changed. This may need to be reflected in the
           attestation environments which use hardware CC registers and not the
           TPM quote.
+
+        * systemd-nspawn gained a new --restrict-address-families= option (and
+          corresponding RestrictAddressFamilies= setting in .nspawn files) to
+          restrict which socket address families may be used in the container.
+          This is currently opt-in. In a future version, the default will be
+          changed to restrict socket address families to AF_INET, AF_INET6 and
+          AF_UNIX.
 
         New features:
 
