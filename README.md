@@ -1,13 +1,12 @@
 # Liberated `systemd`
-
 Mass surveillance is bad, actually. So here's a fork of `systemd` with surveillance enablement removed, which will be kept up-to-date with other changes in `systemd/main`. However you use this, or do not, is your choice and yours alone.
+
+Note: https://github.com/Jeffrey-Sardina/liberated-systemd and https://github.com/Jeffrey-Sardina/systemd are interchangeable aliases. Most documenation refers to the latter for consistency, but either may be used.
 
 ## Purpose
 The purpose of Liberated `systemd` is to do exactly one thing, and do it well: removing surveillance enablement from base `systemd`. Specifically, here is what I mean by surveillance: **surveillance is the tooling that enables or facilitates collection of any personal information that does not arise from technical needs for `systemd`**. The primary offender of this is, of course, age verification. If `systemd` later adds in support for other surveillance mechanisms, those will also be removed.
 
 What this also means is that Liberated `systemd` is not a divergent development project. It will not introduce new features, correct bugs or security issues, or implement optimizations. If you want to contribute to any of those things, the correct way to do so is to raise a PR against the base `systemd/systemd` repo. This repo exists only to remove surveillance enablement.
-
-Note: https://github.com/Jeffrey-Sardina/liberated-systemd and https://github.com/Jeffrey-Sardina/systemd are interchangeable aliases. Most documenation refers to the latter for consistency, but either may be used.
 
 ## Installation
 Detailed blog post: https://medium.com/@jeffrey.sardina/installing-liberating-systemd-a-guide-by-the-author-2a9823192dd3
