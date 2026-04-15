@@ -44,7 +44,7 @@ Then, we pull and build Liberated systemd from source:
 
 ```bash
 # pull Liberated systemd source code
-git clone https://github.com/Jeffrey-Sardina/liberated-systemd.git 
+git clone https://github.com/Jeffrey-Sardina/liberated-systemd.git
 
 # pull mkosi -- latest version
 git clone https://github.com/systemd/mkosi.git
