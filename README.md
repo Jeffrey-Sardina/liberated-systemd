@@ -7,6 +7,8 @@ The purpose of Liberated `systemd` is to do exactly one thing, and do it well: r
 
 What this also means is that Liberated `systemd` is not a divergent development project. It will not introduce new features, correct bugs or security issues, or implement optimizations. If you want to contribute to any of those things, the correct way to do so is to raise a PR against the base `systemd/systemd` repo. This repo exists only to remove surveillance enablement.
 
+Note: https://github.com/Jeffrey-Sardina/liberated-systemd and https://github.com/Jeffrey-Sardina/systemd are interchangeable aliases. Most documenation refers to the latter for consistency, but either may be used.
+
 ## Installation
 Detailed blog post: https://medium.com/@jeffrey.sardina/installing-liberating-systemd-a-guide-by-the-author-2a9823192dd3
 
@@ -107,7 +109,7 @@ In order to allow users to avoid MicroSlop's ecosystem, this repository is made 
 - codeberg (mirror) - https://codeberg.org/Jeffrey-Sardina/systemd
 - gitea (mirror) - https://gitea.com/Jeffrey-Sardina/systemd
 
-Note that https://github.com/Jeffrey-Sardina/systemd and https://github.com/Jeffrey-Sardina/liberated-systemd are fully interchangeable aliases. https://github.com/Jeffrey-Sardina/liberated-systemd was created to allow the repo to be indexed on search engines. Both point to the same repo, and neither URL will expire.
+Note that https://github.com/Jeffrey-Sardina/systemd and https://github.com/Jeffrey-Sardina/liberated-systemd are fully interchangeable aliases. https://github.com/Jeffrey-Sardina/liberated-systemd was created to allow the repo to be indexed on search engines. Both point to the same repo.
 
 If you are interested, you can find the Liberated `systemd` dev log here: https://github.com/Jeffrey-Sardina/systemd-suite/blob/main/DEV-LOG.md.
 
