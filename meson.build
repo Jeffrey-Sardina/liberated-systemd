@@ -1156,8 +1156,8 @@ libmount_cflags = libmount.partial_dependency(includes: true, compile_args: true
 
 libfdisk = dependency('fdisk',
                       version : '>= 2.32',
-                      disabler : true,
                       required : get_option('fdisk'))
+libfdisk_cflags = libfdisk.partial_dependency(includes: true, compile_args: true)
 conf.set10('HAVE_LIBFDISK', libfdisk.found())
 
 # This prefers pwquality if both are enabled or auto.
@@ -1296,6 +1296,7 @@ endforeach
 libcurl = dependency('libcurl',
                      version : '>= 7.32.0',
                      required : get_option('libcurl'))
+libcurl_cflags = libcurl.partial_dependency(includes: true, compile_args: true)
 conf.set10('HAVE_LIBCURL', libcurl.found())
 conf.set10('CURL_NO_OLDIES', conf.get('BUILD_MODE_DEVELOPER') == 1)
 

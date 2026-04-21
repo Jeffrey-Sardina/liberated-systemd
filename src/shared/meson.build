@@ -53,6 +53,7 @@ shared_sources = files(
         'cryptsetup-fido2.c',
         'cryptsetup-tpm2.c',
         'cryptsetup-util.c',
+        'curl-util.c',
         'daemon-util.c',
         'data-fd-util.c',
         'dev-setup.c',
@@ -78,6 +79,7 @@ shared_sources = files(
         'extension-util.c',
         'factory-reset.c',
         'facts.c',
+        'fdisk-util.c',
         'fdset.c',
         'fido2-util.c',
         'find-esp.c',
@@ -396,9 +398,11 @@ libshared_deps = [threads,
                   libbpf_cflags,
                   libcrypt_cflags,
                   libcryptsetup_cflags,
+                  libcurl_cflags,
                   libdl,
                   libdw_cflags,
                   libelf_cflags,
+                  libfdisk_cflags,
                   libfido2_cflags,
                   libgcrypt_cflags,
                   libidn2_cflags,
@@ -447,30 +451,3 @@ libshared = shared_library(
                         userspace],
         install : true,
         install_dir : pkglibdir)
-
-shared_fdisk_sources = files('fdisk-util.c')
-
-libshared_fdisk = static_library(
-        'shared-fdisk',
-        shared_fdisk_sources,
-        include_directories : includes,
-        implicit_include_directories : false,
-        dependencies : [libfdisk,
-                        userspace],
-        c_args : ['-fvisibility=default'],
-        build_by_default : false)
-
-# A small shared file that is linked into a few places.
-# It is not part of libshared because this code needs libcurl and
-# we don't want to link libshared to libcurl.
-if conf.get('HAVE_LIBCURL') == 1
-        libcurlutil_static = static_library(
-                'curl-util',
-                'curl-util.c',
-                implicit_include_directories : false,
-                dependencies : [userspace, libcurl],
-                include_directories : includes,
-                build_by_default : false)
-else
-        libcurlutil_static = []
-endif

@@ -205,6 +205,7 @@ int verb_unlink(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
         r = acquire_esp(/* unprivileged_mode= */ false,
                         /* graceful= */ false,
+                        /* ret_fd= */ NULL,
                         /* ret_part= */ NULL,
                         /* ret_pstart= */ NULL,
                         /* ret_psize= */ NULL,
@@ -217,6 +218,7 @@ int verb_unlink(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
         r = acquire_xbootldr(
                         /* unprivileged_mode= */ false,
+                        /* ret_fd= */ NULL,
                         /* ret_uuid= */ NULL,
                         &xbootldr_devid);
         if (r == -EACCES)
@@ -227,6 +229,7 @@ int verb_unlink(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(boot_config_free) BootConfig config = BOOT_CONFIG_NULL;
         r = boot_config_load_and_select(
                         &config,
+                        arg_root,
                         arg_esp_path,
                         esp_devid,
                         arg_xbootldr_path,

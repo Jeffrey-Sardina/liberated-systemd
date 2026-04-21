@@ -15,12 +15,14 @@
 #include "bootctl-status.h"
 #include "bootctl-uki.h"
 #include "bootctl-unlink.h"
+#include "bootctl-util.h"
 #include "build.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
 #include "efi-loader.h"
 #include "efivars.h"
 #include "escape.h"
+#include "fd-util.h"
 #include "find-esp.h"
 #include "format-table.h"
 #include "image-policy.h"
@@ -51,6 +53,7 @@ bool arg_print_esp_path = false;
 bool arg_print_dollar_boot_path = false;
 bool arg_print_loader_path = false;
 bool arg_print_stub_path = false;
+bool arg_print_efi_architecture = false;
 unsigned arg_print_root_device = 0;
 int arg_touch_variables = -1;
 bool arg_install_random_seed = true;
@@ -100,16 +103,16 @@ static const char* const install_source_table[_INSTALL_SOURCE_MAX] = {
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(install_source, InstallSource);
 
-int acquire_esp(
-                int unprivileged_mode,
+int acquire_esp(int unprivileged_mode,
                 bool graceful,
+                int *ret_fd,
                 uint32_t *ret_part,
                 uint64_t *ret_pstart,
                 uint64_t *ret_psize,
                 sd_id128_t *ret_uuid,
                 dev_t *ret_devid) {
 
-        char *np;
+        _cleanup_free_ char *np = NULL;
         int r;
 
         /* Find the ESP, and log about errors. Note that find_esp_and_warn() will log in all error cases on
@@ -118,7 +121,7 @@ int acquire_esp(
          * we simply eat up the error here, so that --list and --status work too, without noise about
          * this). */
 
-        r = find_esp_and_warn_full(arg_root, arg_esp_path, unprivileged_mode, &np, ret_part, ret_pstart, ret_psize, ret_uuid, ret_devid);
+        r = find_esp_and_warn_full(arg_root, arg_esp_path, unprivileged_mode, &np, ret_fd, ret_part, ret_pstart, ret_psize, ret_uuid, ret_devid);
         if (r == -ENOKEY) {
                 if (graceful)
                         return log_full_errno(arg_quiet ? LOG_DEBUG : LOG_INFO, r,
@@ -134,27 +137,44 @@ int acquire_esp(
         free_and_replace(arg_esp_path, np);
         log_debug("Using EFI System Partition at %s.", arg_esp_path);
 
-        return 0;
+        return 1; /* for symmetry with acquire_xbootldr() below: found */
 }
 
 int acquire_xbootldr(
                 int unprivileged_mode,
+                int *ret_fd,
                 sd_id128_t *ret_uuid,
                 dev_t *ret_devid) {
 
-        char *np;
         int r;
 
-        r = find_xbootldr_and_warn_full(arg_root, arg_xbootldr_path, unprivileged_mode, &np, ret_uuid, ret_devid);
-        if (r == -ENOKEY || path_equal(np, arg_esp_path)) {
-                log_debug("Didn't find an XBOOTLDR partition, using the ESP as $BOOT.");
+        _cleanup_free_ char *np = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        r = find_xbootldr_and_warn_full(
+                        arg_root,
+                        arg_xbootldr_path,
+                        unprivileged_mode,
+                        &np,
+                        ret_fd ? &fd : NULL,
+                        ret_uuid,
+                        ret_devid);
+        if (r == -ENOKEY || (r >= 0 && arg_esp_path && path_equal(np, arg_esp_path))) {
+
+                if (arg_esp_path)
+                        log_debug("Didn't find an XBOOTLDR partition, using the ESP as $BOOT.");
+                else
+                        log_debug("Found neither an XBOOTLDR partition, nor an ESP.");
+
                 arg_xbootldr_path = mfree(arg_xbootldr_path);
 
+                if (ret_fd)
+                        *ret_fd = -EBADF;
                 if (ret_uuid)
                         *ret_uuid = SD_ID128_NULL;
                 if (ret_devid)
                         *ret_devid = 0;
-                return 0;
+
+                return 0; /* not found */
         }
         if (r < 0)
                 return r;
@@ -162,7 +182,10 @@ int acquire_xbootldr(
         free_and_replace(arg_xbootldr_path, np);
         log_debug("Using XBOOTLDR partition at %s as $BOOT.", arg_xbootldr_path);
 
-        return 1;
+        if (ret_fd)
+                *ret_fd = TAKE_FD(fd);
+
+        return 1; /* found */
 }
 
 static int print_loader_or_stub_path(void) {
@@ -199,9 +222,14 @@ static int print_loader_or_stub_path(void) {
         }
 
         sd_id128_t esp_uuid;
-        r = acquire_esp(/* unprivileged_mode= */ false, /* graceful= */ false,
-                        /* ret_part= */ NULL, /* ret_pstart= */ NULL, /* ret_psize= */ NULL,
-                        &esp_uuid, /* ret_devid= */ NULL);
+        r = acquire_esp(/* unprivileged_mode= */ false,
+                        /* graceful= */ false,
+                        /* ret_fd= */ NULL,
+                        /* ret_part= */ NULL,
+                        /* ret_pstart= */ NULL,
+                        /* ret_psize= */ NULL,
+                        &esp_uuid,
+                        /* ret_devid= */ NULL);
         if (r < 0)
                 return r;
 
@@ -211,7 +239,10 @@ static int print_loader_or_stub_path(void) {
         else if (arg_print_stub_path) { /* In case of the stub, also look for things in the xbootldr partition */
                 sd_id128_t xbootldr_uuid;
 
-                r = acquire_xbootldr(/* unprivileged_mode= */ false, &xbootldr_uuid, /* ret_devid= */ NULL);
+                r = acquire_xbootldr(/* unprivileged_mode= */ false,
+                                     /* ret_fd= */ NULL,
+                                     &xbootldr_uuid,
+                                     /* ret_devid= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -421,6 +452,10 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         arg_print_root_device++;
                         break;
 
+                OPTION_LONG("print-efi-architecture", NULL, "Print the local EFI architecture string"):
+                        arg_print_efi_architecture = true;
+                        break;
+
                 OPTION_GROUP("Options"):
                         break;
 
@@ -610,9 +645,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
         char **args = option_parser_get_args(&state);
 
-        if (!!arg_print_esp_path + !!arg_print_dollar_boot_path + (arg_print_root_device > 0) + arg_print_loader_path + arg_print_stub_path > 1)
+        if (!!arg_print_esp_path + !!arg_print_dollar_boot_path + (arg_print_root_device > 0) + arg_print_loader_path + arg_print_stub_path + arg_print_efi_architecture > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "--print-esp-path/-p, --print-boot-path/-x, --print-root-device=/-R, --print-loader-path, --print-stub-path cannot be combined.");
+                                                       "--print-esp-path/-p, --print-boot-path/-x, --print-root-device=/-R, --print-loader-path, --print-stub-path, --print-efi-architecture cannot be combined.");
 
         if ((arg_root || arg_image) && args[0] && !STR_IN_SET(args[0], "status", "list",
                         "install", "update", "remove", "is-installed", "random-seed", "unlink", "cleanup"))
@@ -731,6 +766,11 @@ static int run(int argc, char *argv[]) {
 
         if (arg_print_loader_path || arg_print_stub_path)
                 return print_loader_or_stub_path();
+
+        if (arg_print_efi_architecture) {
+                printf("%s\n", get_efi_arch());
+                return 0;
+        }
 
         /* Open up and mount the image */
         if (arg_image) {

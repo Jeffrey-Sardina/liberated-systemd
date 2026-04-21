@@ -1420,35 +1420,30 @@ static int dhcp_client_private_options_append_json(Link *link, sd_json_variant *
                 return 0;
 
         LIST_FOREACH(options, option, link->dhcp_lease->private_options) {
-
                 r = sd_json_variant_append_arraybo(
                                 &array,
                                 SD_JSON_BUILD_PAIR_UNSIGNED("Option", option->tag),
                                 SD_JSON_BUILD_PAIR_HEX("PrivateOptionData", option->data, option->length));
                 if (r < 0)
-                        return 0;
+                        return r;
         }
         return json_variant_set_field_non_null(v, "PrivateOptions", array);
 }
 
 static int dhcp_client_id_append_json(Link *link, sd_json_variant **v) {
-        const sd_dhcp_client_id *client_id;
-        const void *data;
-        size_t l;
-        int r;
-
         assert(link);
         assert(v);
 
         if (!link->dhcp_client)
                 return 0;
 
-        r = sd_dhcp_client_get_client_id(link->dhcp_client, &client_id);
-        if (r < 0)
+        const sd_dhcp_client_id *client_id;
+        if (sd_dhcp_client_get_client_id(link->dhcp_client, &client_id) < 0)
                 return 0;
 
-        r = sd_dhcp_client_id_get_raw(client_id, &data, &l);
-        if (r < 0)
+        const void *data;
+        size_t l;
+        if (sd_dhcp_client_id_get_raw(client_id, &data, &l) < 0)
                 return 0;
 
         return sd_json_variant_merge_objectbo(v, SD_JSON_BUILD_PAIR_BYTE_ARRAY("ClientIdentifier", data, l));
@@ -1549,10 +1544,10 @@ int link_build_json(Link *link, sd_json_variant **ret) {
                         SD_JSON_BUILD_PAIR_STRING("AdministrativeState", link_state_to_string(link->state)),
                         SD_JSON_BUILD_PAIR_STRING("OperationalState", link_operstate_to_string(link->operstate)),
                         SD_JSON_BUILD_PAIR_STRING("CarrierState", link_carrier_state_to_string(link->carrier_state)),
-                        SD_JSON_BUILD_PAIR_STRING("AddressState", link_address_state_to_string(link->address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv4AddressState", link_address_state_to_string(link->ipv4_address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv6AddressState", link_address_state_to_string(link->ipv6_address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("OnlineState", link_online_state_to_string(link->online_state)));
+                        JSON_BUILD_PAIR_ENUM("AddressState", link_address_state_to_string(link->address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv4AddressState", link_address_state_to_string(link->ipv4_address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv6AddressState", link_address_state_to_string(link->ipv6_address_state)),
+                        JSON_BUILD_PAIR_ENUM("OnlineState", link_online_state_to_string(link->online_state)));
         if (r < 0)
                 return r;
 

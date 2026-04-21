@@ -1292,7 +1292,7 @@ char* string_replace_char(char *str, char old_char, char new_char) {
         return str;
 }
 
-int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret) {
+int make_cstring(const void *s, size_t n, MakeCStringMode mode, char **ret) {
         char *b;
 
         assert(s || n == 0);
@@ -1311,11 +1311,11 @@ int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret) {
 
                 b = new0(char, 1);
         } else {
-                const char *nul;
+                const uint8_t *nul;
 
                 nul = memchr(s, 0, n);
                 if (nul) {
-                        if (nul < s + n - 1 || /* embedded NUL? */
+                        if (nul < (const uint8_t*) s + n - 1 || /* embedded NUL? */
                             mode == MAKE_CSTRING_REFUSE_TRAILING_NUL)
                                 return -EINVAL;
 
@@ -1519,15 +1519,30 @@ char* strrstr_internal(const char *haystack, const char *needle) {
 
         /* Special case: for the empty string we return the very last possible occurrence, i.e. *after* the
          * last char, not before. */
-        if (*needle == 0)
+        if (needle[0] == 0)
                 return (char*) strchr(haystack, 0);
+
+        /* Special case: for single character strings, just use optimized strrchr() */
+        if (needle[1] == 0)
+                return (char*) strrchr(haystack, needle[0]);
 
         for (const char *p = strstr(haystack, needle), *q; p; p = q) {
                 q = strstr(p + 1, needle);
                 if (!q)
-                        return (char *) p;
+                        return (char*) p;
         }
         return NULL;
+}
+
+char* strrstr_no_case_internal(const char *haystack, const char *needle) {
+        if (!haystack || !needle)
+                return NULL;
+
+        for (const char *p = strchr(haystack, 0); p > haystack; p--)
+                if (startswith_no_case(p, needle))
+                        return (char*) p;
+
+        return startswith_no_case(haystack, needle) ? (char*) haystack : NULL;
 }
 
 size_t str_common_prefix(const char *a, const char *b) {
