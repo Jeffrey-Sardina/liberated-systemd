@@ -3,6 +3,8 @@ Mass surveillance is bad, actually. So here's a fork of `systemd` with surveilla
 
 Note: https://github.com/Jeffrey-Sardina/liberated-systemd and https://github.com/Jeffrey-Sardina/systemd are interchangeable aliases. Most documenation refers to the latter for consistency, but either may be used.
 
+See the dev log here: https://github.com/Jeffrey-Sardina/systemd-suite/blob/main/DEV-LOG.md
+
 ## Purpose
 The purpose of Liberated `systemd` is to do exactly one thing, and do it well: removing surveillance enablement from base `systemd`. Specifically, here is what I mean by surveillance: **surveillance is the tooling that enables or facilitates collection of any personal information that does not arise from technical needs for `systemd`**. The primary offender of this is, of course, age verification. If `systemd` later adds in support for other surveillance mechanisms, those will also be removed.
 
@@ -100,7 +102,7 @@ It's quite simple: `systemd`, very nicely, has (mostly) atomic commits. There is
 Since age collection is not needed for any aspect of `systemd`, this does not affect other aspects of `systemd`. Any downstream systems that attempt to call age-verification-related functions on Liberated `systemd` will therefore encounter an error. This is done by design. This is also why I have not simply created a "default age" as a lie -- it's about denying applications the ability to assume the presence of an API that enables mass surveillance.
 
 ## How is Liberated `systemd` tested?
-To see how I run testing for this fork, see: https://github.com/Jeffrey-Sardina/systemd-suite. (In short, I run their unit tests and CI pipeline before pushing changes. This includes testing Liberated `systemd` in a VM.)
+To see how I run testing for this fork, see: https://github.com/Jeffrey-Sardina/systemd-suite. (In short, I run their unit tests and CI pipeline before pushing changes. This includes testing Liberated `systemd` in a VM. Pushes are only made once I verify that Liberated `systemd` is *as stabler as* base `systemd`.)
 
 ## Where else can I find Liberated `systemd`?
 In order to allow users to avoid MicroSlop's ecosystem, this repository is made available via Gitea and Codeberg, on top of GitHub. The contents of all repositories are identical, and updated at the same time.
