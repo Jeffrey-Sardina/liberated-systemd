@@ -5,7 +5,6 @@
 #include "sd-bus.h"
 #include "sd-varlink.h"
 
-#include "ansi-color.h"
 #include "ask-password-api.h"
 #include "bitfield.h"
 #include "build.h"
