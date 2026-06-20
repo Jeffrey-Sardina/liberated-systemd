@@ -14,10 +14,14 @@ What this also means is that Liberated `systemd` is not a divergent development 
 Detailed blog post: https://medium.com/@jeffrey.sardina/installing-liberating-systemd-a-guide-by-the-author-2a9823192dd3
 
 ### Risks (read this!)
-In short, first,you must understand the risks. Liberated systemd currently is, essentially, a nightly build. This means:
-- it might not be as stable as a named release of base systemd
-- it might have new, changed, or deprecated features relative to the most recent named releases of base systemd
-- therefore, there is potential for version mismatches with what your OS expects, as the nightly version is likely newer than that named release most distros install
+You must understand the risks. Liberated systemd can be installed 2 ways: from a named release, or from a nightly build.
+
+For a nightly build, the risks are higher. This means:
+1. if you are not installing a named release, you should expect a higher potential for instability
+2. it might have new, changed, or deprecated features relative to the most recent named releases of base systemd
+3. therefore, there is potential for version mismatches with what your OS expects, as the nightly version is likely newer than that named release most distros install
+
+If installing from a named release, you should expect much more stability. But bear in mind that you still need to follow all of the safety precautions - unexpected bugs are unexpected, after all!
 
 Further, Systemd is the first process to run on your computer -- if you corrupt it, your computer will not boot. So whenever you go about changing the installed version -- be very careful. This means:
 - record everything you do
@@ -29,7 +33,7 @@ Further, Systemd is the first process to run on your computer -- if you corrupt 
 
 Everyone's local setup is different, and what works for one person might not work for you. I highly recommend test-installing in a VM before running on your actual computer.
 
-### Install from release
+### Install from release (recommended)
 To install Liberated `systemd` from a named release, download the **.tar.gz** file for release of choice instead of cloning Liberated `systemd`. For Liberated `systemd` v261,this is: [systemd-261.tar.gz](https://github.com/Jeffrey-Sardina/liberated-systemd/releases/download/v261/systemd-261.tar.gz). This will download the release's source code as a compressed file. (Note: don't use the auto-generated "source code" links -- use the *.tar.gz file if you want an exact match to Systemd v261).
 
 The instructions for installing from the release source code are identical to those below.
