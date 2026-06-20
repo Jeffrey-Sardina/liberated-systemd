@@ -190,8 +190,6 @@ static inline int parse_calendar_date(const char *s, usec_t *ret) {
         return parse_calendar_date_full(s, /* allow_pre_epoch= */ false, ret, NULL);
 }
 
-/* this is just an empty value used elsewhere. It does not enable surveillance, but is used
- * in legitimate functions. */
 #define BIRTH_DATE_UNSET                        \
         (const struct tm) {                     \
                 .tm_year = INT_MIN,             \

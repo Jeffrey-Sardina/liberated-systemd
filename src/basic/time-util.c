@@ -1932,8 +1932,6 @@ int parse_calendar_date_full(const char *s, bool allow_pre_epoch, usec_t *ret_us
         usec_t usec = USEC_INFINITY;
 
         if (allow_pre_epoch) {
-                /* This part of the function was for birthday surveillance. It therefore must be removed.
-                 * This function does have legitimate uses, however, so we don't delete the whole thing .*/
                 return 0;
         } else {
                 r = mktime_or_timegm_usec(&copy_tm, /* utc= */ true, &usec);
