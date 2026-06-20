@@ -29,6 +29,11 @@ Further, Systemd is the first process to run on your computer -- if you corrupt 
 
 Everyone's local setup is different, and what works for one person might not work for you. I highly recommend test-installing in a VM before running on your actual computer.
 
+### Install from release
+To install Liberated `systemd` from a named release, download the release of choice instead of cloning Liberated `systemd`. This will download the release's source code.
+
+The instructions for installing from the release source code are identical to those below.
+
 ### Install from source
 Here is the set of commands you can use to install Liberated systemd from source. This is how I run Liberated systemd on my Arch and Ubuntu (26.04 / "resolute") systems, although the commands should work on any Linux distro. First, we check the current version of systemd:
 
@@ -47,6 +52,7 @@ Then, we pull and build Liberated systemd from source:
 
 ```bash
 # pull Liberated systemd source code
+#if you want to install from release, instead download the release here, and uncompress it
 git clone https://github.com/Jeffrey-Sardina/systemd.git # this is an alias of https://github.com/Jeffrey-Sardina/liberated-systemd
 
 # pull mkosi -- latest version
