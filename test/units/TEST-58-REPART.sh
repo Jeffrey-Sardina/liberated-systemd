@@ -500,8 +500,8 @@ EOF
 		"raw_size" : 33554432,
 		"size" : "-> 32M",
 		"old_padding" : 0,
-		"raw_padding" : 0,
-		"padding" : "-> 0B",
+		"raw_padding" : 70234112,
+		"padding" : "-> 66.9M",
 		"activity" : "create",
 		"drop-in_files" : [
 			"$defs/root.conf.d/override1.conf",
@@ -577,8 +577,8 @@ EOF
 		"raw_size" : 33554432,
 		"size" : "-> 32M",
 		"old_padding" : 0,
-		"raw_padding" : 0,
-		"padding" : "-> 0B",
+		"raw_padding" : 36679680,
+		"padding" : "-> 34.9M",
 		"activity" : "create"
 	}
 ]
@@ -704,6 +704,149 @@ EOF
     assert_in "$imgs/unaligned1 : start=        2048, size=       69044," "$output"
     assert_in "$imgs/unaligned2 : start=       71092, size=     3591848," "$output"
     assert_in "$imgs/unaligned3 : start=     3662944, size=    17308536, type=${root_guid}, uuid=${root_uuid}, name=\"root-${architecture}\", attrs=\"GUID:59\"" "$output"
+}
+
+testcase_output_order() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Ensure the order of the partition list is correct ***"
+
+    # make this one min size 20MiB so that it has to be assigned slot 4
+    tee "$defs/01-home.conf" <<EOF
+[Partition]
+Type=home
+SizeMinBytes=20971520
+EOF
+
+    tee "$defs/02-swap.conf" <<EOF
+[Partition]
+Type=swap
+EOF
+
+    tee "$defs/03-esp.conf" <<EOF
+[Partition]
+Type=esp
+EOF
+
+    tee "$defs/04-root.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+EOF
+
+    truncate -s 80MiB "$imgs/order"
+    sfdisk "$imgs/order" <<EOF
+label: gpt
+
+size=10M, type=${root_guid}, uuid=837c3d67-21b3-478e-be82-7e7f83bf96d3
+size=5M, type=${xbootldr_guid}, uuid=4985c03e-eecb-4fe0-9f65-3f6345782214
+start=30M, size=10M, type=${esp_guid}, uuid=91c30bc9-0187-4db6-81a2-c648294197f8
+EOF
+
+    output=$(systemd-repart --offline="$OFFLINE" \
+                            --definitions="$defs" \
+                            --seed="$seed" \
+                            --dry-run=no \
+                            --json=pretty \
+                            "$imgs/order")
+
+    diff -u - <<EOF <(echo "$output")
+[
+	{
+		"type" : "root-$architecture",
+		"label" : "root-$architecture",
+		"uuid" : "837c3d67-21b3-478e-be82-7e7f83bf96d3",
+		"partno" : 0,
+		"file" : "$defs/04-root.conf",
+		"node" : "$imgs/order1",
+		"offset" : 1048576,
+		"old_size" : 10485760,
+		"raw_size" : 10485760,
+		"size" : "10M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "0B",
+		"activity" : "unchanged"
+	},
+	{
+		"type" : "xbootldr",
+		"label" : "xbootldr",
+		"uuid" : "4985c03e-eecb-4fe0-9f65-3f6345782214",
+		"partno" : 1,
+		"file" : null,
+		"node" : "$imgs/order2",
+		"offset" : 11534336,
+		"old_size" : 5242880,
+		"raw_size" : 5242880,
+		"size" : "5M",
+		"old_padding" : 14680064,
+		"raw_padding" : 0,
+		"padding" : "14M -> 0B",
+		"activity" : "unchanged"
+	},
+	{
+		"type" : "swap",
+		"label" : "swap",
+		"uuid" : "78c92db8-3d2b-4823-b0dc-792b78f66f1e",
+		"partno" : 3,
+		"file" : "$defs/02-swap.conf",
+		"node" : "$imgs/order4",
+		"offset" : 16777216,
+		"old_size" : 0,
+		"raw_size" : 14680064,
+		"size" : "-> 14M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "-> 0B",
+		"activity" : "create"
+	},
+	{
+		"type" : "esp",
+		"label" : "esp",
+		"uuid" : "91c30bc9-0187-4db6-81a2-c648294197f8",
+		"partno" : 2,
+		"file" : "$defs/03-esp.conf",
+		"node" : "$imgs/order3",
+		"offset" : 31457280,
+		"old_size" : 10485760,
+		"raw_size" : 26202112,
+		"size" : "10M -> 24.9M",
+		"old_padding" : 41922560,
+		"raw_padding" : 0,
+		"padding" : "39.9M -> 0B",
+		"activity" : "resize"
+	},
+	{
+		"type" : "home",
+		"label" : "home",
+		"uuid" : "4980595d-d74a-483a-aa9e-9903879a0ee5",
+		"partno" : 4,
+		"file" : "$defs/01-home.conf",
+		"node" : "$imgs/order5",
+		"offset" : 57659392,
+		"old_size" : 0,
+		"raw_size" : 26206208,
+		"size" : "-> 24.9M",
+		"old_padding" : 0,
+		"raw_padding" : 0,
+		"padding" : "-> 0B",
+		"activity" : "create"
+	}
+]
+EOF
+
+    output=$(sfdisk --dump "$imgs/order")
+
+    assert_in "$imgs/order1 : start=        2048, size=       20480, type=${root_guid}," "$output"
+    assert_in "$imgs/order2 : start=       22528, size=       10240, type=${xbootldr_guid}," "$output"
+    assert_in "$imgs/order3 : start=       61440, size=       51176, type=${esp_guid}," "$output"
+    assert_in "$imgs/order4 : start=       32768, size=       28672, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F," "$output"
+    assert_in "$imgs/order5 : start=      112616, size=       51184, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915," "$output"
 }
 
 testcase_issue_21817() {
@@ -1618,6 +1761,8 @@ Type=root
 MakeDirectories=/dir
 MakeSymlinks=/foo:/bar
 MakeSymlinks=/dir/foo:/bar
+MakeSymlinks=/dir/foo-%a:/bar-%a
+MakeSymlinks=/dir/bar-%a:../bar-%a
 EOF
 
     systemd-repart --offline="$OFFLINE" \
@@ -1632,6 +1777,8 @@ EOF
     systemd-dissect "$imgs/zzz" -M "$imgs/mnt"
     assert_eq "$(readlink "$imgs/mnt/foo")" "/bar"
     assert_eq "$(readlink "$imgs/mnt/dir/foo")" "/bar"
+    assert_eq "$(readlink "$imgs/mnt/dir/foo-${architecture}")" "/bar-${architecture}"
+    assert_eq "$(readlink "$imgs/mnt/dir/bar-${architecture}")" "../bar-${architecture}"
     systemd-dissect -U "$imgs/mnt"
 }
 
@@ -2395,6 +2542,48 @@ EOF
     assert_eq "$(udevadm info --query=property --property=DEVNAME --value "${encrypted_device}")" "${loop}p2"
     grep -q tada "${btrfs_mntpoint_plain}/magic-plain"
     grep -q tada "${btrfs_mntpoint_encrypted}/magic-encrypted"
+}
+
+testcase_insert_into_gap() {
+    local defs imgs output
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    echo "*** Inserting a new partition into a gap between two existing partitions ***"
+
+    truncate -s 71M "$imgs/gap.img"
+    sfdisk "$imgs/gap.img" <<EOF
+label: gpt
+size=10M, type=${esp_guid}, name="part-a",
+start=60M, size=10M, type=${root_guid}, name="part-c",
+EOF
+
+    tee "$defs/new.conf" <<EOF
+[Partition]
+Type=usr
+Label=part-b
+SizeMinBytes=10M
+SizeMaxBytes=10M
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "$imgs/gap.img"
+
+    output=$(sfdisk --dump "$imgs/gap.img")
+
+    assert_in "$imgs/gap.img1 : start=        2048, size=       20480," "$output"
+    assert_in "$imgs/gap.img2 : start=      122880, size=       20480," "$output"
+
+    # New partition B must start at the beginning of the gap (after A), not at
+    # the end (before C).
+    assert_in "$imgs/gap.img3 : start=       22528, size=       20480, type=$usr_guid, uuid=$usr_uuid, name=\"part-b\"" "$output"
 }
 
 OFFLINE="yes"

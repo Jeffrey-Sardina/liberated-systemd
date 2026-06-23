@@ -414,6 +414,14 @@ units = [
           'conditions' : ['ENABLE_IMDS'],
         },
         {
+          'file' : 'systemd-imds-metrics.socket',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-metrics@.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
           'file' : 'systemd-importd.service.in',
           'conditions' : ['ENABLE_IMPORTD'],
           'symlinks' : ['dbus-org.freedesktop.import1.service'],
@@ -747,6 +755,8 @@ units = [
           'file' : 'systemd-report-sign-plain@.service.in',
           'conditions' : ['HAVE_OPENSSL'],
         },
+        { 'file' : 'systemd-report-sign-tsm.socket' },
+        { 'file' : 'systemd-report-sign-tsm@.service.in' },
         {
           'file' : 'systemd-resolved.service.in',
           'conditions' : ['ENABLE_RESOLVE'],
