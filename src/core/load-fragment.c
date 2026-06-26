@@ -2247,6 +2247,66 @@ int config_parse_socket_service(
         return 0;
 }
 
+int config_parse_xattr(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***lp = ASSERT_PTR(data);
+        Unit *u = userdata;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                *lp = strv_free(*lp);
+                return 0;
+        }
+
+        _cleanup_free_ char *name = NULL, *value = NULL;
+        r = split_pair(rvalue, "=", &name, &value);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse extended attribute expression, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        _cleanup_free_ char *expanded_name = NULL;
+        r = unit_full_printf(u, name, &expanded_name);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to expand specifiers in extended attribute expression, ignoring: %s", name);
+                return 0;
+        }
+
+        if (!startswith(expanded_name, "user.")) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Extended attribute name does not begin with 'user.', ignoring: %s", expanded_name);
+                return 0;
+        }
+
+        _cleanup_free_ char *expanded_value = NULL;
+        r = unit_full_printf(u, value, &expanded_value);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to expand specifiers in extended attribute expression, ignoring: %s", value);
+                return 0;
+        }
+
+        if (strv_push_pair(lp, expanded_name, expanded_value) < 0)
+                return log_oom();
+
+        TAKE_PTR(expanded_name);
+        TAKE_PTR(expanded_value);
+
+        return 0;
+}
+
 int config_parse_fdname(
                 const char *unit,
                 const char *filename,
@@ -6763,8 +6823,10 @@ int config_parse_luo_sessions(
                                    "Failed to parse LUOSession= value, ignoring: %s", rvalue);
                         return 0;
                 }
-                if (r == 0)
+                if (r == 0) {
+                        strv_sort(*sessions);
                         return 0;
+                }
 
                 if (!luo_session_name_is_valid(word)) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0,
@@ -6782,6 +6844,4 @@ int config_parse_luo_sessions(
                 if (r < 0)
                         return log_oom();
         }
-
-        strv_sort(*sessions);
 }

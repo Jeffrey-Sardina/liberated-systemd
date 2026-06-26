@@ -3,11 +3,14 @@
 #include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-json.h"
+#include "sd-varlink.h"
 
 #include "build.h"
 #include "conf-files.h"
 #include "constants.h"
 #include "dissect-image.h"
+#include "env-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-table.h"
@@ -36,6 +39,7 @@
 #include "sysupdate-transfer.h"
 #include "sysupdate-update-set.h"
 #include "sysupdate-util.h"
+#include "varlink-util.h"
 #include "verbs.h"
 
 static char *arg_definitions = NULL;
@@ -47,6 +51,7 @@ static bool arg_legend = true;
 char *arg_root = NULL;
 static char *arg_image = NULL;
 static bool arg_reboot = false;
+static int arg_cleanup = -1;
 static char *arg_component = NULL;
 static bool arg_component_all = false;
 static int arg_verify = -1;
@@ -1191,6 +1196,82 @@ static int context_process_partial_and_pending(
         return 1;
 }
 
+static int notify_subscribers_reply(
+                sd_varlink *link,
+                sd_json_variant *reply,
+                const char *error_id,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        assert(link);
+
+        if (error_id)
+                log_warning("Notification subscriber '%s' returned error, ignoring: %s",
+                            strna(sd_varlink_get_description(link)), error_id);
+
+        return 0;
+}
+
+static int context_notify_subscribers(Context *c, UpdateSet *us) {
+        int r;
+
+        assert(c);
+
+        /* 'us' is NULL when we are forced to notify even though no update was applied (via
+         * SYSTEMD_SYSUPDATE_FORCE_NOTIFY=1). In that case we send neither a version nor a resource list. */
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *resources = NULL;
+        if (us)
+                for (size_t i = 0; i < c->n_transfers; i++) {
+                        Instance *inst = us->instances[i];
+                        Transfer *t = c->transfers[i];
+
+                        if (inst->resource == &t->target &&
+                            !inst->is_pending)
+                                continue;
+
+                        /* Report where the resource was installed *to* (not the source it came from): the
+                         * final on-disk path for filesystem targets, the partition device node for partition
+                         * targets. */
+                        const char *target_path =
+                                RESOURCE_IS_FILESYSTEM(t->target.type) ? t->final_path :
+                                t->target.type == RESOURCE_PARTITION ? t->partition_info.device :
+                                NULL;
+
+                        r = sd_json_variant_append_arraybo(
+                                        &resources,
+                                        SD_JSON_BUILD_PAIR_STRING("transfer", t->id),
+                                        SD_JSON_BUILD_PAIR_CONDITION(!!target_path, "path", SD_JSON_BUILD_STRING(target_path)));
+                        if (r < 0)
+                                return log_warning_errno(r, "Failed to build sysupdate notify resources list, skipping notification: %m");
+                }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL;
+        r = sd_json_buildo(
+                        &params,
+                        SD_JSON_BUILD_PAIR_CONDITION(!!arg_component, "component", SD_JSON_BUILD_STRING(arg_component)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!us, "version", SD_JSON_BUILD_STRING(us ? us->version : NULL)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!resources, "resources", SD_JSON_BUILD_VARIANT(resources)));
+        if (r < 0)
+                return log_warning_errno(r, "Failed to build sysupdate notify parameters, skipping notification: %m");
+
+        ssize_t n = varlink_execute_directory(
+                        VARLINK_DIR_SYSUPDATE_NOTIFY_HOOK,
+                        "io.systemd.SysUpdate.Notify.OnCompletedUpdate",
+                        params,
+                        /* more= */ false,
+                        /* timeout_usec= */ 5 * USEC_PER_MINUTE,
+                        notify_subscribers_reply,
+                        /* userdata= */ NULL);
+        if (n < 0)
+                log_debug_errno(n, "Failed to dispatch sysupdate notification to %s, ignoring: %m",
+                                VARLINK_DIR_SYSUPDATE_NOTIFY_HOOK);
+        else if (n > 0)
+                log_debug("Dispatched sysupdate notification to %zi subscribers in %s.", n, VARLINK_DIR_SYSUPDATE_NOTIFY_HOOK);
+
+        return 0;
+}
+
 static int context_install(
                 Context *c,
                 const char *version,
@@ -1234,6 +1315,9 @@ static int context_install(
         }
 
         log_info("%s Successfully installed update '%s'.", glyph(GLYPH_SPARKLES), us->version);
+
+        if (!arg_root)
+                (void) context_notify_subscribers(c, us);
 
         (void) sd_notifyf(/* unset_environment= */ false,
                           "STATUS=Installed '%s'.", us->version);
@@ -1595,44 +1679,71 @@ static int verb_update_impl(int argc, char **argv, UpdateActionFlags action_flag
         if (r < 0)
                 return r;
 
+        const char *node = loop_device ? loop_device->node : NULL;
+        bool installed = false;
+        int ret = 0;
+
         r = context_make_online(
                         &context,
-                        loop_device ? loop_device->node : NULL,
+                        node,
                         arg_component);
-        if (r < 0)
-                return r;
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return r;
 
-        if (action_flags & UPDATE_ACTION_ACQUIRE)
-                r = context_acquire(context, version);
-        else
-                r = context_process_partial_and_pending(context, version);
-        if (r < 0)
-                return r;  /* error */
+                /* No transfer files found. In that case, still do the installdb cleanup below */
+                RET_GATHER(ret, r);
+        } else {
+                if (action_flags & UPDATE_ACTION_ACQUIRE)
+                        r = context_acquire(context, version);
+                else
+                        r = context_process_partial_and_pending(context, version);
+                if (r < 0)
+                        return r;
 
-        if (action_flags & UPDATE_ACTION_INSTALL && r > 0)  /* update needed */
-                r = context_install(context, version, &applied);
-        if (r < 0)
-                return r;
+                if (FLAGS_SET(action_flags, UPDATE_ACTION_INSTALL) && r > 0) { /* installation of update indicated */
+                        r = context_install(context, version, &applied);
+                        if (r < 0)
+                                return r;
 
-        if (r > 0 && arg_reboot) {
-                assert(applied);
-                assert(booted_version);
-
-                if (strverscmp_improved(applied->version, booted_version) > 0) {
-                        log_notice("Newly installed version is newer than booted version, rebooting.");
-                        return reboot_now();
+                        installed = r > 0;
                 }
 
-                if (strverscmp_improved(applied->version, booted_version) == 0 &&
-                    FLAGS_SET(applied->flags, UPDATE_INCOMPLETE)) {
-                        log_notice("Currently booted version was incomplete and has been repaired, rebooting.");
-                        return reboot_now();
+                /* context_install() returns > 0 (and emits a notification) only if it actually applied an update. If
+                 * nothing was applied but SYSTEMD_SYSUPDATE_FORCE_NOTIFY=1 is set, still notify subscribers (without a
+                 * resource list), so e.g. a kernel/policy refresh can be triggered unconditionally. */
+                if ((action_flags & UPDATE_ACTION_INSTALL) && !installed) {
+                        int f = secure_getenv_bool("SYSTEMD_SYSUPDATE_FORCE_NOTIFY");
+                        if (f < 0 && f != -ENXIO)
+                                log_debug_errno(f, "Failed to parse $SYSTEMD_SYSUPDATE_FORCE_NOTIFY, ignoring: %m");
+                        if (f > 0)
+                                (void) context_notify_subscribers(context, /* us= */ NULL);
                 }
-
-                log_info("Booted version is newer or identical to newly installed version, not rebooting.");
         }
 
-        return 0;
+        if (arg_cleanup > 0)
+                RET_GATHER(ret, installdb_cleanup_component(node, arg_component));
+
+        if (installed) {
+                /* We installed something, yay */
+
+                if (arg_reboot) {
+                        assert(applied);
+                        assert(booted_version);
+
+                        if (strverscmp_improved(applied->version, booted_version) > 0) {
+                                log_notice("Newly installed version is newer than booted version, rebooting.");
+                                RET_GATHER(ret, reboot_now());
+                        } else if (strverscmp_improved(applied->version, booted_version) == 0 &&
+                                   FLAGS_SET(applied->flags, UPDATE_INCOMPLETE)) {
+                                log_notice("Currently booted version was incomplete and has been repaired, rebooting.");
+                                RET_GATHER(ret, reboot_now());
+                        } else
+                                log_info("Booted version is newer or identical to newly installed version, not rebooting.");
+                }
+        }
+
+        return ret;
 }
 
 VERB(verb_update, "update", "[VERSION]", VERB_ANY, 2, 0,
@@ -1822,6 +1933,9 @@ static int verb_cleanup(int argc, char *argv[], uintptr_t _data, void *userdata)
 
         assert(argc <= 1);
 
+        if (arg_cleanup == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invocation of 'cleanup' with --cleanup=no is contradictory, refusing.");
+
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
         _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         r = process_image(/* ro= */ false, &mounted_dir, &loop_device);
@@ -2003,6 +2117,17 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                             "Do not fetch metadata from the network"):
                         arg_offline = true;
                         break;
+
+                OPTION_LONG("cleanup", "BOOL", "Clean up orphaned files after completing update"): {
+                        bool b;
+
+                        r = parse_boolean_argument("--cleanup=", opts.arg, &b);
+                        if (r < 0)
+                                return r;
+
+                        arg_cleanup = b;
+                        break;
+                }
 
                 OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;

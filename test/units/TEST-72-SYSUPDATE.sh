@@ -49,6 +49,10 @@ systemctl daemon-reload
 at_exit() {
     set +e
 
+    systemctl stop test-sysupdate-notify-recorder.socket
+    rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+          /run/systemd/system/test-sysupdate-notify-recorder@.service
+
     losetup -n --output NAME --associated "$BACKING_FILE" | while read -r loop_dev; do
         losetup --detach "$loop_dev"
     done
@@ -857,5 +861,175 @@ test ! -e "$COMPALL/target-b/comp-b-v1.bin"
 
 rm -rf "$COMPALL" /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d \
     /var/lib/systemd/sysupdate/installdb.comp-a /var/lib/systemd/sysupdate/installdb.comp-b
+
+# Check the "--cleanup=" switch of the "update" verb. With "--cleanup=yes" a
+# successful update must, after installing the new version, run the equivalent of
+# the "cleanup" verb and remove any resources that are no longer owned by a
+# currently defined transfer file. Reuse the "alpha"/"beta" helpers from above.
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+mkdir -p "$CONFIGDIR" "$CLEANUP/source" "$CLEANUP/target"
+
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+cat >"$CONFIGDIR/02-beta.transfer" <<EOF
+[Source]
+Type=directory
+Path=$CLEANUP/source
+MatchPattern=beta-@v
+
+[Target]
+Type=directory
+Path=$CLEANUP/target
+MatchPattern=beta-@v
+InstancesMax=2
+EOF
+
+# Install a first version with both transfers in place.
+cleanup_new_version v1
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+verify_beta_synced v1
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Now drop the "beta" transfer file and install a second version with
+# "--cleanup=yes". The new alpha resource must be installed, and the now-orphaned
+# beta directory (and its install database entry) must be removed as part of the
+# same invocation, without a separate "cleanup" call.
+rm "$CONFIGDIR/02-beta.transfer"
+cleanup_new_version v2
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+test ! -e "$CLEANUP/target/beta-v1"
+[[ "$(installdb_count)" -eq 1 ]]
+assert_installdb_covers_target
+
+# With "--cleanup=no" (the default) orphaned resources must be left in place.
+# Redefine the "alpha" transfer so its patterns no longer match the already
+# installed alpha files (turning them into orphans), while keeping a valid
+# transfer definition in place. Updating with "--cleanup=no" must then install
+# nothing new (there's no matching source) and leave the now-orphaned alpha files
+# and their install database entry untouched.
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=gamma-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=gamma-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" --verify=no update --cleanup=no
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 1 ]]
+
+# Invoking the "cleanup" verb with "--cleanup=no" is contradictory and must be
+# refused.
+(! "$SYSUPDATE" --cleanup=no cleanup) |& grep "contradictory" >/dev/null
+
+# A plain "cleanup" must still remove the orphaned alpha files.
+"$SYSUPDATE" cleanup
+test ! -f "$CLEANUP/target/alpha-v1.bin"
+test ! -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 0 ]]
+
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+
+# Verify the notification callout: after a successful update, sysupdate must connect to every socket in
+# /run/systemd/sysupdate/notify/ and invoke io.systemd.SysUpdate.Notify.OnCompletedUpdate(). We hook a tiny
+# recorder socket into that directory that captures the request and replies with success.
+NOTIFY_LOG="$WORKDIR/notify.log"
+rm -f "$NOTIFY_LOG"
+
+cat >"$WORKDIR/notify-recorder.py" <<EOF
+#!/usr/bin/env python3
+# Minimal Varlink server: read one NUL-terminated request, record it, reply with empty parameters.
+import sys
+buf = b""
+while True:
+    c = sys.stdin.buffer.read(1)
+    if not c or c == b"\x00":
+        break
+    buf += c
+with open("$NOTIFY_LOG", "ab") as f:
+    f.write(buf + b"\n")
+sys.stdout.buffer.write(b'{"parameters":{}}\x00')
+sys.stdout.buffer.flush()
+EOF
+chmod +x "$WORKDIR/notify-recorder.py"
+
+cat >/run/systemd/system/test-sysupdate-notify-recorder.socket <<EOF
+[Socket]
+ListenStream=/run/systemd/sysupdate/notify/io.test.SysUpdateRecorder
+Accept=yes
+EOF
+
+cat >"/run/systemd/system/test-sysupdate-notify-recorder@.service" <<EOF
+[Service]
+ExecStart=$WORKDIR/notify-recorder.py
+StandardInput=socket
+StandardOutput=socket
+EOF
+
+systemctl daemon-reload
+systemctl start test-sysupdate-notify-recorder.socket
+
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"
+echo "hello" >"$WORKDIR/source/notifytest-v1.bin"
+(cd "$WORKDIR/source" && sha256sum notifytest-v1.bin >SHA256SUMS)
+cat >"$CONFIGDIR/01-notifytest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=notifytest-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=notifytest-@v.bin
+InstancesMax=1
+EOF
+
+# A real update must trigger exactly one notification carrying the version and the updated resources.
+# The callout is synchronous (sysupdate blocks until the subscriber replied, which happens after the
+# request was recorded), so the log is fully written by the time the update returns.
+"$SYSUPDATE" --verify=no update
+test -s "$NOTIFY_LOG"  # the notification must have been recorded
+notify_line="$(tail -n1 "$NOTIFY_LOG")"
+echo "Recorded notification: $notify_line"
+jq -e '.method == "io.systemd.SysUpdate.Notify.OnCompletedUpdate"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.version == "v1"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | length >= 1' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | all(has("transfer"))' <<<"$notify_line" >/dev/null
+
+# A no-op update ("No update needed") must NOT emit a notification.
+rm -f "$NOTIFY_LOG"
+"$SYSUPDATE" --verify=no update
+test ! -s "$NOTIFY_LOG"
+
+systemctl stop test-sysupdate-notify-recorder.socket
+rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+      /run/systemd/system/test-sysupdate-notify-recorder@.service
+systemctl daemon-reload
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+rm -f "$WORKDIR/source/notifytest-v1.bin" "$WORKDIR/source/SHA256SUMS" \
+      "$WORKDIR/notify-recorder.py" "$NOTIFY_LOG"
 
 touch /testok

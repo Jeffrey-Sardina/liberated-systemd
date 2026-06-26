@@ -126,6 +126,8 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - remove any trace of "cpuacct" cgroup controller, it's a cgroupv1 thing.
   similar "devices"
 
+- drop socket_xattr_supported() once our baseline is kernel 7.0
+
 ## Features
 
 - **report:**
@@ -136,8 +138,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     sessions, and number of sessions since boot.
   - implement metrics provider in journald that reports number of log messages
     received since boot, by log priority
-  - implement metrics provider in journalctl, that simply reports the most
-    recent 10 emergency log msgs on the system
   - allow to compile statically (together with the basic and cgroup
     backends)
   - make sure backends can also be invoked via forking off
@@ -231,12 +231,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   sequences of this type, so that every step of the way we get the right
   behaviour.
 
-- now that the kernel supports xattrs on sockets: mark varlink entrypoint
-  sockets, server side of varlink sockets, and client sides of valrink sockets
-  with distinct xattrs to make them recognizable (similar maybe for our other
-  protocols, such as syslog, journal native entry point). For entrypoints might
-  require new .socket unit setting.
-
 - implement "varlinkctl trace" or so, that watches socket traffic on a group of
   processes (select by pid, select by cgroup, select by all machine), and shows
   traffic of all sockets marked via the new varlink socket xattrs. Use BPF for
@@ -285,12 +279,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - firstboot/sysinstall: add simple interface for prompting users to enable
   "features" exposed by of sysupdate.
-
-- bootctl link + sysupdate integration
-  - make sysupdate call out to a special varlink dir on completion
-  - bind bootctl link socket in there, which when invoked goes to new dir in
-    /var/ where downloaded kernels+confext+sysext are dropped in (place in
-    .v/) and then does "bootctl link" on them.
 
 - a tool that can prep credentials, put them in the ESP, for provisioning
   systems for SBC or UEFI/HTTP boot. Should be doing what sysinstall does with
