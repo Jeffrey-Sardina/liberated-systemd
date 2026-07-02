@@ -694,6 +694,10 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--remain-after-exit and --service-type= are not supported in --scope mode.");
 
+        if (arg_scope && arg_no_block)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "--no-block is not supported in --scope mode.");
+
         if (arg_stdio != ARG_STDIO_NONE) {
                 if (with_trigger || arg_scope)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -1049,7 +1053,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
 
         strv_free_and_replace(arg_cmdline, l);
 
-        if (!arg_slice) {
+        if (!custom_slice) {
                 arg_slice = strdup(SPECIAL_USER_SLICE);
                 if (!arg_slice)
                         return log_oom();

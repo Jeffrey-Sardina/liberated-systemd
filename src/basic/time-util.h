@@ -197,6 +197,8 @@ static inline int parse_calendar_date(const char *s, usec_t *ret) {
                 .tm_year = INT_MIN,             \
         }
 
+uint64_t sysconf_clock_ticks_cached(void);
+
 uint32_t usec_to_jiffies(usec_t usec);
 usec_t jiffies_to_usec(uint32_t jiffies);
 
