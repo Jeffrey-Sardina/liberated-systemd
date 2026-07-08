@@ -774,6 +774,114 @@ def test_inspect_no_osrel(kernel_initrd, tmp_path, capsys):
     test_inspect(kernel_initrd, tmp_path, capsys, osrel=False)
 
 
+def build_inspect_uki(*args):
+    # Build a UKI for the inspect-JSON tests. Building needs a stub; CI provides the addon stub via
+    # $EFI_ADDON (see test_addon), so build addon-style (no --linux) to need only that one. Skip if
+    # the stub is unavailable.
+    stub = os.getenv('EFI_ADDON')
+    if not stub:
+        pytest.skip('EFI_ADDON not set')
+    opts = ukify.parse_args(['build', f'--stub={stub}', *args, *arg_tools])
+    try:
+        ukify.check_inputs(opts)
+    except FileNotFoundError as e:
+        pytest.skip(str(e))
+    ukify.make_uki(opts)
+
+
+def test_inspect_json_profiles(tmp_path, capsys):
+    # Build two standalone profile PE binaries, each carrying its own '.cmdline'.
+    profiles = []
+    for i in range(2):
+        profile = f'{tmp_path}/profile{i}.efi'
+        build_inspect_uki(f'--profile=ID=profile{i}', f'--cmdline=PROFILE{i}ARG', f'--output={profile}')
+        profiles.append(profile)
+
+    # Build the base UKI joining both profiles. The result has a shared base '.cmdline' plus one
+    # '.cmdline' (and one '.profile') per profile, including the implicit base profile.
+    output = f'{tmp_path}/base.efi'
+    build_inspect_uki(
+        '--cmdline=BASEARG',
+        '--uname=1.2.3',
+        *(f'--join-profile={p}' for p in profiles),
+        f'--output={output}',
+    )
+
+    opts = ukify.parse_args(['inspect', output, '--json=short'])
+    ukify.inspect_sections(opts)
+    result = json.loads(capsys.readouterr().out)
+
+    # Shared base sections stay keyed by name at the top level, just as for a profile-less UKI, so
+    # the base '.cmdline' is not overwritten by the profile-specific ones.
+    assert result['.cmdline']['text'] == 'BASEARG'
+    assert result['.uname']['text'] == '1.2.3'
+
+    # Implicit base profile (ID=main) plus the two joined profiles, each keyed by section name and
+    # starting with its '.profile' section.
+    assert len(result['_profiles']) == 3
+    assert [p['.profile']['text'] for p in result['_profiles']] == ['ID=main', 'ID=profile0', 'ID=profile1']
+
+    # Each joined profile's distinct '.cmdline' survives instead of being overwritten.
+    profile_cmdlines = [p['.cmdline']['text'] for p in result['_profiles'] if '.cmdline' in p]
+    assert profile_cmdlines == ['PROFILE0ARG', 'PROFILE1ARG']
+
+    shutil.rmtree(tmp_path)
+
+
+def test_inspect_json_alternative_set_sections(tmp_path, capsys):
+    # '.dtbauto' and '.efifw' are alternative-sets (one entry per hardware variant): every occurrence
+    # must be preserved, and they are always reported as a list, even for a single entry. The two are
+    # built differently ('.efifw' via --efifw on a directory, measure=False) but flow through the same
+    # list path, so both are exercised.
+    def inspect(output):
+        opts = ukify.parse_args(['inspect', str(output), '--json=short'])
+        ukify.inspect_sections(opts)
+        return json.loads(capsys.readouterr().out)
+
+    dtbs = []
+    for i in range(2):
+        dtb = tmp_path / f'dtb{i}'
+        dtb.write_bytes(f'DTB{i}'.encode())
+        dtbs.append(dtb)
+
+    # --efifw takes a directory containing exactly one firmware file; the fwid is the directory name.
+    efifws = []
+    for i in range(2):
+        fwdir = tmp_path / f'fw{i}'
+        fwdir.mkdir()
+        (fwdir / 'firmware.bin').write_bytes(f'EFIFW{i}'.encode())
+        efifws.append(fwdir)
+
+    output = f'{tmp_path}/alt.efi'
+    build_inspect_uki(
+        '--cmdline=ARG',
+        *(f'--devicetree-auto={d}' for d in dtbs),
+        *(f'--efifw={d}' for d in efifws),
+        f'--output={output}',
+    )
+    result = inspect(output)
+
+    # No profiles, so no '_profiles' key and single sections stay plain objects (backwards compatible).
+    assert '_profiles' not in result
+    assert result['.cmdline']['text'] == 'ARG'
+
+    # Both occurrences of each alternative-set section are preserved as a list, none dropped.
+    for name in ('.dtbauto', '.efifw'):
+        assert isinstance(result[name], list), name
+        assert len(result[name]) == 2, name
+        assert all('sha256' in d for d in result[name]), name
+        assert result[name][0]['sha256'] != result[name][1]['sha256'], name
+
+    # A single entry is still reported as a (one-element) list, not a bare object.
+    single = f'{tmp_path}/single.efi'
+    build_inspect_uki(f'--devicetree-auto={dtbs[0]}', f'--efifw={efifws[0]}', f'--output={single}')
+    result = inspect(single)
+    assert isinstance(result['.dtbauto'], list) and len(result['.dtbauto']) == 1
+    assert isinstance(result['.efifw'], list) and len(result['.efifw']) == 1
+
+    shutil.rmtree(tmp_path)
+
+
 @pytest.mark.skipif(not slow_tests, reason='slow')
 def test_pcr_signing(kernel_initrd, tmp_path):
     if kernel_initrd is None:
@@ -927,6 +1035,93 @@ def test_pcr_signing2(kernel_initrd, tmp_path):
     sig = json.loads(sig)
     assert list(sig.keys()) == ['sha384']
     assert len(sig['sha384']) == 6  # six items for six phases paths
+
+    shutil.rmtree(tmp_path)
+
+
+@pytest.mark.skipif(not slow_tests, reason='slow')
+def test_pcr_signing3(kernel_initrd, tmp_path):
+    if kernel_initrd is None:
+        pytest.skip('linux+initrd not found')
+    try:
+        systemd_measure()
+    except ValueError:
+        pytest.skip('systemd-measure not found')
+
+    ourdir = pathlib.Path(__file__).parent
+    pub = unbase64(ourdir / 'example.tpm2-pcr-public.pem.base64')
+    priv = unbase64(ourdir / 'example.tpm2-pcr-private.pem.base64')
+
+    # simulate a microcode file
+    with open(f'{tmp_path}/microcode', 'wb') as microcode:
+        microcode.write(b'1234567890')
+
+    output = f'{tmp_path}/signed.efi'
+    assert kernel_initrd[0] == '--linux'
+    opts = ukify.parse_args(
+        [
+            'build',
+            *kernel_initrd[:2],
+            f'--initrd={microcode.name}',
+            *kernel_initrd[2:],
+            f'--output={output}',
+            '--uname=1.2.3',
+            '--cmdline=ARG1 ARG2 ARG3',
+            '--os-release=ID=foobar\n',
+            '--pcr-banks=sha384',
+            f'--pcrpkey={pub.name}',
+            f'--pcr-private-key={priv.name}',
+            '--phases=enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready',
+            '--policyref=',
+            f'--pcr-private-key={priv.name}',
+            '--phases=enter-initrd',
+            '--policyref=initrd',
+        ]
+        + arg_tools
+    )
+
+    try:
+        ukify.check_inputs(opts)
+    except OSError as e:
+        pytest.skip(str(e))
+
+    ukify.make_uki(opts)
+
+    # let's check that objdump likes the resulting file
+    dump = subprocess.check_output(['objdump', '-h', output], text=True)
+
+    for sect in 'text osrel cmdline linux initrd uname pcrsig'.split():
+        assert re.search(rf'^\s*\d+\s+\.{sect}\s+[0-9a-f]+', dump, re.MULTILINE)
+
+    subprocess.check_call(
+        [
+            'objcopy',
+            *(
+                f'--dump-section=.{n}={tmp_path}/out.{n}'
+                for n in ('pcrpkey', 'pcrsig', 'osrel', 'uname', 'cmdline', 'initrd')
+            ),
+            output,
+            tmp_path / 'dummy',
+        ],
+        text=True,
+    )
+
+    assert open(tmp_path / 'out.pcrpkey').read() == open(pub.name).read()
+    assert open(tmp_path / 'out.osrel').read() == 'ID=foobar\n'
+    assert open(tmp_path / 'out.uname').read() == '1.2.3'
+    assert open(tmp_path / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
+    assert open(tmp_path / 'out.initrd', 'rb').read(10) == b'1234567890'
+
+    sig = open(tmp_path / 'out.pcrsig').read()
+    sig = json.loads(sig)
+    assert list(sig.keys()) == ['sha384']
+    assert len(sig['sha384']) == 5  # five items for five phases paths
+    assert 'ref' not in sig['sha384'][0]
+    assert 'ref' not in sig['sha384'][1]
+    assert 'ref' not in sig['sha384'][2]
+    assert 'ref' not in sig['sha384'][3]
+    assert 'ref' in sig['sha384'][4]
+    assert sig['sha384'][4]['ref'] == 'initrd'
 
     shutil.rmtree(tmp_path)
 

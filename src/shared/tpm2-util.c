@@ -4214,6 +4214,7 @@ static int find_signature(
                 const TPML_PCR_SELECTION *pcr_selection,
                 const void *fp,
                 size_t fp_size,
+                const char *policy_ref,
                 const void *policy,
                 size_t policy_size,
                 void *ret_signature,
@@ -4248,7 +4249,8 @@ static int find_signature(
         /* Now iterate through all signatures known for this bank */
         JSON_VARIANT_ARRAY_FOREACH(i, b) {
                 _cleanup_free_ void *fpj_data = NULL, *polj_data = NULL;
-                sd_json_variant *maskj, *fpj, *sigj, *polj;
+                const char *refj_data = NULL;
+                sd_json_variant *maskj, *fpj, *sigj, *polj, *refj;
                 size_t fpj_size, polj_size;
                 uint32_t parsed_mask;
 
@@ -4278,6 +4280,16 @@ static int find_signature(
 
                 if (memcmp_nn(fp, fp_size, fpj_data, fpj_size) != 0)
                         continue; /* Not for this public key */
+
+                refj = sd_json_variant_by_key(i, "ref");
+                if (refj) {
+                        refj_data = sd_json_variant_string(refj);
+                        if (!refj_data)
+                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Policy reference is not a string.");
+                }
+
+                if (!streq_ptr(policy_ref, refj_data))
+                        continue;
 
                 /* Finally, check if this is for the PCR policy we expect this to be */
                 polj = sd_json_variant_by_key(i, "pol");
@@ -4943,7 +4955,7 @@ int tpm2_policy_pcr(
 /* Extend 'digest' with the PolicyAuthorize calculated hash. */
 int tpm2_calculate_policy_authorize(
                 const TPM2B_PUBLIC *public,
-                const TPM2B_DIGEST *policy_ref,
+                const TPM2B_NONCE *policy_ref,
                 TPM2B_DIGEST *digest) {
 
         TPM2_CC command = TPM2_CC_PolicyAuthorize;
@@ -4999,11 +5011,35 @@ int tpm2_calculate_policy_authorize(
         return 0;
 }
 
+static void tpm2_make_policy_ref(const char *policy_ref, TPM2B_NONCE *ret_policy_ref) {
+        assert(ret_policy_ref);
+        assert(SHA256_DIGEST_SIZE <= sizeof(ret_policy_ref->buffer));
+
+        /* A policy reference is represented by the TPM2B_NONCE type, which has a maximum size equivalent
+         * to the largest digest supported by the TPM. Because of this, digest the policy reference string.
+         * As we don't know what the maximum digest size supported by the TPM is when publishing a
+         * signed policy, we pick SHA256 which is universally supported on PC-Client devices. Ideally the
+         * algorithm ID would be prepended to the digest, but we don't know if the TPM2B_NONCE type can
+         * accomodate this. For this reason, the digest algorithm here should match the one used to create
+         * the approved digest for the corresponding policy, which is always SHA256 at the moment.
+         *
+         * Note that we return a policy ref size of 0 if no string is supplied in order to maintain
+         * backwards compatibility with previous systemd releases. */
+        if (isempty(policy_ref)) {
+                ret_policy_ref->size = 0;
+                return;
+        }
+
+        sha256_direct(policy_ref, strlen(policy_ref), ret_policy_ref->buffer);
+        ret_policy_ref->size = SHA256_DIGEST_SIZE;
+}
+
 static int tpm2_policy_authorize(
                 Tpm2Context *c,
                 const Tpm2Handle *session,
                 TPML_PCR_SELECTION *pcr_selection,
                 const TPM2B_PUBLIC *public,
+                const char *policy_ref,
                 const void *fp,
                 size_t fp_size,
                 sd_json_variant *signature_json,
@@ -5051,6 +5087,7 @@ static int tpm2_policy_authorize(
                                 signature_json,
                                 pcr_selection,
                                 fp, fp_size,
+                                policy_ref,
                                 approved_policy->buffer,
                                 approved_policy->size,
                                 &signature_raw,
@@ -5060,8 +5097,13 @@ static int tpm2_policy_authorize(
 
                 /* TPM2_VerifySignature() will only verify the RSA part of the RSA+SHA256 signature,
                  * hence we need to do the SHA256 part ourselves, first */
-                TPM2B_DIGEST signature_hash = *approved_policy;
-                r = tpm2_digest_rehash(TPM2_ALG_SHA256, &signature_hash);
+                _cleanup_(iovec_done) struct iovec tbs_data = {};
+                r = tpm2_make_policy_authorize_tbs_data(approved_policy, policy_ref, &tbs_data);
+                if (r < 0)
+                        return r;
+
+                TPM2B_DIGEST signature_hash;
+                r = tpm2_digest_buffer(TPM2_ALG_SHA256, &signature_hash, tbs_data.iov_base, tbs_data.iov_len, /* extend= */ false);
                 if (r < 0)
                         return r;
 
@@ -5101,6 +5143,9 @@ static int tpm2_policy_authorize(
                 check_ticket = &check_ticket_null;
         }
 
+        TPM2B_NONCE policy_ref_tpm2b;
+        tpm2_make_policy_ref(policy_ref, &policy_ref_tpm2b);
+
         rc = sym_Esys_PolicyAuthorize(
                         c->esys_context,
                         session->esys_handle,
@@ -5108,7 +5153,7 @@ static int tpm2_policy_authorize(
                         ESYS_TR_NONE,
                         ESYS_TR_NONE,
                         approved_policy,
-                        /* policyRef= */ &(const TPM2B_NONCE) {},
+                        &policy_ref_tpm2b,
                         pubkey_name,
                         check_ticket);
         if (rc != TSS2_RC_SUCCESS)
@@ -5123,6 +5168,7 @@ int tpm2_calculate_sealing_policy(
                 const Tpm2PCRValue *pcr_values,
                 size_t n_pcr_values,
                 const TPM2B_PUBLIC *public,
+                const char *pubkey_policy_ref,
                 bool use_pin,
                 const Tpm2PCRLockPolicy *pcrlock_policy,
                 TPM2B_DIGEST *digest) {
@@ -5139,7 +5185,9 @@ int tpm2_calculate_sealing_policy(
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Policies that combined signed PCR and pcrlock are not supported.");
 
         if (public) {
-                r = tpm2_calculate_policy_authorize(public, NULL, digest);
+                TPM2B_NONCE policy_ref;
+                tpm2_make_policy_ref(pubkey_policy_ref, &policy_ref);
+                r = tpm2_calculate_policy_authorize(public, &policy_ref, digest);
                 if (r < 0)
                         return r;
         }
@@ -5180,6 +5228,7 @@ static int tpm2_build_sealing_policy(
                 uint32_t hash_pcr_mask,
                 uint16_t pcr_bank,
                 const TPM2B_PUBLIC *public,
+                const char *pubkey_policy_ref,
                 const void *fp,
                 size_t fp_size,
                 uint32_t pubkey_pcr_mask,
@@ -5193,6 +5242,7 @@ static int tpm2_build_sealing_policy(
         assert(c);
         assert(session);
         assert(pubkey_pcr_mask == 0 || public);
+        assert(!pubkey_policy_ref || public);
 
         log_debug("Building sealing policy.");
 
@@ -5210,7 +5260,7 @@ static int tpm2_build_sealing_policy(
         if (pubkey_pcr_mask != 0) {
                 TPML_PCR_SELECTION pcr_selection;
                 tpm2_tpml_pcr_selection_from_mask(pubkey_pcr_mask, (TPMI_ALG_HASH)pcr_bank, &pcr_selection);
-                r = tpm2_policy_authorize(c, session, &pcr_selection, public, fp, fp_size, signature_json, NULL);
+                r = tpm2_policy_authorize(c, session, &pcr_selection, public, pubkey_policy_ref, fp, fp_size, signature_json, NULL);
                 if (r < 0)
                         return r;
         }
@@ -6343,6 +6393,32 @@ int tpm2_calculate_seal(
 #endif
 }
 
+int tpm2_make_policy_authorize_tbs_data(
+                const TPM2B_DIGEST *approved_digest,
+                const char *policy_ref_data,
+                struct iovec *ret_tbs_data) {
+
+        TPM2B_NONCE policy_ref;
+
+        assert(approved_digest);
+        assert(ret_tbs_data);
+
+        tpm2_make_policy_ref(policy_ref_data, &policy_ref);
+
+        /* The data to be signed for a TPM2_PolicyAuthorize() is the concatenation of the approved policy
+         * digest and the policy reference, as per TPM2 Spec Part 3, 23.16. */
+        _cleanup_(iovec_done) struct iovec tbs_data = {};
+
+        if (!iovec_append(&tbs_data, &IOVEC_MAKE(approved_digest->buffer, approved_digest->size)))
+                return log_oom_debug();
+
+        if (!iovec_append(&tbs_data, &IOVEC_MAKE(policy_ref.buffer, policy_ref.size)))
+                return log_oom_debug();
+
+        *ret_tbs_data = TAKE_STRUCT(tbs_data);
+        return 0;
+}
+
 int tpm2_seal(Tpm2Context *c,
               uint32_t seal_key_handle,
               const TPM2B_DIGEST policy[],
@@ -6569,6 +6645,7 @@ int tpm2_unseal(Tpm2Context *c,
                 uint32_t hash_pcr_mask,
                 uint16_t pcr_bank,
                 const struct iovec *pubkey,
+                const char *pubkey_policy_ref,
                 uint32_t pubkey_pcr_mask,
                 sd_json_variant *signature,
                 const char *pin,
@@ -6602,6 +6679,7 @@ int tpm2_unseal(Tpm2Context *c,
         assert(n_blobs > 0);
         assert(blobs);
         assert(iovec_is_valid(pubkey));
+        assert(!pubkey_policy_ref || iovec_is_set(pubkey));
         assert(ret_secret);
 
         assert(TPM2_PCR_MASK_VALID(hash_pcr_mask));
@@ -6744,6 +6822,7 @@ int tpm2_unseal(Tpm2Context *c,
                                         hash_pcr_mask,
                                         pcr_bank,
                                         shard == 0 && iovec_is_set(pubkey) ? &pubkey_tpm2b : NULL,
+                                        shard == 0 ? pubkey_policy_ref : NULL,
                                         fp.iov_base, fp.iov_len,
                                         shard == 0 ? pubkey_pcr_mask : 0,
                                         signature,
@@ -7104,9 +7183,9 @@ static int tpm2_define_nvpcr_nv_index(
                 const Tpm2Handle *session,
                 TPM2_HANDLE nv_index,
                 TPMI_ALG_HASH algorithm,
+                bool orderly,
                 Tpm2Handle **ret_nv_handle) {
 
-        _cleanup_(tpm2_handle_freep) Tpm2Handle *new_handle = NULL;
         TSS2_RC rc;
         int r;
 
@@ -7124,11 +7203,13 @@ static int tpm2_define_nvpcr_nv_index(
         if ((size_t) digest_size > sizeof_field(TPM2B_MAX_NV_BUFFER, buffer))
                 return log_debug_errno(SYNTHETIC_ERRNO(E2BIG), "Digest too large for extension.");
 
-        r = tpm2_handle_new(c, &new_handle);
-        if (r < 0)
-                return r;
-
-        new_handle->flush = false; /* This is a persistent NV index, don't flush hence */
+        /* If we already ran into NV index space exhaustion for this orderly mode during this boot, don't
+         * bother trying again — the situation is unlikely to improve until reboot. We track this via a flag
+         * file in /run/, with a separate file for orderly and non-orderly NvPCRs, since the two draw on
+         * different TPM resources (RAM-backed vs. NVRAM-backed). */
+        const char *exhausted_flag = orderly ?
+                "/run/systemd/tpm2-nv-space-exhausted-orderly" :
+                "/run/systemd/tpm2-nv-space-exhausted-non-orderly";
 
         TPM2B_NV_PUBLIC public_info = {
                 .size = sizeof_field(TPM2B_NV_PUBLIC, nvPublic),
@@ -7136,7 +7217,7 @@ static int tpm2_define_nvpcr_nv_index(
                         .nvIndex = nv_index,
                         .nameAlg = algorithm,
                         .attributes = TPMA_NV_CLEAR_STCLEAR |
-                                      TPMA_NV_ORDERLY |
+                                      (orderly ? TPMA_NV_ORDERLY : 0) |
                                       TPMA_NV_OWNERWRITE |
                                       TPMA_NV_AUTHWRITE |
                                       TPMA_NV_OWNERREAD |
@@ -7146,62 +7227,93 @@ static int tpm2_define_nvpcr_nv_index(
                 },
         };
 
-        rc = sym_Esys_NV_DefineSpace(
-                        c->esys_context,
-                        /* authHandle= */ ESYS_TR_RH_OWNER,
-                        /* shandle1= */ session ? session->esys_handle : ESYS_TR_PASSWORD,
-                        /* shandle2= */ ESYS_TR_NONE,
-                        /* shandle3= */ ESYS_TR_NONE,
-                        /* auth= */ NULL,
-                        &public_info,
-                        &new_handle->esys_handle);
-        if (rc == TPM2_RC_NV_SPACE)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOSPC),
-                                       "NV index space on TPM exhausted, cannot allocate NvPCR.");
-        if (rc == TPM2_RC_NV_DEFINED) {
-                log_debug("NV index 0x%" PRIu32 " already registered.", nv_index);
+        bool exhausted;
+        if (access(exhausted_flag, F_OK) < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Failed to check whether %s exists, assuming it does not: %m", exhausted_flag);
 
-                new_handle = tpm2_handle_free(new_handle);
+                _cleanup_(tpm2_handle_freep) Tpm2Handle *new_handle = NULL;
+                r = tpm2_handle_new(c, &new_handle);
+                if (r < 0)
+                        return r;
 
-                _cleanup_(Esys_Freep) TPM2B_NV_PUBLIC *nv_public_real = NULL;
-                r = tpm2_nv_index_to_handle(
-                                c,
-                                nv_index,
-                                session,
-                                &nv_public_real,
-                                /* ret_name= */ NULL,
-                                &new_handle);
-                if (r <= 0)
-                        return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                               "Failed to acquire handle to existing NV index 0x%" PRIu32 ".", nv_index);
+                new_handle->flush = false; /* This is a persistent NV index, don't flush hence */
 
-                log_debug("Successfully acquired handle to existing NV index 0x%" PRIx32 ".", nv_index);
+                rc = sym_Esys_NV_DefineSpace(
+                                c->esys_context,
+                                /* authHandle= */ ESYS_TR_RH_OWNER,
+                                /* shandle1= */ session ? session->esys_handle : ESYS_TR_PASSWORD,
+                                /* shandle2= */ ESYS_TR_NONE,
+                                /* shandle3= */ ESYS_TR_NONE,
+                                /* auth= */ NULL,
+                                &public_info,
+                                &new_handle->esys_handle);
+                if (rc == TPM2_RC_NV_SPACE) {
+                        /* Remember that we ran out of NV index space for this orderly mode, so that we don't keep
+                         * retrying the (doomed) allocation until reboot. */
+                        r = touch(exhausted_flag);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to create %s flag file, ignoring: %m", exhausted_flag);
 
-                if (nv_public_real->size < endoffsetof_field(TPMS_NV_PUBLIC, attributes) + sizeof_field(TPMS_NV_PUBLIC, dataSize) ||
-                    nv_public_real->nvPublic.nvIndex != public_info.nvPublic.nvIndex ||
-                    nv_public_real->nvPublic.nameAlg != public_info.nvPublic.nameAlg ||
-                    ((nv_public_real->nvPublic.attributes ^ public_info.nvPublic.attributes) & ~TPMA_NV_WRITTEN) != 0 ||
-                    nv_public_real->nvPublic.dataSize != public_info.nvPublic.dataSize)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EEXIST),
-                                               "Public data of nvindex 0x%x does not match our expectations.", nv_index);
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS),
+                                               "NV index space on TPM exhausted, cannot allocate NvPCR.");
+                }
+                if (rc == TSS2_RC_SUCCESS) {
+                        log_debug("NV Index 0x%" PRIx32 " successfully allocated.", nv_index);
 
-                log_debug("Public info for nvindex 0x%x checks out, using.", nv_index);
+                        if (ret_nv_handle)
+                                *ret_nv_handle = TAKE_PTR(new_handle);
 
-                if (ret_nv_handle)
-                        *ret_nv_handle = TAKE_PTR(new_handle);
+                        return 1;
+                }
+                if (rc != TPM2_RC_NV_DEFINED)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                               "Failed to allocate NV index: %s", sym_Tss2_RC_Decode(rc));
 
-                return 0;
+                log_debug("NV index 0x%" PRIx32 " already registered.", nv_index);
+                exhausted = false;
+        } else {
+                log_debug("TPM NV index space previously found exhausted (%s exists), refusing to allocate %s NvPCR, but checking if it already exists.",
+                          exhausted_flag, orderly ? "orderly" : "non-orderly");
+                exhausted = true;
         }
-        if (rc != TSS2_RC_SUCCESS)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                       "Failed to allocate NV index: %s", sym_Tss2_RC_Decode(rc));
 
-        log_debug("NV Index 0x%" PRIx32 " successfully allocated.", nv_index);
+        /* We either got told that this NV index already exists or we didn't even try to allocate it, because
+         * it failed before. Let's get information about it, in the hope it exists. */
+
+        _cleanup_(Esys_Freep) TPM2B_NV_PUBLIC *nv_public_real = NULL;
+        _cleanup_(tpm2_handle_freep) Tpm2Handle *new_handle = NULL;
+        r = tpm2_nv_index_to_handle(
+                        c,
+                        nv_index,
+                        session,
+                        &nv_public_real,
+                        /* ret_name= */ NULL,
+                        &new_handle);
+        if (r <= 0) {
+                if (exhausted)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS), "Unable to acquire NvPCR and space exhaustion was indicated before.");
+
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "Failed to acquire handle to NV index 0x%" PRIx32 ".", nv_index);
+        }
+
+        log_debug("Successfully acquired handle to existing NV index 0x%" PRIx32 ".", nv_index);
+
+        if (nv_public_real->size < endoffsetof_field(TPMS_NV_PUBLIC, attributes) + sizeof_field(TPMS_NV_PUBLIC, dataSize) ||
+            nv_public_real->nvPublic.nvIndex != public_info.nvPublic.nvIndex ||
+            nv_public_real->nvPublic.nameAlg != public_info.nvPublic.nameAlg ||
+            ((nv_public_real->nvPublic.attributes ^ public_info.nvPublic.attributes) & ~(TPMA_NV_WRITTEN|TPMA_NV_ORDERLY)) != 0 ||
+            nv_public_real->nvPublic.dataSize != public_info.nvPublic.dataSize)
+                return log_debug_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "Public data of nvindex 0x%" PRIx32 " does not match our expectations.", nv_index);
+
+        log_debug("Public info for nvindex 0x%" PRIx32 " checks out, using.", nv_index);
 
         if (ret_nv_handle)
                 *ret_nv_handle = TAKE_PTR(new_handle);
 
-        return 1;
+        return 0;
 }
 
 static int tpm2_extend_nvpcr_nv_index(
@@ -7897,6 +8009,7 @@ typedef struct NvPCRData {
         uint16_t algorithm;
         uint32_t nv_index;
         uint64_t priority;
+        bool orderly;
 } NvPCRData;
 
 static void nvpcr_data_done(NvPCRData *d) {
@@ -7937,12 +8050,14 @@ static int nvpcr_data_load(const char *name, NvPCRData *ret) {
                 { "algorithm", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_tpm2_algorithm, offsetof(NvPCRData, algorithm), 0                 },
                 { "nvIndex",   _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint32,      offsetof(NvPCRData, nv_index),  SD_JSON_MANDATORY },
                 { "priority",  _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,      offsetof(NvPCRData, priority),  0                 },
+                { "orderly",   SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,     offsetof(NvPCRData, orderly),   0                 },
                 {},
         };
 
         _cleanup_(nvpcr_data_done) NvPCRData p = {
                 .algorithm = TPM2_ALG_SHA256,
                 .priority = TPM2_NVPCR_PRIORITY_DEFAULT,
+                .orderly = true,
         };
         r = sd_json_dispatch(v, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &p);
         if (r < 0)
@@ -8573,6 +8688,7 @@ int tpm2_nvpcr_initialize(
                         session,
                         p.nv_index,
                         p.algorithm,
+                        p.orderly,
                         &nv_handle);
         if (r < 0)
                 return r;
@@ -9642,6 +9758,7 @@ int tpm2_make_luks2_json(
                 uint32_t hash_pcr_mask,
                 uint16_t pcr_bank,
                 const struct iovec *pubkey,
+                const char *pubkey_policy_ref,
                 uint32_t pubkey_pcr_mask,
                 uint16_t primary_alg,
                 const struct iovec blobs[],
@@ -9659,6 +9776,7 @@ int tpm2_make_luks2_json(
         int r;
 
         assert(iovec_is_valid(pubkey));
+        assert(!pubkey_policy_ref || iovec_is_set(pubkey));
         assert(n_blobs >= 1);
         assert(n_policy_hash >= 1);
 
@@ -9702,6 +9820,7 @@ int tpm2_make_luks2_json(
                         SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK), "tpm2_pcrlock", SD_JSON_BUILD_BOOLEAN(true)),
                         SD_JSON_BUILD_PAIR_CONDITION(pubkey_pcr_mask != 0, "tpm2_pubkey_pcrs", SD_JSON_BUILD_VARIANT(pkmj)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pubkey), "tpm2_pubkey", JSON_BUILD_IOVEC_BASE64(pubkey)),
+                        SD_JSON_BUILD_PAIR_CONDITION(pubkey_policy_ref != NULL, "tpm2_pubkey_ref", SD_JSON_BUILD_STRING(pubkey_policy_ref)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(salt), "tpm2_salt", JSON_BUILD_IOVEC_BASE64(salt)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(srk), "tpm2_srk", JSON_BUILD_IOVEC_BASE64(srk)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pcrlock_nv), "tpm2_pcrlock_nv", JSON_BUILD_IOVEC_BASE64(pcrlock_nv)));
@@ -9777,6 +9896,7 @@ int tpm2_parse_luks2_json(
                 uint32_t *ret_hash_pcr_mask,
                 uint16_t *ret_pcr_bank,
                 struct iovec *ret_pubkey,
+                char **ret_pubkey_policy_ref,
                 uint32_t *ret_pubkey_pcr_mask,
                 uint16_t *ret_primary_alg,
                 struct iovec **ret_blobs,
@@ -9789,6 +9909,7 @@ int tpm2_parse_luks2_json(
                 TPM2Flags *ret_flags) {
 
         _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+        _cleanup_free_ char *pubkey_ref = NULL;
         uint32_t hash_pcr_mask = 0, pubkey_pcr_mask = 0;
         uint16_t primary_alg = 0;
         uint16_t pcr_bank = UINT16_MAX; /* default: pick automatically */
@@ -9911,6 +10032,16 @@ int tpm2_parse_luks2_json(
         } else if (pubkey_pcr_mask != 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Public key PCR mask set, but not public key included in JSON data, refusing.");
 
+        w = sd_json_variant_by_key(v, "tpm2_pubkey_ref");
+        if (w) {
+                const char *s = sd_json_variant_string(w);
+                if (!s)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Public key policy reference is not a string.");
+                pubkey_ref = strdup(s);
+                if (!pubkey_ref)
+                        return log_oom_debug();
+        }
+
         w = sd_json_variant_by_key(v, "tpm2_srk");
         if (w) {
                 r = json_variant_unbase64_iovec(w, &srk);
@@ -9933,6 +10064,8 @@ int tpm2_parse_luks2_json(
                 *ret_pcr_bank = pcr_bank;
         if (ret_pubkey)
                 *ret_pubkey = TAKE_STRUCT(pubkey);
+        if (ret_pubkey_policy_ref)
+                *ret_pubkey_policy_ref = TAKE_PTR(pubkey_ref);
         if (ret_pubkey_pcr_mask)
                 *ret_pubkey_pcr_mask = pubkey_pcr_mask;
         if (ret_primary_alg)

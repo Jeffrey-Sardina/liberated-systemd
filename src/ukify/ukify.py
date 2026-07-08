@@ -292,6 +292,7 @@ class UkifyConfig:
     pcrsig: Union[str, Path, None]
     join_pcrsig: Optional[Path]
     phase_path_groups: Optional[list[str]]
+    policyrefs: Optional[list[str]]
     policy_digest: bool
     profile: Optional[str]
     sb_cert: Union[str, Path, None]
@@ -419,6 +420,11 @@ DEFAULT_SECTIONS_TO_SHOW = {
     '.profile': 'text',
 }  # fmt: skip
 
+# Sections that may legitimately appear more than once within a single profile: they carry one entry
+# per hardware variant and the firmware picks the matching one at boot. 'inspect --json' therefore
+# always reports them as a list, and add_section() allows them to repeat.
+MULTI_INSTANCE_SECTIONS = ('.dtbauto', '.efifw')
+
 
 @dataclasses.dataclass
 class Section:
@@ -490,9 +496,8 @@ class UKI:
             if s.name == '.profile':
                 start = i + 1
 
-        multiple_allowed_sections = ['.dtbauto', '.efifw']
         if any(
-            section.name == s.name for s in self.sections[start:] if s.name not in multiple_allowed_sections
+            section.name == s.name for s in self.sections[start:] if s.name not in MULTI_INSTANCE_SECTIONS
         ):
             raise ValueError(f'Duplicate section {section.name}')
 
@@ -697,7 +702,7 @@ def check_cert_and_keys_nonexistent(opts: UkifyConfig) -> None:
     # Raise if any of the keys and certs are found on disk
     paths: Iterator[Union[str, Path, None]] = itertools.chain(
         (opts.sb_key, opts.sb_cert),
-        *((priv_key, pub_key, cert) for priv_key, pub_key, cert, _ in key_path_groups(opts)),
+        *((priv_key, pub_key, cert) for priv_key, pub_key, cert, _, _ in key_path_groups(opts)),
     )
     for path in paths:
         if path and Path(path).exists():
@@ -735,7 +740,9 @@ def combine_signatures(pcrsigs: list[dict[str, str]]) -> str:
     return json.dumps(combined)
 
 
-def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Optional[str], Optional[str]]]:
+def key_path_groups(
+    opts: UkifyConfig,
+) -> Iterator[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]]:
     if not opts.pcr_private_keys:
         return
 
@@ -743,12 +750,14 @@ def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Opt
     pub_keys = opts.pcr_public_keys or []
     certs = opts.pcr_certificates or []
     pp_groups = opts.phase_path_groups or []
+    policyrefs = opts.policyrefs or []
 
     yield from itertools.zip_longest(
         opts.pcr_private_keys,
         pub_keys[:n_priv],
         certs[:n_priv],
         pp_groups[:n_priv],
+        policyrefs[:n_priv],
         fillvalue=None,
     )
 
@@ -870,7 +879,7 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                 *(f'--bank={bank}' for bank in banks),
             ]
 
-            for priv_key, pub_key, cert, group in key_path_groups(opts):
+            for priv_key, pub_key, cert, group, ref in key_path_groups(opts):
                 extra = [f'--private-key={priv_key}']
                 if opts.signing_engine is not None:
                     assert pub_key or cert
@@ -895,6 +904,8 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                     extra += [f'--certificate-source=provider:{opts.certificate_provider}']
 
                 extra += [f'--phase={phase_path}' for phase_path in group or ()]
+                if ref is not None:
+                    extra += [f'--policyref={ref}']
 
                 print('+', shell_join(cmd + extra), file=sys.stderr)  # type: ignore
                 output = subprocess.check_output(cmd + extra, text=True)  # type: ignore
@@ -1674,7 +1685,7 @@ def generate_keys(opts: UkifyConfig) -> None:
 
         work = True
 
-    for priv_key, pub_key, _, _ in key_path_groups(opts):
+    for priv_key, pub_key, _, _, _ in key_path_groups(opts):
         priv_key_pem, pub_key_pem = generate_priv_pub_key_pair()
 
         print(f'Writing private key for PCR signing to {priv_key}', file=sys.stderr)
@@ -1695,14 +1706,15 @@ def generate_keys(opts: UkifyConfig) -> None:
 def inspect_section(
     opts: UkifyConfig,
     section: pefile.SectionStructure,
-) -> tuple[str, Optional[dict[str, Union[int, str]]]]:
-    name = pe_strip_section_name(section.Name)
-
-    # find the config for this section in opts and whether to show it
+    name: str,
+    force: bool = False,
+) -> Optional[dict[str, Union[int, str]]]:
+    # find the config for this section in opts and whether to show it ('force' is used for the
+    # '.profile' delimiters, which must always appear in the JSON profile structure)
     config = opts.sections_by_name.get(name, None)
-    show = config or opts.all or (name in DEFAULT_SECTIONS_TO_SHOW and not opts.sections)
+    show = force or config or opts.all or (name in DEFAULT_SECTIONS_TO_SHOW and not opts.sections)
     if not show:
-        return name, None
+        return None
 
     ttype = config.output_mode if config else DEFAULT_SECTIONS_TO_SHOW.get(name, 'binary')
 
@@ -1732,7 +1744,26 @@ def inspect_section(
             text = textwrap.indent(cast(str, struct['text']).rstrip(), ' ' * 4)
             print(f'  text:\n{text}')
 
-    return name, struct
+    return struct
+
+
+def add_section_to_profile(profile: dict[str, Any], name: str, desc: dict[str, Union[int, str]]) -> None:
+    # Sections in MULTI_INSTANCE_SECTIONS can occur multiple times within the same profile so always
+    # report them as a list even when there's a single entry. Every other section is unique within a
+    # profile and is reported as a plain object keyed by name. A repeat of such a section means the
+    # image is malformed; warn, but still report every instance by turning the entry into a list so
+    # nothing is dropped.
+    if name in MULTI_INSTANCE_SECTIONS:
+        profile.setdefault(name, [])
+        profile[name] += [desc]
+    elif name not in profile:
+        profile[name] = desc
+    else:
+        print(f'Unexpected duplicate {name!r} section, reporting all instances as a list', file=sys.stderr)
+        if isinstance(profile[name], list):
+            profile[name] += [desc]
+        else:
+            profile[name] = [profile[name], desc]
 
 
 def inspect_sections(opts: UkifyConfig) -> None:
@@ -1740,10 +1771,36 @@ def inspect_sections(opts: UkifyConfig) -> None:
 
     for file in opts.files:
         pe = pefile.PE(file, fast_load=True)
-        gen = (inspect_section(opts, section) for section in pe.sections)
-        descs = {key: val for (key, val) in gen if val}
-        if opts.json != 'off':
-            json.dump(descs, sys.stdout, indent=indent)
+
+        # A UKI is a flat list of PE sections with profile structure: the sections before the first
+        # '.profile' section belong to the base profile, and each subsequent '.profile' section
+        # introduces a further profile whose sections (up to the next '.profile') override the base
+        # ones. For JSON output the base profile's sections are reported by name at the root (so e.g.
+        # '.cmdline' refers to the base profile) and the further profiles as separate by-name objects
+        # in the '_profiles' list. That key is '_profiles' and not 'profiles' so it can never collide
+        # with a section of that name: PE section names are at most 8 bytes, so a 9-byte key is never
+        # a section name.
+        emit_json = opts.json != 'off'
+        base: dict[str, Any] = {}
+        profiles: list[dict[str, Any]] = []
+        profile = base  # sections fill the base profile until the first '.profile' delimiter
+
+        for section in pe.sections:
+            name = pe_strip_section_name(section.Name)
+            if emit_json and name == '.profile':
+                profile = {}
+                profiles += [profile]
+
+            # The '.profile' delimiter is forced into the structure so every profile object carries
+            # its identity, even when --section filters out the other sections.
+            desc = inspect_section(opts, section, name, force=emit_json and name == '.profile')
+            if desc and emit_json:
+                add_section_to_profile(profile, name, desc)
+
+        if emit_json:
+            if profiles:
+                base['_profiles'] = profiles
+            json.dump(base, sys.stdout, indent=indent)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2201,6 +2258,15 @@ CONFIG_ITEMS = [
         config_push=ConfigItem.config_set_group,
     ),
     ConfigItem(
+        '--policyref',
+        dest='policyrefs',
+        metavar='STRING',
+        action='append',
+        help='policy references to bind signatures to',
+        config_key='PCRSignature:/PolicyRef',
+        config_push=ConfigItem.config_set_group,
+    ),
+    ConfigItem(
         '--tools',
         type=Path,
         action='append',
@@ -2396,6 +2462,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
     n_pcr_pub = None if opts.pcr_public_keys is None else len(opts.pcr_public_keys)
     n_pcr_priv = None if opts.pcr_private_keys is None else len(opts.pcr_private_keys)
     n_phase_path_groups = None if opts.phase_path_groups is None else len(opts.phase_path_groups)
+    n_policyrefs = None if opts.policyrefs is None else len(opts.policyrefs)
     if opts.policy_digest and n_pcr_priv is not None:
         raise ValueError('--pcr-private-key= cannot be specified with --policy-digest')
     if (
@@ -2412,6 +2479,8 @@ def finalize_options(opts: argparse.Namespace) -> None:
         raise ValueError('--pcr-public-key= and --pcr-certificate= cannot be used at the same time')
     if n_phase_path_groups is not None and n_phase_path_groups != n_pcr_priv:
         raise ValueError('--phases= specifications must match --pcr-private-key=')
+    if n_policyrefs is not None and n_policyrefs != n_pcr_priv:
+        raise ValueError('--policyref= specifications must match --pcr-private-key=')
 
     opts.cmdline = resolve_at_path(opts.cmdline)
 

@@ -938,16 +938,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - drop nss-myhostname in favour of nss-resolve?
 
-- drop NV_ORDERLY flag from the product uuid nvpcr. Effect of the flag is that
-  it pushes the thing into TPM RAM, but a TPM usually has very little of that,
-  less than NVRAM. hence setting the flag amplifies space issues. Unsetting the
-  flag increases wear issues on the NVRAM, however, but this should be limited
-  for the product uuid nvpcr, since its only changed once per boot. this needs
-  to be configurable by nvpcr however, as other nvpcrs are different,
-  i.e. verity one receives many writes during system uptime quite
-  possibly. (also, NV_ORDERLY makes stuff faster, and dropping it costs
-  possibly up to 100ms supposedly)
-
 - **EFI:**
   - honor timezone efi variables for default timezone selection (if there are any?)
 
@@ -2435,6 +2425,12 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     as mass storage devices on systems that have a USB controller that can
     operate in device mode
   - add NVMe authentication
+
+- **sigpwr.target** doesn't do anything useful. Consider hooking it up to
+  poweroff.target.
+
+- Provide a fallback in **rescue.service** that prints a fixed message
+  if sulogin-shell could not be started.
 
 - support boot into nvme-over-tcp: add generator that allows specifying nvme
   devices on kernel cmdline + credentials. Also maybe add interactive mode

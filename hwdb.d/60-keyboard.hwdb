@@ -1432,6 +1432,10 @@ evdev:input:b0005v046DpB317*
  KEYBOARD_KEY_70047=brightnessdown
  KEYBOARD_KEY_70048=brightnessup
 
+# Logitech K950
+evdev:input:b0005v046DpB388*
+ KEYBOARD_KEY_100e1=micmute                             # Mic-mute key emits BTN_0
+
 # iTouch
 evdev:input:b0003v046DpC308*
  KEYBOARD_KEY_90001=shop                                # Shopping
@@ -1681,6 +1685,12 @@ evdev:name:AT Translated Set 2 keyboard:dmi:*:rvnMicro-StarInternationalCo.,Ltd.
 evdev:name:AT Translated Set 2 keyboard:dmi:*:rvnMicro-StarInternationalCo.,Ltd.:rnMS-1T8K:*
  KEYBOARD_KEY_b9=f15                                   # Right Face Button
  KEYBOARD_KEY_ba=f16                                   # Left Face Button
+
+# MSI Claw 8 EX AI+ CG3EM
+# Face-button scancodes are swapped compared to the older Claw models
+evdev:name:AT Translated Set 2 keyboard:dmi:*:rvnMicro-StarInternationalCo.,Ltd.:rnMS-1T91:*
+ KEYBOARD_KEY_db=f15                                   # Left Face Button
+ KEYBOARD_KEY_b9=f16                                   # Right Face Button
 
 # MSI Katana GF66 12UD toggles touchpad using Fn+F4 where the keyboard key is 76
 evdev:atkbd:dmi:*svnMicro-Star*:pnKatanaGF6612UD:*

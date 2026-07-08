@@ -78,8 +78,9 @@ conf.set10('FUZZ_USE_SIZE_LIMIT', fuzzer_build)
 # We'll set this to '1' for EFI builds in a different place.
 conf.set10('SD_BOOT', false)
 
-link_executor_shared = get_option('link-executor-shared')
-conf.set10('BUILD_EXECUTOR_SINGLE', link_executor_shared == 'single')
+conf.set10('SYSTEMD_MULTICALL_BINARY', get_option('systemd-multicall-binary'))
+
+conf.set10('BUILD_STATIC', get_option('build-static'))
 
 # Create a title-less summary section early, so it ends up first in the output.
 # More items are added later after they have been detected.
@@ -725,6 +726,9 @@ if fallback_hostname == '' or fallback_hostname[0] == '.' or fallback_hostname[0
 endif
 conf.set_quoted('FALLBACK_HOSTNAME', fallback_hostname)
 
+fallback_default_target = get_option('fallback-default-target')
+conf.set_quoted('FALLBACK_DEFAULT_TARGET', fallback_default_target)
+
 extra_net_naming_schemes = []
 extra_net_naming_map = []
 foreach scheme: get_option('extra-net-naming-schemes').split(',')
@@ -1024,13 +1028,18 @@ endif
 
 if get_option('libc') == 'musl'
         libcrypt = []
-        libcrypt_cflags = []
+        libcrypt_cflags = declare_dependency(
+                compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBCRYPT',
+        )
         have = get_option('libcrypt').allowed()
 else
         libcrypt = dependency('libcrypt', 'libxcrypt',
                               required : get_option('libcrypt'),
                               version : '>=4.4.0')
-        libcrypt_cflags = libcrypt.partial_dependency(includes: true, compile_args: true)
+        libcrypt_cflags = declare_dependency(
+                dependencies : libcrypt.partial_dependency(includes: true, compile_args: true),
+                compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBCRYPT',
+        )
         have = libcrypt.found()
 endif
 conf.set10('HAVE_LIBCRYPT', have)
@@ -1048,7 +1057,10 @@ bpf_compiler = get_option('bpf-compiler')
 libbpf = dependency('libbpf',
                     required : bpf_framework,
                     version : bpf_compiler == 'gcc' ? '>= 1.4.0' : '>= 0.1.0')
-libbpf_cflags = libbpf.partial_dependency(includes: true, compile_args: true)
+libbpf_cflags = declare_dependency(
+        dependencies : libbpf.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBBPF',
+)
 conf.set10('HAVE_LIBBPF', libbpf.found())
 
 libmount = dependency('mount',
@@ -1056,12 +1068,18 @@ libmount = dependency('mount',
                       required : get_option('libmount'))
 have = libmount.found()
 conf.set10('HAVE_LIBMOUNT', have)
-libmount_cflags = libmount.partial_dependency(includes: true, compile_args: true)
+libmount_cflags = declare_dependency(
+        dependencies : libmount.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBMOUNT',
+)
 
 libfdisk = dependency('fdisk',
                       version : '>= 2.35',
                       required : get_option('fdisk'))
-libfdisk_cflags = libfdisk.partial_dependency(includes: true, compile_args: true)
+libfdisk_cflags = declare_dependency(
+        dependencies : libfdisk.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBFDISK',
+)
 conf.set10('HAVE_LIBFDISK', libfdisk.found())
 
 # This prefers pwquality if both are enabled or auto.
@@ -1075,7 +1093,10 @@ if not have
         libpwquality = dependency('passwdqc',
                                   required : get_option('passwdqc'))
 endif
-libpwquality_cflags = libpwquality.partial_dependency(includes: true, compile_args: true)
+libpwquality_cflags = declare_dependency(
+        dependencies : libpwquality.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBPWQUALITY',
+)
 conf.set10('HAVE_PWQUALITY', have)
 conf.set10('HAVE_PASSWDQC', not have and libpwquality.found())
 
@@ -1083,19 +1104,28 @@ libseccomp = dependency('libseccomp',
                         version : '>= 2.4.0',
                         required : get_option('seccomp'))
 conf.set10('HAVE_SECCOMP', libseccomp.found())
-libseccomp_cflags = libseccomp.partial_dependency(includes: true, compile_args: true)
+libseccomp_cflags = declare_dependency(
+        dependencies : libseccomp.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBSECCOMP',
+)
 
 libselinux = dependency('libselinux',
                         version : '>= 2.1.9',
                         required : get_option('selinux'))
 conf.set10('HAVE_SELINUX', libselinux.found())
-libselinux_cflags = libselinux.partial_dependency(includes: true, compile_args: true)
+libselinux_cflags = declare_dependency(
+        dependencies : libselinux.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBSELINUX',
+)
 
 libapparmor = dependency('libapparmor',
                          version : '>= 2.13',
                          required : get_option('apparmor'))
 conf.set10('HAVE_APPARMOR', libapparmor.found())
-libapparmor_cflags = libapparmor.partial_dependency(includes: true, compile_args: true)
+libapparmor_cflags = declare_dependency(
+        dependencies : libapparmor.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBAPPARMOR',
+)
 
 have = get_option('smack') and get_option('smack-run-label') != ''
 conf.set10('HAVE_SMACK_RUN_LABEL', have)
@@ -1121,30 +1151,45 @@ conf.set10('ENABLE_POLKIT', install_polkit)
 libacl = dependency('libacl',
                     required : get_option('acl'))
 conf.set10('HAVE_ACL', libacl.found())
-libacl_cflags = libacl.partial_dependency(includes: true, compile_args: true)
+libacl_cflags = declare_dependency(
+        dependencies : libacl.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBACL',
+)
 
 libaudit = dependency('audit',
                       required : get_option('audit'))
 conf.set10('HAVE_AUDIT', libaudit.found())
-libaudit_cflags = libaudit.partial_dependency(includes: true, compile_args: true)
+libaudit_cflags = declare_dependency(
+        dependencies : libaudit.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBAUDIT',
+)
 
 libblkid = dependency('blkid',
                       version : '>=2.37.0',
                       required : get_option('blkid'))
 conf.set10('HAVE_BLKID', libblkid.found())
-libblkid_cflags = libblkid.partial_dependency(includes: true, compile_args: true)
+libblkid_cflags = declare_dependency(
+        dependencies : libblkid.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBBLKID',
+)
 
 libkmod = dependency('libkmod',
                      version : '>= 15',
                      required : get_option('kmod'))
 conf.set10('HAVE_KMOD', libkmod.found())
-libkmod_cflags = libkmod.partial_dependency(includes: true, compile_args: true)
+libkmod_cflags = declare_dependency(
+        dependencies : libkmod.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBKMOD',
+)
 
 libxenctrl = dependency('xencontrol',
                         version : '>= 4.9',
                         required : get_option('xenctrl'))
 conf.set10('HAVE_XENCTRL', libxenctrl.found())
-libxenctrl_cflags = libxenctrl.partial_dependency(includes: true, compile_args: true)
+libxenctrl_cflags = declare_dependency(
+        dependencies : libxenctrl.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBXENCTRL',
+)
 
 feature = get_option('pam')
 libpam = dependency('pam',
@@ -1154,13 +1199,19 @@ if not libpam.found()
         libpam = cc.find_library('pam', required : feature)
 endif
 conf.set10('HAVE_PAM', libpam.found())
-libpam_cflags = libpam.partial_dependency(includes: true, compile_args: true)
+libpam_cflags = declare_dependency(
+        dependencies : libpam.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBPAM',
+)
 
 libmicrohttpd = dependency('libmicrohttpd',
                            version : '>= 0.9.33',
                            required : get_option('microhttpd'))
 conf.set10('HAVE_MICROHTTPD', libmicrohttpd.found())
-libmicrohttpd_cflags = libmicrohttpd.partial_dependency(includes: true, compile_args: true)
+libmicrohttpd_cflags = declare_dependency(
+        dependencies : libmicrohttpd.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBMICROHTTPD',
+)
 
 libcryptsetup = get_option('libcryptsetup')
 libcryptsetup_plugins = get_option('libcryptsetup-plugins')
@@ -1174,7 +1225,10 @@ endif
 libcryptsetup = dependency('libcryptsetup',
                            version : '>= 2.4.0',
                            required : libcryptsetup)
-libcryptsetup_cflags = libcryptsetup.partial_dependency(includes: true, compile_args: true)
+libcryptsetup_cflags = declare_dependency(
+        dependencies : libcryptsetup.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBCRYPTSETUP',
+)
 
 have = libcryptsetup.found()
 conf.set10('HAVE_LIBCRYPTSETUP', have)
@@ -1184,19 +1238,28 @@ conf.set10('HAVE_LIBCRYPTSETUP_PLUGINS',
 libcurl = dependency('libcurl',
                      version : '>= 7.32.0',
                      required : get_option('libcurl'))
-libcurl_cflags = libcurl.partial_dependency(includes: true, compile_args: true)
+libcurl_cflags = declare_dependency(
+        dependencies : libcurl.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBCURL',
+)
 conf.set10('HAVE_LIBCURL', libcurl.found())
 conf.set10('CURL_NO_OLDIES', conf.get('BUILD_MODE_DEVELOPER') == 1)
 
 libidn2 = dependency('libidn2',
                      required : get_option('libidn2'))
-libidn2_cflags = libidn2.partial_dependency(includes: true, compile_args: true)
+libidn2_cflags = declare_dependency(
+        dependencies : libidn2.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBIDN2',
+)
 conf.set10('HAVE_LIBIDN2', libidn2.found())
 
 libqrencode = dependency('libqrencode',
                          version : '>= 3',
                          required : get_option('qrencode'))
-libqrencode_cflags = libqrencode.partial_dependency(includes: true, compile_args: true)
+libqrencode_cflags = declare_dependency(
+        dependencies : libqrencode.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBQRENCODE',
+)
 conf.set10('HAVE_QRENCODE', libqrencode.found())
 
 feature = get_option('gcrypt')
@@ -1204,7 +1267,10 @@ libgcrypt = dependency('libgcrypt',
                        required : feature.disabled() ? feature : false)
 conf.set10('HAVE_GCRYPT', libgcrypt.found())
 if libgcrypt.found()
-        libgcrypt_cflags = libgcrypt.partial_dependency(includes: true, compile_args: true)
+        libgcrypt_cflags = declare_dependency(
+                dependencies : libgcrypt.partial_dependency(includes: true, compile_args: true),
+                compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBGCRYPT',
+        )
 else
         libgcrypt_cflags = []
 endif
@@ -1213,48 +1279,78 @@ libgnutls = dependency('gnutls',
                        version : '>= 3.1.4',
                        required : get_option('gnutls'))
 conf.set10('HAVE_GNUTLS', libgnutls.found())
-libgnutls_cflags = libgnutls.partial_dependency(includes: true, compile_args: true)
+libgnutls_cflags = declare_dependency(
+        dependencies : libgnutls.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBGNUTLS',
+)
 
 libopenssl = dependency('openssl',
                         version : '>= 3.0.0',
                         required : get_option('openssl'))
-libopenssl_cflags = libopenssl.partial_dependency(includes: true, compile_args: true)
+libopenssl_cflags = declare_dependency(
+        dependencies : libopenssl.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBOPENSSL',
+)
 conf.set10('HAVE_OPENSSL', libopenssl.found())
 
 libp11kit = dependency('p11-kit-1',
                        version : '>= 0.23.3',
                        required : get_option('p11kit'))
 conf.set10('HAVE_P11KIT', libp11kit.found())
-libp11kit_cflags = libp11kit.partial_dependency(includes: true, compile_args: true)
+libp11kit_cflags = declare_dependency(
+        dependencies : libp11kit.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBP11KIT',
+)
 
 feature = get_option('libfido2').require(
         conf.get('HAVE_OPENSSL') == 1,
         error_message : 'openssl required')
 libfido2 = dependency('libfido2',
                       required : feature)
-libfido2_cflags = libfido2.partial_dependency(includes: true, compile_args: true)
+libfido2_cflags = declare_dependency(
+        dependencies : libfido2.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBFIDO2',
+)
 conf.set10('HAVE_LIBFIDO2', libfido2.found())
 
-tpm2 = dependency('tss2-esys tss2-rc tss2-mu tss2-tcti-device',
-                  required : get_option('tpm2'))
-tpm2_cflags = tpm2.partial_dependency(includes: true, compile_args: true)
-conf.set10('HAVE_TPM2', tpm2.found())
-conf.set10('HAVE_TSS2_ESYS3', tpm2.found() and tpm2.version().version_compare('>= 3.0.0'))
+tss2_esys = dependency('tss2-esys', required : get_option('tpm2'))
+tss2_mu = dependency('tss2-mu', required : get_option('tpm2'))
+tss2_rc = dependency('tss2-rc', required : get_option('tpm2'))
+tss2_tcti_device = dependency('tss2-tcti-device', required : get_option('tpm2'))
+tpm2_cflags = declare_dependency(
+        dependencies : [
+                tss2_esys.partial_dependency(includes: true, compile_args: true),
+                tss2_mu.partial_dependency(includes: true, compile_args: true),
+                tss2_rc.partial_dependency(includes: true, compile_args: true),
+                tss2_tcti_device.partial_dependency(includes: true, compile_args: true),
+        ],
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_TPM2',
+)
+conf.set10('HAVE_TPM2', tss2_esys.found() and tss2_mu.found() and tss2_rc.found() and tss2_tcti_device.found())
+conf.set10('HAVE_TSS2_ESYS3', tss2_esys.found() and tss2_esys.version().version_compare('>= 3.0.0'))
 conf.set('TPM2_NVPCR_BASE', get_option('tpm2-nvpcr-base'))
 
 libdw = dependency('libdw',
                    version : '>=0.177',
                    required : get_option('elfutils'))
-libdw_cflags = libdw.partial_dependency(includes: true, compile_args: true)
 libelf = dependency('libelf',
                     required : get_option('elfutils'))
-libelf_cflags = libelf.partial_dependency(includes: true, compile_args: true)
+libelf_cflags = declare_dependency(
+        dependencies : [
+                libelf.partial_dependency(includes: true, compile_args: true),
+                libdw.partial_dependency(includes: true, compile_args: true),
+        ],
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBELF',
+)
 conf.set10('HAVE_ELFUTILS', libdw.found() and libelf.found())
 
 libz = dependency('zlib',
                   required : get_option('zlib'))
 conf.set10('HAVE_ZLIB', libz.found())
-libz_cflags = libz.partial_dependency(includes: true, compile_args: true)
+libz_cflags = declare_dependency(
+        dependencies : libz.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBZ',
+)
 
 feature = get_option('bzip2')
 libbzip2 = dependency('bzip2',
@@ -1264,24 +1360,36 @@ if not libbzip2.found()
         libbzip2 = cc.find_library('bz2', required : feature)
 endif
 conf.set10('HAVE_BZIP2', libbzip2.found())
-libbzip2_cflags = libbzip2.partial_dependency(includes: true, compile_args: true)
+libbzip2_cflags = declare_dependency(
+        dependencies : libbzip2.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBBZIP2',
+)
 
 libxz = dependency('liblzma',
                    required : get_option('xz'))
 conf.set10('HAVE_XZ', libxz.found())
-libxz_cflags = libxz.partial_dependency(includes: true, compile_args: true)
+libxz_cflags = declare_dependency(
+        dependencies : libxz.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBXZ',
+)
 
 liblz4 = dependency('liblz4',
                     version : '>= 1.3.0',
                     required : get_option('lz4'))
 conf.set10('HAVE_LZ4', liblz4.found())
-liblz4_cflags = liblz4.partial_dependency(includes: true, compile_args: true)
+liblz4_cflags = declare_dependency(
+        dependencies : liblz4.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBLZ4',
+)
 
 libzstd = dependency('libzstd',
                      version : '>= 1.4.0',
                      required : get_option('zstd'))
 conf.set10('HAVE_ZSTD', libzstd.found())
-libzstd_cflags = libzstd.partial_dependency(includes: true, compile_args: true)
+libzstd_cflags = declare_dependency(
+        dependencies : libzstd.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBZSTD',
+)
 
 conf.set10('HAVE_COMPRESSION', libxz.found() or liblz4.found() or libzstd.found())
 
@@ -1317,18 +1425,27 @@ conf.set('DEFAULT_COMPRESSION', 'COMPRESSION_@0@'.format(compression.to_upper())
 libarchive = dependency('libarchive',
                         version : '>= 3.0',
                         required : get_option('libarchive'))
-libarchive_cflags = libarchive.partial_dependency(includes: true, compile_args: true)
+libarchive_cflags = declare_dependency(
+        dependencies : libarchive.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBARCHIVE',
+)
 conf.set10('HAVE_LIBARCHIVE', libarchive.found())
 
 libxkbcommon = dependency('xkbcommon',
                           version : '>= 0.3.0',
                           required : get_option('xkbcommon'))
-libxkbcommon_cflags = libxkbcommon.partial_dependency(includes: true, compile_args: true)
+libxkbcommon_cflags = declare_dependency(
+        dependencies : libxkbcommon.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBXKBCOMMON',
+)
 conf.set10('HAVE_XKBCOMMON', libxkbcommon.found())
 
 libpcre2 = dependency('libpcre2-8',
                       required : get_option('pcre2'))
-libpcre2_cflags = libpcre2.partial_dependency(includes: true, compile_args: true)
+libpcre2_cflags = declare_dependency(
+        dependencies : libpcre2.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBPCRE2',
+)
 conf.set10('HAVE_PCRE2', libpcre2.found())
 
 libglib =    dependency('glib-2.0',
@@ -1340,15 +1457,23 @@ libgobject = dependency('gobject-2.0',
 libgio =     dependency('gio-2.0',
                         required : get_option('glib'))
 conf.set10('HAVE_GLIB', libglib.found() and libgobject.found() and libgio.found())
-libglib_cflags = libglib.partial_dependency(includes: true, compile_args: true)
-libgobject_cflags = libgobject.partial_dependency(includes: true, compile_args: true)
-libgio_cflags = libgio.partial_dependency(includes: true, compile_args: true)
+libglib_cflags = declare_dependency(
+        dependencies : [
+                libglib.partial_dependency(includes: true, compile_args: true),
+                libgobject.partial_dependency(includes: true, compile_args: true),
+                libgio.partial_dependency(includes: true, compile_args: true),
+        ],
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBGLIB',
+)
 
 libdbus = dependency('dbus-1',
                      version : '>= 1.3.2',
                      required : get_option('dbus'))
 conf.set10('HAVE_DBUS', libdbus.found())
-libdbus_cflags = libdbus.partial_dependency(includes: true, compile_args: true)
+libdbus_cflags = declare_dependency(
+        dependencies : libdbus.partial_dependency(includes: true, compile_args: true),
+        compile_args : '-DSYSTEMD_CFLAGS_MARKER_LIBDBUS',
+)
 
 dbusdatadir = libdbus.get_variable(pkgconfig: 'datadir', default_value: datadir) / 'dbus-1'
 
@@ -1690,7 +1815,7 @@ catalogs = []
 modules = [] # nss, pam, and other plugins
 executables = []
 executables_by_name = {}
-objects_by_name = {}
+exported_by_name = {}
 fuzzer_exes = []
 sources = []
 
@@ -1807,12 +1932,16 @@ if static_libsystemd != 'false'
                 install_tag: 'libsystemd',
                 install_dir : libdir,
                 pic : static_libsystemd_pic,
-                dependencies : [liblz4_cflags,
-                                libm,
-                                libucontext,
-                                libxz_cflags,
-                                libzstd_cflags,
-                                userspace],
+                dependencies : [
+                        libbzip2_cflags,
+                        liblz4_cflags,
+                        libm,
+                        libucontext,
+                        libxz_cflags,
+                        libz_cflags,
+                        libzstd_cflags,
+                        userspace,
+                ],
                 c_args : libsystemd_c_args + (static_libsystemd_pic ? [] : ['-fno-PIC']))
 
         alias_target('libsystemd', libsystemd, install_libsystemd_static)
@@ -1850,8 +1979,15 @@ if static_libudev != 'false'
                 install_tag: 'libudev',
                 install_dir : libdir,
                 link_depends : libudev_sym,
-                dependencies : [libshared_deps,
-                                userspace],
+                dependencies : [
+                        libbzip2_cflags,
+                        liblz4_cflags,
+                        libshared_deps,
+                        libxz_cflags,
+                        libz_cflags,
+                        libzstd_cflags,
+                        userspace,
+                ],
                 c_args : static_libudev_pic ? [] : ['-fno-PIC'],
                 pic : static_libudev_pic)
 
@@ -1971,6 +2107,9 @@ module_additional_kwargs = {
 
 #####################################################################
 
+# 'src/core' embeds a built-in copy of some unit files, so the unit file list
+# from 'units' must be defined first.
+subdir('units')
 # systemd-analyze requires 'libcore'
 subdir('src/core')
 # systemd-networkd requires 'libsystemd_network'
@@ -2137,7 +2276,7 @@ foreach dict : executables
                 continue
         endif
 
-        exe_sources = dict.get('sources', []) + dict.get('extract', [])
+        exe_sources = dict.get('sources', []) + dict.get('export', [])
 
         foreach bpf_name : dict.get('bpf_programs', [])
                 if bpf_name in bpf_programs_by_name
@@ -2148,7 +2287,7 @@ foreach dict : executables
         kwargs = {}
         foreach key, val : dict
                 if key in ['name', 'dbus', 'public', 'conditions', 'type', 'suite',
-                           'timeout', 'parallel', 'objects', 'sources', 'extract',
+                           'timeout', 'parallel', 'sources', 'import', 'export',
                            'include_directories', 'build_by_default', 'install',
                            'bpf_programs']
                         continue
@@ -2166,9 +2305,9 @@ foreach dict : executables
                 include_directories += fs.parent(exe_sources[0])
         endif
 
-        foreach val : dict.get('objects', [])
-                obj = objects_by_name[val]
-                kwargs += { 'objects' : kwargs.get('objects', []) + obj['objects'] }
+        foreach val : dict.get('import', [])
+                obj = exported_by_name[val]
+                kwargs += { 'objects' : kwargs.get('objects', []) + obj['exported'] }
                 include_directories += obj['include_directories']
         endforeach
 
@@ -2215,11 +2354,11 @@ foreach dict : executables
                 sources += exe_sources
         endif
 
-        if dict.has_key('extract')
-                objects_by_name += {
+        if 'export' in dict
+                exported_by_name += {
                         name : {
-                                'objects' : exe.extract_objects(dict['extract']),
-                                'include_directories' : fs.parent(dict['extract'][0]),
+                                'exported' : exe.extract_objects(dict['export']),
+                                'include_directories' : fs.parent(dict['export'][0]),
                         }
                 }
         endif
@@ -2462,7 +2601,6 @@ subdir('shell-completion/zsh')
 subdir('sysctl.d')
 subdir('sysusers.d')
 subdir('tmpfiles.d')
-subdir('units')
 
 install_subdir('factory/etc',
                install_dir : factorydir)
@@ -2580,7 +2718,7 @@ if meson.version().version_compare('>=1.4.0')
         uniq = {}
 
         foreach source : sources
-                if uniq.has_key(source.full_path())
+                if source.full_path() in uniq
                         continue
                 endif
                 uniq += {source.full_path(): source}
@@ -2750,6 +2888,7 @@ summary({
         'nobody user name'                          : nobody_user,
         'nobody group name'                         : nobody_group,
         'fallback hostname'                         : get_option('fallback-hostname'),
+        'fallback default target'                   : fallback_default_target,
         'default compression method'                : compression,
         'default DNSSEC mode'                       : default_dnssec,
         'default DNS-over-TLS mode'                 : default_dns_over_tls,

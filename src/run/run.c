@@ -552,19 +552,24 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG("on-calendar", "SPEC", "Realtime timer"): {
                         _cleanup_(calendar_spec_freep) CalendarSpec *cs = NULL;
 
-                        r = calendar_spec_from_string(opts.arg, &cs);
+                        r = calendar_spec_from_string_full(opts.arg, &cs, /* warn_on_weekday_mismatch= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse calendar event specification: %m");
 
                         /* Let's make sure the given calendar event is not in the past */
                         r = calendar_spec_next_usec(cs, now(CLOCK_REALTIME), NULL);
-                        if (r == -ENOENT)
-                                /* The calendar event is in the past — let's warn about this, but install it
-                                 * anyway as is. The service manager will trigger the service right away.
-                                 * Moreover, the server side might have a different clock or timezone than we
-                                 * do, hence it should decide when or whether to run something. */
-                                log_warning("Specified calendar expression is in the past, proceeding anyway.");
-                        else if (r < 0)
+                        if (r == -ENOENT) {
+                                /* The calendar event might be in the past, so let's warn about this, but
+                                 * install it anyway as is. The service manager will trigger the service
+                                 * right away. Moreover, the server side might have a different clock or
+                                 * timezone than we do, hence it should decide when or whether to run
+                                 * something.
+                                 *
+                                 * However, a mismatching weekday for a fixed date also results in -ENOENT,
+                                 * and was already warned about when parsing. */
+                                if (!calendar_spec_weekday_conflicts(cs, NULL))
+                                        log_warning("Specified calendar expression is in the past, proceeding anyway.");
+                        } else if (r < 0)
                                 return log_error_errno(r, "Failed to calculate next time calendar expression elapses: %m");
 
                         r = add_timer_property("OnCalendar", opts.arg);
@@ -968,14 +973,20 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                         arg_working_directory = mfree(arg_working_directory);
         }
 
-        if (!arg_exec_user && (arg_area || arg_empower)) {
+        if (!arg_exec_user) {
                 /* If the user specifies --area= but not --user= then consider this an area switch request,
                  * and default to logging into our own account.
                  *
                  * If the user specifies --empower but not --user= then consider this a request to empower
-                 * the current user. */
+                 * the current user.
+                 *
+                 * If neither --user=, --area= nor --empower is specified, default to switching to root
+                 * explicitly. */
 
-                arg_exec_user = getusername_malloc();
+                if (arg_area || arg_empower)
+                        arg_exec_user = getusername_malloc();
+                else
+                        arg_exec_user = strdup("root");
                 if (!arg_exec_user)
                         return log_oom();
         }

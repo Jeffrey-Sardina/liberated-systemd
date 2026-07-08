@@ -150,7 +150,10 @@ units = [
           'symlinks' : ['sockets.target.wants/']
         },
         { 'file' : 'systemd-mute-console@.service' },
-        { 'file' : 'system-systemd\\x2dmute\\x2dconsole.slice' },
+        {
+          'file' : 'system-systemd-mute-console.slice',
+          'name' : 'system-systemd\\x2dmute\\x2dconsole.slice',
+        },
         { 'file' : 'network-online.target' },
         { 'file' : 'network-pre.target' },
         { 'file' : 'network.target' },
@@ -242,11 +245,13 @@ units = [
         { 'file' : 'syslog.socket' },
         { 'file' : 'system-install.target' },
         {
-          'file' : 'system-systemd\\x2dcryptsetup.slice',
+          'file' : 'system-systemd-cryptsetup.slice',
+          'name' : 'system-systemd\\x2dcryptsetup.slice',
           'conditions' : ['HAVE_LIBCRYPTSETUP'],
         },
         {
-          'file' : 'system-systemd\\x2dveritysetup.slice',
+          'file' : 'system-systemd-veritysetup.slice',
+          'name' : 'system-systemd\\x2dveritysetup.slice',
           'conditions' : ['HAVE_LIBCRYPTSETUP'],
         },
         { 'file' : 'system-update-cleanup.service' },
@@ -855,6 +860,15 @@ units = [
           'symlinks' : ['system-install.target.wants/'],
         },
         {
+          'file' : 'systemd-sysinstall.socket',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysinstall@.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+        },
+        {
           'file' : 'systemd-sysupdate-reboot.service',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
@@ -1070,6 +1084,33 @@ units = [
 udev_units = []
 hwdb_units = []
 
+# Unit files whose contents are embedded into the manager binary, so that it can
+# fall back to a built-in copy when the file is not present on disk. Referenced
+# from src/core/meson.build.
+embedded_unit_names = [
+        'basic.target',
+        'exit.target',
+        'final.target',
+        'graphical.target',
+        'halt.target',
+        'kexec.target',
+        'multi-user.target',
+        'poweroff.target',
+        'reboot.target',
+        'shutdown.target',
+        'sigpwr.target',
+        'soft-reboot.target',
+        'sysinit.target',
+        'systemd-exit.service',
+        'systemd-halt.service',
+        'systemd-kexec.service',
+        'systemd-poweroff.service',
+        'systemd-reboot.service',
+        'systemd-soft-reboot.service',
+        'umount.target',
+]
+embedded_units = []
+
 foreach unit : units
         source = unit.get('file')
 
@@ -1081,6 +1122,9 @@ foreach unit : units
                 needs_jinja = false
                 name = source
         endif
+        # Unit names that contain characters which are awkward in source file names (e.g. the
+        # backslash in \x2d escapes) are stored under a sanitized file name and renamed on install.
+        name = unit.get('name', name)
         source = files(source)
 
         install = true
@@ -1092,7 +1136,7 @@ foreach unit : units
         endforeach
 
         if needs_jinja
-                t = custom_target(
+                processed = custom_target(
                         input : source,
                         output : name,
                         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
@@ -1100,14 +1144,20 @@ foreach unit : units
                         install_dir : systemunitdir,
                         install_tag : unit.get('install_tag', ''))
                 if unit.get('install_tag', '') == 'udev'
-                        udev_units += t
+                        udev_units += processed
                 elif unit.get('install_tag', '') == 'hwdb'
-                        hwdb_units += t
+                        hwdb_units += processed
                 endif
         elif install
                 install_data(source,
+                             rename : name,
                              install_dir : systemunitdir,
                              install_tag : unit.get('install_tag', ''))
+        endif
+
+        if name in embedded_unit_names
+                # Embed either the processed output or the original file.
+                embedded_units += needs_jinja ? processed : source
         endif
 
         if install

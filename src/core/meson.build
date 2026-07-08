@@ -135,6 +135,13 @@ load_fragment_gperf_nulstr_c = custom_target(
         command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
         capture : true)
 
+generate_builtin_units = files('generate-builtin-units.py')
+builtin_units_inc = custom_target(
+        input : [generate_builtin_units, embedded_units],
+        output : 'builtin-units.inc',
+        command : [python, generate_builtin_units, embedded_units],
+        capture : true)
+
 generate_bpf_delegate_configs = files('generate-bpf-delegate-configs.py')
 bpf_delegate_configs_inc = custom_target(
         input : [generate_bpf_delegate_configs, bpf_delegate_sources],
@@ -155,8 +162,8 @@ bpf_delegate_xml = custom_target(
         capture : true)
 man_page_depends += bpf_delegate_xml
 
-generated_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_delegate_configs_inc]
-libcore_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_delegate_configs_inc]
+generated_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_delegate_configs_inc, builtin_units_inc]
+libcore_sources += [load_fragment_gperf_c, load_fragment_gperf_nulstr_c, bpf_delegate_configs_inc, builtin_units_inc]
 libcore_build_dir = meson.current_build_dir()
 libcore_name = 'systemd-core-@0@'.format(shared_lib_tag)
 core_includes = [include_directories('.'), includes]
@@ -167,14 +174,18 @@ libcore_static = static_library(
         include_directories : core_includes,
         implicit_include_directories : false,
         c_args : ['-fvisibility=default'],
-        dependencies : [libaudit_cflags,
-                        libbpf_cflags,
-                        libcryptsetup_cflags,
-                        libm,
-                        libmount_cflags,
-                        libseccomp_cflags,
-                        libselinux_cflags,
-                        userspace],
+        dependencies : [
+                libacl_cflags,
+                libaudit_cflags,
+                libbpf_cflags,
+                libcryptsetup_cflags,
+                libm,
+                libmount_cflags,
+                libpcre2_cflags,
+                libseccomp_cflags,
+                libselinux_cflags,
+                userspace,
+        ],
         build_by_default : false)
 
 libcore = shared_library(
@@ -203,21 +214,24 @@ core_libs_shared = [
 
 systemd_deps = [
         libapparmor_cflags,
+        libaudit_cflags,
         libkmod_cflags,
         libmount_cflags,
         libseccomp_cflags,
         libselinux_cflags,
 ]
 
-link_executor_shared = get_option('link-executor-shared')
+systemd_link_args = get_option('build-static') ? ['-static'] : []
+systemd_libs = get_option('build-static') ? core_libs_static : core_libs_shared
 
-executor_libs = link_executor_shared == 'true' ? core_libs_shared : core_libs_static
+executor_libs = get_option('link-executor-shared') ? core_libs_shared : core_libs_static
 
-if link_executor_shared == 'single'
+if conf.get('SYSTEMD_MULTICALL_BINARY') == 1
         systemd_sources += systemd_executor_sources
         systemd_deps += [
                 libbpf_cflags,
                 libcryptsetup_cflags,
+                libopenssl_cflags,
                 libpam_cflags,
         ]
 endif
@@ -228,7 +242,8 @@ executables += [
                 'dbus' : true,
                 'public' : true,
                 'sources' : systemd_sources,
-                'link_with' : core_libs_shared,
+                'link_args' : systemd_link_args,
+                'link_with' : systemd_libs,
                 'dependencies' : systemd_deps,
         },
 
@@ -256,7 +271,7 @@ executables += [
         },
 ]
 
-if link_executor_shared == 'single'
+if conf.get('SYSTEMD_MULTICALL_BINARY') == 1
         # Symlink for external callers
         install_symlink('systemd-executor',
                         pointing_to : 'systemd',
@@ -273,6 +288,7 @@ else
                                 libbpf_cflags,
                                 libcryptsetup_cflags,
                                 libmount_cflags,
+                                libopenssl_cflags,
                                 libpam_cflags,
                                 libseccomp_cflags,
                                 libselinux_cflags,
