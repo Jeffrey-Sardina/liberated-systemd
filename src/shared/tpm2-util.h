@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-dlopen.h"
-
 #include "bitfield.h"
+#include "crypto-util.h"
+#include "dlopen-note.h"
 #include "iovec-util.h"
 #include "shared-forward.h"
 #include "sha256.h"
 
 typedef enum TPM2Flags {
-        TPM2_FLAGS_USE_PIN     = 1 << 0,
-        TPM2_FLAGS_USE_PCRLOCK = 1 << 1,
+        TPM2_FLAGS_USE_PIN      = 1 << 0,
+        TPM2_FLAGS_USE_PCRLOCK  = 1 << 1,
+        TPM2_FLAGS_USE_ARGON2ID = 1 << 2,
 } TPM2Flags;
 
 /* As per https://trustedcomputinggroup.org/wp-content/uploads/TCG_PCClient_PFP_r1p05_v23_pub.pdf a
@@ -47,35 +48,27 @@ static inline bool TPM2_PCR_MASK_VALID(uint32_t pcr_mask) {
 
 #define TPM2_N_HASH_ALGORITHMS 4U
 
-int dlopen_tpm2(int log_level);
+int dlopen_tpm2(int log_level) _dlopen_loader_;
 
-#if HAVE_TPM2
-#ifndef SYSTEMD_CFLAGS_MARKER_TPM2
-#  error "missing tpm2_cflags in meson dependency."
-#endif
+/* tpm2_unseal() returns a bunch of different errors for various flavours of PCR issues, let's group them.
+ * Kept outside the HAVE_TPM2 guard as callers switch on these errnos even in builds without TPM2. */
+#define ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r) IN_SET(r, -EREMCHG, -ENOANO, -EUCLEAN, -EPERM)
 
-#define TPM2_ESYS_NOTE(priority) \
-        SD_ELF_NOTE_DLOPEN("tpm", "Support for TPM", priority, "libtss2-esys.so.0")
-#define TPM2_RC_NOTE(priority) \
-        SD_ELF_NOTE_DLOPEN("tpm", "Support for TPM", priority, "libtss2-rc.so.0")
-#define TPM2_MU_NOTE(priority) \
-        SD_ELF_NOTE_DLOPEN("tpm", "Support for TPM", priority, "libtss2-mu.so.0")
-#define TPM2_TCTI_DEVICE_NOTE(priority) \
-        SD_ELF_NOTE_DLOPEN("tpm", "Support for TPM", priority, "libtss2-tcti-device.so.0")
-
-#define TPM2_NOTE(priority)                                             \
-        ({                                                              \
-                TPM2_ESYS_NOTE(priority);                               \
-                TPM2_RC_NOTE(priority);                                 \
-                TPM2_MU_NOTE(priority);                                 \
-                TPM2_TCTI_DEVICE_NOTE(priority);                        \
-        })
+/* Errors that mean the tried TPM2 token does not match the boot state, be it due to wrong PCR state, a
+ * different PCR signing key/policy, a different TPM, or an unusable NV index. The caller should keep trying
+ * other tokens. */
+#define ERRNO_IS_NEG_TPM2_TOKEN_MISMATCH(r) IN_SET(r, -EREMCHG, -ENOANO, -EPERM, -ENOSTR, -EREMOTE, -EADDRNOTAVAIL)
 
 #define DLOPEN_TPM2(log_level, priority)                                \
         ({                                                              \
                 TPM2_NOTE(priority);                                    \
                 dlopen_tpm2(log_level);                                 \
         })
+
+#if HAVE_TPM2
+#ifndef SYSTEMD_CFLAGS_MARKER_TPM2
+#  error "missing tpm2_cflags in meson dependency."
+#endif
 
 #include <tss2/tss2_esys.h>     /* IWYU pragma: export */
 #include <tss2/tss2_mu.h>       /* IWYU pragma: export */
@@ -378,8 +371,9 @@ int tpm2_get_or_create_ek(Tpm2Context *c, const Tpm2Handle *session, TPM2B_PUBLI
 int tpm2_seal(Tpm2Context *c, uint32_t seal_key_handle, const TPM2B_DIGEST policy_hash[], size_t n_policy, const char *pin, struct iovec *ret_secret, struct iovec **ret_blobs, size_t *ret_n_blobs, uint16_t *ret_primary_alg, struct iovec *ret_srk);
 int tpm2_unseal(Tpm2Context *c, uint32_t hash_pcr_mask, uint16_t pcr_bank, const struct iovec *pubkey, const char *pubkey_policy_ref, uint32_t pubkey_pcr_mask, sd_json_variant *signature, const char *pin, const Tpm2PCRLockPolicy *pcrlock_policy, uint16_t primary_alg, const struct iovec blobs[], size_t n_blobs, const struct iovec known_policy_hash[], size_t n_known_policy_hash, const struct iovec *srk, struct iovec *ret_secret);
 
-/* tpm2_unseal() returns a bunch of different errors for various flavours of PCR issues, let's group them */
-#define ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r) IN_SET(r, -EREMCHG, -ENOANO, -EUCLEAN, -EPERM)
+/* On load/import the return codes mean the key was wrapped for a different parent (INTEGRITY) or used a
+ * different template (SIZE), so it's probably not for our TPM. */
+#define TPM2_RC_IS_FOREIGN_KEY(rc) IN_SET((rc) & ~(TPM2_RC_N_MASK|TPM2_RC_P), TPM2_RC_INTEGRITY, TPM2_RC_SIZE)
 
 #if HAVE_OPENSSL
 int tpm2_tpm2b_public_to_openssl_pkey(const TPM2B_PUBLIC *public, EVP_PKEY **ret);
@@ -473,9 +467,10 @@ typedef struct Tpm2PCRValue {} Tpm2PCRValue;
 static inline int tpm2_pcrlock_search_file(const char *path, FILE **ret_file, char **ret_path) {
         return -ENOENT;
 }
-
-#define DLOPEN_TPM2(log_level, priority) dlopen_tpm2(log_level)
 #endif /* HAVE_TPM2 */
+
+int tpm2_argon2id_derive_split(const char *pin, const struct iovec *salt, const Argon2IdParameters *argon2id_params, struct iovec *ret_key1, char **ret_b64_pin);
+int tpm2_argon2id_hkdf(const struct iovec *key1, const struct iovec *unsealed, struct iovec *ret_volume_key);
 
 int tpm2_list_devices(bool legend, bool quiet);
 int tpm2_find_device_auto(char **ret);
@@ -483,8 +478,8 @@ int tpm2_find_device_auto(char **ret);
 int tpm2_make_pcr_json_array(uint32_t pcr_mask, sd_json_variant **ret);
 int tpm2_parse_pcr_json_array(sd_json_variant *v, uint32_t *ret);
 
-int tpm2_make_luks2_json(int keyslot, uint32_t hash_pcr_mask, uint16_t pcr_bank, const struct iovec *pubkey, const char *pubkey_policy_ref, uint32_t pubkey_pcr_mask, uint16_t primary_alg, const struct iovec blobs[], size_t n_blobs, const struct iovec policy_hash[], size_t n_policy_hash, const struct iovec *salt, const struct iovec *srk, const struct iovec *pcrlock_nv, TPM2Flags flags, sd_json_variant **ret);
-int tpm2_parse_luks2_json(sd_json_variant *v, int *ret_keyslot, uint32_t *ret_hash_pcr_mask, uint16_t *ret_pcr_bank, struct iovec *ret_pubkey, char **ret_pubkey_policy_ref, uint32_t *ret_pubkey_pcr_mask, uint16_t *ret_primary_alg, struct iovec **ret_blobs, size_t *ret_n_blobs, struct iovec **ret_policy_hash, size_t *ret_n_policy_hash, struct iovec *ret_salt, struct iovec *ret_srk, struct iovec *ret_pcrlock_nv, TPM2Flags *ret_flags);
+int tpm2_make_luks2_json(int keyslot, uint32_t hash_pcr_mask, uint16_t pcr_bank, const struct iovec *pubkey, const char *pubkey_policy_ref, uint32_t pubkey_pcr_mask, uint16_t primary_alg, const struct iovec blobs[], size_t n_blobs, const struct iovec policy_hash[], size_t n_policy_hash, const struct iovec *salt, const struct iovec *srk, const struct iovec *pcrlock_nv, TPM2Flags flags, const Argon2IdParameters *argon2id_params, sd_json_variant **ret);
+int tpm2_parse_luks2_json(sd_json_variant *v, int *ret_keyslot, uint32_t *ret_hash_pcr_mask, uint16_t *ret_pcr_bank, struct iovec *ret_pubkey, char **ret_pubkey_policy_ref, uint32_t *ret_pubkey_pcr_mask, uint16_t *ret_primary_alg, struct iovec **ret_blobs, size_t *ret_n_blobs, struct iovec **ret_policy_hash, size_t *ret_n_policy_hash, struct iovec *ret_salt, struct iovec *ret_srk, struct iovec *ret_pcrlock_nv, TPM2Flags *ret_flags, Argon2IdParameters *ret_argon2id_params);
 
 /* Before v258 we used to bind to PCR 7 by default at various places if no explicit PCR mask was set. With
  * v258 we stopped doing that (since the SecureBoot DB is as much subject to regular updates by tools such as

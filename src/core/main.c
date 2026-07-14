@@ -5,7 +5,7 @@
 #include <linux/vt.h>
 #include <stdlib.h>
 #include <sys/mount.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -41,6 +41,7 @@
 #include "dbus.h"
 #include "dbus-manager.h"
 #include "dev-setup.h"
+#include "dlopen-note.h"
 #include "efi-random.h"
 #include "emergency-action.h"
 #include "env-util.h"
@@ -2614,6 +2615,11 @@ static void log_execution_mode(bool *ret_first_boot) {
                         }
                 }
 
+                /* Make the first-boot file visible now: the credential import
+                 * consults in_first_boot() for systemd.credentials_boot_policy= which runs
+                 * before the manager object is created. */
+                (void) update_first_boot_file(first_boot);
+
                 assert_se(uname(&uts) >= 0);
 
                 if (strverscmp_improved(uts.release, KERNEL_BASELINE_VERSION) < 0)
@@ -2733,9 +2739,10 @@ static int initialize_runtime(
                 }
 
                 if (arg_no_new_privs) {
-                        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                        r = proc_set_nnp();
+                        if (r < 0) {
                                 *ret_error_message = "Failed to disable new privileges";
-                                return log_struct_errno(LOG_EMERG, errno,
+                                return log_struct_errno(LOG_EMERG, r,
                                                         LOG_MESSAGE("Failed to disable new privileges: %m"),
                                                         LOG_MESSAGE_ID(SD_MESSAGE_CORE_DISABLE_PRIVILEGES_STR));
                         }
@@ -2788,9 +2795,11 @@ static int initialize_runtime(
         if (r < 0)
                 log_warning_errno(r, "Failed to reset ambient capability set, ignoring: %m");
 
-        if (arg_timer_slack_nsec != NSEC_INFINITY)
-                if (prctl(PR_SET_TIMERSLACK, arg_timer_slack_nsec) < 0)
-                        log_warning_errno(errno, "Failed to adjust timer slack, ignoring: %m");
+        if (arg_timer_slack_nsec != NSEC_INFINITY) {
+                r = prctl_safe(PR_SET_TIMERSLACK, arg_timer_slack_nsec, 0, 0, 0);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to adjust timer slack, ignoring: %m");
+        }
 
         if (arg_syscall_archs) {
                 r = enforce_syscall_archs(arg_syscall_archs);
@@ -3561,7 +3570,7 @@ static int run_systemd(int argc, char *argv[]) {
          * reexecution we are then called 'systemd'. That is confusing, hence let's call us systemd
          * right-away. */
         program_invocation_short_name = systemd;
-        (void) prctl(PR_SET_NAME, systemd);
+        (void) proc_set_comm(systemd);
 
         /* Save the original command line */
         save_argc_argv(argc, argv);
@@ -3814,7 +3823,7 @@ static int run_systemd(int argc, char *argv[]) {
         }
 
         /* Building without libmount is allowed, but if it is compiled in, then we must be able to load it */
-        r = DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        r = DLOPEN_LIBMOUNT(LOG_DEBUG, required);
         if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
                 error_message = "Failed to load libmount.so";
                 goto finish;
@@ -4018,6 +4027,18 @@ finish:
 }
 
 int main(int argc, char *argv[]) {
+        LIBACL_NOTE(recommended);
+        LIBAPPARMOR_NOTE(recommended);
+        LIBAUDIT_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBBPF_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBKMOD_NOTE(recommended);
+        LIBPCRE2_NOTE(suggested);
+        LIBSECCOMP_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
 #if SYSTEMD_MULTICALL_BINARY
         if (invoked_as(argv, "executor"))
                 return run_executor(argc, argv);

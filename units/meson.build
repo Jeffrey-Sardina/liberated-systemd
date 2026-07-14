@@ -13,6 +13,10 @@ units = [
         { 'file' : 'breakpoint-pre-udev.service.in' },
         { 'file' : 'capsule@.service.in' },
         { 'file' : 'capsule.slice' },
+        {
+          'file' : 'clonesetup.target',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
         { 'file' : 'console-getty.service.in' },
         { 'file' : 'container-getty@.service.in' },
         {
@@ -1036,7 +1040,7 @@ units = [
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {
-          'file' : 'systemd-nsresourced.socket',
+          'file' : 'systemd-nsresourced.socket.in',
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {

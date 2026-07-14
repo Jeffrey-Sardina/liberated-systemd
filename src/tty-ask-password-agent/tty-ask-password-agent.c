@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -19,6 +19,7 @@
 #include "daemon-util.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "exit-status.h"
 #include "fd-util.h"
@@ -559,7 +560,7 @@ static int ask_on_this_console(const char *tty, char **arguments, PidRef *ret) {
         if (r < 0)
                 return r;
         if (r == 0) {
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGHUP) >= 0);
+                assert_se(prctl_safe(PR_SET_PDEATHSIG, SIGHUP, 0, 0, 0) >= 0);
 
                 STRV_FOREACH(i, arguments) {
                         char *k;
@@ -699,6 +700,8 @@ static int ask_on_consoles(char *argv[]) {
 
 static int run(int argc, char *argv[]) {
         int r;
+
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

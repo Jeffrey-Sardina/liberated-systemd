@@ -17,6 +17,7 @@ test_env = {
         'SYSTEMD_SLOW_TESTS' : want_slow_tests ? '1' : '0',
         'PYTHONDONTWRITEBYTECODE' : '1',
         'SYSTEMD_LIBC' : get_option('libc'),
+        'SYSTEMD_BUILD_MODE' : get_option('mode'),
 }
 if conf.get('ENABLE_LOCALED') == 1
         test_env += {'SYSTEMD_LANGUAGE_FALLBACK_MAP' : language_fallback_map}
@@ -299,7 +300,10 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-creds.c'),
-                'dependencies' : tpm2_cflags,
+                'dependencies' : [
+                        libopenssl_cflags,
+                        tpm2_cflags,
+                ],
         },
         test_template + {
                 'sources' : files('test-crypto-util.c'),
@@ -349,7 +353,7 @@ executables += [
                         libc_wrapper_static,
                         libbasic_static,
                 ],
-                'install' : false,
+                'install' : 'no',
                 'type' : 'manual',
         },
         test_template + {
@@ -721,7 +725,7 @@ if static_libsystemd != 'false'
                         'sources' : [test_libsystemd_sym_c],
                         'link_with' : install_libsystemd_static,
                         'build_by_default' : want_tests != 'false',
-                        'install' : install_tests,
+                        'install' : install_tests ? 'yes' : 'no',
                         'suite' : 'libsystemd',
                 },
         ]
@@ -736,7 +740,7 @@ if static_libudev != 'false'
                         'c_args' : ['-Wno-deprecated-declarations'] + test_cflags,
                         'link_with' : install_libudev_static,
                         'build_by_default' : want_tests != 'false',
-                        'install' : install_tests,
+                        'install' : install_tests ? 'yes' : 'no',
                         'suite' : 'libudev',
                 },
         ]

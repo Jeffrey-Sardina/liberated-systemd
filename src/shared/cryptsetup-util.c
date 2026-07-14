@@ -2,7 +2,6 @@
 
 #include <stdlib.h>
 
-#include "sd-dlopen.h"
 #include "sd-json.h"
 
 #include "alloc-util.h"
@@ -164,6 +163,7 @@ int cryptsetup_get_token_as_json(
          *      -EINVAL → token index out of range or "type" field missing
          *      -ENOENT → token doesn't exist
          * -EMEDIUMTYPE → "verify_type" specified and doesn't match token's type
+         *     -EUCLEAN → token JSON data cannot be parsed
          */
 
         r = sym_crypt_token_json_get(cd, idx, &text);
@@ -172,7 +172,7 @@ int cryptsetup_get_token_as_json(
 
         r = sd_json_parse(text, 0, &v, NULL, NULL);
         if (r < 0)
-                return r;
+                return r == -ENOMEM ? r : -EUCLEAN; /* Report unparseable token data in a single way for callers to skip */
 
         if (verify_type) {
                 sd_json_variant *w;
@@ -281,7 +281,7 @@ int dlopen_cryptsetup(int log_level) {
          * still available though, and given we want to support 2.2.0 for a while longer, we'll use the old
          * symbol if the new one is not available. */
 
-        CRYPTSETUP_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+        LIBCRYPTSETUP_NOTE(suggested);
 
         r = dlopen_many_sym_or_warn(
                         &cryptsetup_dl, "libcryptsetup.so.12", log_level,
