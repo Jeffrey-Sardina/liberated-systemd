@@ -3,7 +3,7 @@
 
 #include "dlfcn-util.h"
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBCRYPTSETUP
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBCRYPTSETUP
@@ -100,12 +100,6 @@ int cryptsetup_get_volume_key_id(struct crypt_device *cd, const char *volume_nam
 #endif
 
 int dlopen_cryptsetup(int log_level) _dlopen_loader_;
-
-#define DLOPEN_CRYPTSETUP(log_level, priority)                          \
-        ({                                                              \
-                LIBCRYPTSETUP_NOTE(priority);                           \
-                dlopen_cryptsetup(log_level);                           \
-        })
 
 int cryptsetup_get_keyslot_from_token(sd_json_variant *v);
 

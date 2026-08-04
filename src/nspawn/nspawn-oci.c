@@ -1826,7 +1826,7 @@ static int oci_seccomp(const char *name, sd_json_variant *v, sd_json_dispatch_fl
         if (r < 0)
                 return json_log(def, flags, r, "Unknown default action: %s", sd_json_variant_string(def));
 
-        r = DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended);
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return json_log(def, flags, r, "No support for libseccomp: %m");
 
@@ -2123,9 +2123,9 @@ int oci_load(FILE *f, const char *bundle, Settings **ret) {
         if (!s->bundle)
                 return log_oom();
 
-        r = oci_dispatch(oci, table, 0, s);
+        r = oci_dispatch(oci, table, /* flags= */ 0, s);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to parse OCI bundle configuration file '%s': %m", path);
 
         if (s->properties) {
                 r = sd_bus_message_seal(s->properties, 0, 0);

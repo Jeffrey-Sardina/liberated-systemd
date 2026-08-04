@@ -132,6 +132,8 @@ typedef struct Context {
 
         UGIDAllocationRange login_defs;
         bool login_defs_need_warning;
+
+        LabelContext *label_context;
 } Context;
 
 static void context_done(Context *c) {
@@ -152,6 +154,7 @@ static void context_done(Context *c) {
 
         set_free(c->names);
         uid_range_free(c->uid_range);
+        mac_label_context_free(c->label_context);
 }
 
 static void maybe_emit_login_defs_warning(Context *c) {
@@ -303,7 +306,7 @@ static int load_group_database(Context *c) {
         return r;
 }
 
-static int make_backup(const char *target, const char *x) {
+static int make_backup(const char *target, const char *x, LabelContext *label_context) {
         _cleanup_(unlink_and_freep) char *dst_tmp = NULL;
         _cleanup_fclose_ FILE *dst = NULL;
         _cleanup_close_ int src = -EBADF;
@@ -325,15 +328,17 @@ static int make_backup(const char *target, const char *x) {
         if (fstat(src, &st) < 0)
                 return -errno;
 
-        r = fopen_temporary_label(
+        r = fopen_temporary_at_label(
+                        AT_FDCWD,
                         target,   /* The path for which to the look up the label */
                         x,        /* Where we want the file actually to end up */
                         &dst,     /* The temporary file we write to */
-                        &dst_tmp);
+                        &dst_tmp,
+                        label_context);
         if (r < 0)
                 return r;
 
-        r = copy_bytes(src, fileno(dst), UINT64_MAX, COPY_REFLINK);
+        r = copy_bytes(src, fileno(dst), UINT64_MAX, /* copy_flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -468,6 +473,35 @@ static const char* pick_shell(const Item *i) {
         return NOLOGIN;
 }
 
+static int read_shell_credential(const Item *i, char **ret) {
+        _cleanup_free_ char *cn = NULL, *shell = NULL;
+        int r;
+
+        assert(i);
+
+        cn = strjoin("passwd.shell.", i->name);
+        if (!cn)
+                return -ENOMEM;
+
+        r = read_credential(cn, (void**) &shell, /* ret_size= */ NULL);
+        if (r < 0) {
+                log_debug_errno(r, "Couldn't read credential '%s', ignoring: %m", cn);
+                if (ret)
+                        *ret = NULL;
+                return 0;
+        }
+
+        path_simplify(shell);
+        if (!valid_shell(shell))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Shell credential '%s' specifies invalid login shell '%s'.",
+                                       cn, shell);
+
+        if (ret)
+                *ret = TAKE_PTR(shell);
+        return 0;
+}
+
 static int write_temporary_passwd(
                 Context *c,
                 const char *passwd_path,
@@ -488,11 +522,17 @@ static int write_temporary_passwd(
                 goto done;
 
         if (arg_dry_run) {
+                ORDERED_HASHMAP_FOREACH(i, c->todo_uids) {
+                        r = read_shell_credential(i, /* ret= */ NULL);
+                        if (r < 0)
+                                return r;
+                }
+
                 log_info("Would write /etc/passwd%s", glyph(GLYPH_ELLIPSIS));
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/passwd", passwd_path, &passwd, &passwd_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, passwd_path, passwd_path, &passwd, &passwd_tmp, c->label_context);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open temporary copy of %s: %m", passwd_path);
 
@@ -540,7 +580,7 @@ static int write_temporary_passwd(
         }
 
         ORDERED_HASHMAP_FOREACH(i, c->todo_uids) {
-                _cleanup_free_ char *creds_shell = NULL, *cn = NULL;
+                _cleanup_free_ char *creds_shell = NULL;
 
                 struct passwd n = {
                         .pw_name = i->name,
@@ -559,15 +599,10 @@ static int write_temporary_passwd(
                         .pw_shell = (char*) pick_shell(i),
                 };
 
-                /* Try to pick up the shell for this account via the credentials logic */
-                cn = strjoin("passwd.shell.", i->name);
-                if (!cn)
-                        return -ENOMEM;
-
-                r = read_credential(cn, (void**) &creds_shell, NULL);
+                r = read_shell_credential(i, &creds_shell);
                 if (r < 0)
-                        log_debug_errno(r, "Couldn't read credential '%s', ignoring: %m", cn);
-                else
+                        return r;
+                if (creds_shell)
                         n.pw_shell = creds_shell;
 
                 r = putpwent_sane(&n, passwd);
@@ -625,7 +660,7 @@ static int write_temporary_shadow(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/shadow", shadow_path, &shadow, &shadow_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, shadow_path, shadow_path, &shadow, &shadow_tmp, c->label_context);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open temporary copy of %s: %m", shadow_path);
 
@@ -762,7 +797,7 @@ static int write_temporary_group(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/group", group_path, &group, &group_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, group_path, group_path, &group, &group_tmp, c->label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to open temporary copy of %s: %m", group_path);
 
@@ -881,7 +916,7 @@ static int write_temporary_gshadow(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/gshadow", gshadow_path, &gshadow, &gshadow_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, gshadow_path, gshadow_path, &gshadow, &gshadow_tmp, c->label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to open temporary copy of %s: %m", gshadow_path);
 
@@ -897,10 +932,13 @@ static int write_temporary_gshadow(
                 while ((r = fgetsgent_sane(original, &sg)) > 0) {
 
                         i = ordered_hashmap_get(c->groups, sg->sg_namp);
-                        if (i && i->todo_group)
-                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
-                                                       "%s: Group \"%s\" already exists.",
-                                                       gshadow_path, sg->sg_namp);
+                        if (i && i->todo_group) {
+                                /* The group already exists in /etc/gshadow. Only the
+                                 * /etc/gshadow stage is left, so we can safely remove
+                                 * the item from the todo set. */
+                                i->todo_group = false;
+                                ordered_hashmap_remove(c->todo_gids, GID_TO_PTR(i->gid));
+                        }
 
                         r = putsgent_with_members(c, sg, gshadow);
                         if (r < 0)
@@ -991,23 +1029,23 @@ static int write_files(Context *c) {
 
         /* Make a backup of the old files */
         if (group) {
-                r = make_backup("/etc/group", group_path);
+                r = make_backup(group_path, group_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", group_path);
         }
         if (gshadow) {
-                r = make_backup("/etc/gshadow", gshadow_path);
+                r = make_backup(gshadow_path, gshadow_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", gshadow_path);
         }
 
         if (passwd) {
-                r = make_backup("/etc/passwd", passwd_path);
+                r = make_backup(passwd_path, passwd_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", passwd_path);
         }
         if (shadow) {
-                r = make_backup("/etc/shadow", shadow_path);
+                r = make_backup(shadow_path, shadow_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", shadow_path);
         }
@@ -2152,7 +2190,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         arg_replace = opts.arg;
                         break;
 
-                OPTION_LONG("dry-run", NULL, "Just print what would be done"):
+                OPTION('n', "dry-run", NULL, "Just print what would be done"):
                         arg_dry_run = true;
                         break;
 
@@ -2320,6 +2358,10 @@ static int run(int argc, char *argv[]) {
                 if (!arg_root)
                         return log_oom();
         }
+
+        r = mac_label_context_new(arg_root, &c.label_context);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize label context for root '%s': %m", arg_root);
 
         /* Prepare to emit audit events, but only if we're operating on the host system. */
         if (!arg_root)

@@ -449,7 +449,7 @@ int json_dispatch_const_version(const char *name, sd_json_variant *variant, sd_j
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(name));
 
         const char *version = sd_json_variant_string(variant);
-        if (!version_is_valid(version))
+        if (!version_is_valid(version, FLAGS_SET(flags, SD_JSON_STRICT) ? 0 : VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid version string.", strna(name));
 
         *n = version;
@@ -499,7 +499,7 @@ int json_variant_new_pidref(sd_json_variant **ret, PidRef *pidref) {
         return sd_json_buildo(
                         ret,
                         SD_JSON_BUILD_PAIR_INTEGER("pid", pidref->pid),
-                        SD_JSON_BUILD_PAIR_CONDITION(pidref->fd_id > 0, "pidfdId", SD_JSON_BUILD_INTEGER(pidref->fd_id)),
+                        SD_JSON_BUILD_PAIR_CONDITION(pidref->fd_id > 0, "pidfdId", SD_JSON_BUILD_UNSIGNED(pidref->fd_id)),
                         SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(boot_id), "bootId", SD_JSON_BUILD_ID128(boot_id)));
 }
 

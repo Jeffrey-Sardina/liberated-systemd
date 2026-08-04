@@ -392,9 +392,15 @@ static int extract_now(
                         if (!IN_SET(de->d_type, DT_LNK, DT_REG))
                                 continue;
 
-                        fd = openat(dirfd(d), de->d_name, O_CLOEXEC|O_RDONLY);
+                        fd = chase_and_openat(
+                                        rfd,
+                                        dirfd(d),
+                                        de->d_name,
+                                        CHASE_MUST_BE_REGULAR,
+                                        O_RDONLY|O_CLOEXEC,
+                                        /* ret_path= */ NULL);
                         if (fd < 0) {
-                                log_debug_errno(errno, "Failed to open unit file '%s', ignoring: %m", de->d_name);
+                                log_debug_errno(fd, "Failed to open unit file '%s', ignoring: %m", de->d_name);
                                 continue;
                         }
 
@@ -535,7 +541,7 @@ static int portable_extract_by_path(
                                                 matches,
                                                 image_name,
                                                 path_is_extension,
-                                                /* relax_extension_release_check= */ false,
+                                                relax_extension_release_check,
                                                 seq[1],
                                                 /* ret_os_release= */ NULL,
                                                 /* ret_unit_files= */ NULL);
@@ -565,7 +571,7 @@ static int portable_extract_by_path(
                                         matches,
                                         image_name,
                                         path_is_extension,
-                                        /* relax_extension_release_check= */ false,
+                                        relax_extension_release_check,
                                         /* socket_fd= */ -EBADF,
                                         &os_release,
                                         &unit_files);
@@ -610,8 +616,8 @@ static int portable_extract_by_path(
                  * there, and extract the metadata we need. The metadata is sent from the child back to us. */
 
                 /* Load some libraries before we fork workers off that want to use them */
-                (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
-                (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
+                (void) dlopen_cryptsetup(LOG_DEBUG);
+                (void) dlopen_libmount(LOG_DEBUG);
 
                 r = mkdtemp_malloc("/tmp/inspect-XXXXXX", &tmpdir);
                 if (r < 0)
@@ -1098,7 +1104,7 @@ int portable_extract(
                         return -ENOMEM;
 
                 return sd_bus_error_setf(error,
-                                         SD_BUS_ERROR_INVALID_ARGS,
+                                         BUS_ERROR_NO_MATCHING_UNIT_FILES,
                                          "Couldn't find any matching unit files in image '%s%s%s', refusing.",
                                          image->path,
                                          isempty(extensions) ? "" : "' or any of its extensions '",
@@ -1610,7 +1616,7 @@ static int install_profile_dropin(
                 return -ENOMEM;
 
         if (flags & PORTABLE_PREFER_COPY) {
-                CopyFlags copy_flags = COPY_REFLINK|COPY_FSYNC;
+                CopyFlags copy_flags = COPY_FSYNC;
 
                 if (flags & PORTABLE_FORCE_ATTACH)
                         copy_flags |= COPY_REPLACE;
@@ -1754,7 +1760,7 @@ static int attach_unit_file(
                 if (fd < 0)
                         return log_debug_errno(fd, "Failed to create unit file '%s': %m", path);
 
-                r = copy_bytes(m->fd, fd, UINT64_MAX, COPY_REFLINK);
+                r = copy_bytes(m->fd, fd, UINT64_MAX, /* copy_flags= */ 0);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to copy unit file '%s': %m", path);
 
@@ -1883,7 +1889,7 @@ static int install_image(
                                       target,
                                       UID_INVALID,
                                       GID_INVALID,
-                                      COPY_REFLINK | COPY_FSYNC | COPY_FSYNC_FULL | COPY_SYNCFS,
+                                      COPY_FSYNC | COPY_FSYNC_FULL | COPY_SYNCFS,
                                       /* denylist= */ NULL,
                                       /* subvolumes= */ NULL);
                         if (r < 0)
@@ -2102,7 +2108,7 @@ int portable_attach(
 
                 return sd_bus_error_setf(
                                 error,
-                                SD_BUS_ERROR_INVALID_ARGS,
+                                BUS_ERROR_NO_MATCHING_UNIT_FILES,
                                 "Couldn't find any matching unit files in image '%s%s%s', refusing.",
                                 image->path,
                                 isempty(extensions_joined) ? "" : "' or any of its extensions '",

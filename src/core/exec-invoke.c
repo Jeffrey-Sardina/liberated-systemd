@@ -1311,7 +1311,7 @@ static int setup_pam(
          * parent process will exec() the actual daemon. We do things this way to ensure that the main PID of
          * the daemon is the one we initially fork()ed. */
 
-        r = DLOPEN_LIBPAM(LOG_ERR, recommended);
+        r = dlopen_libpam(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -1578,7 +1578,7 @@ static bool seccomp_allows_drop_privileges(const ExecContext *c) {
         assert(c);
 
         /* No libseccomp, all is fine */
-        if (DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended) < 0)
+        if (dlopen_libseccomp(LOG_DEBUG) < 0)
                 return true;
 
         /* No syscall filter, we are allowed to drop privileges */
@@ -1888,7 +1888,7 @@ static int apply_restrict_filesystems(const ExecContext *c, const ExecParameters
         }
 
         /* We are in a new binary, so dl-open again */
-        r = DLOPEN_BPF(LOG_DEBUG, recommended);
+        r = dlopen_bpf(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3594,7 +3594,7 @@ static int setup_ephemeral(
                 log_debug("Making ephemeral copy of %s to %s", rootfs->image, new_root);
 
                 fd = copy_file(rootfs->image, new_root, O_EXCL, 0600,
-                               COPY_LOCK_BSD|COPY_REFLINK|COPY_CRTIME|COPY_NOCOW_AFTER);
+                               COPY_LOCK_BSD|COPY_CRTIME|COPY_NOCOW_AFTER);
                 if (fd < 0) {
                         *reterr_path = strdup(rootfs->image);
                         return log_debug_errno(fd, "Failed to copy image %s to %s: %m",
@@ -6006,12 +6006,12 @@ int exec_invoke(
         }
 
         /* Load a bunch of libraries we'll possibly need later, before we turn off dlopen() */
-        (void) DLOPEN_BPF(LOG_DEBUG, recommended);
-        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, recommended);
-        (void) DLOPEN_LIBSECCOMP(LOG_DEBUG, recommended);
+        (void) dlopen_bpf(LOG_DEBUG);
+        (void) dlopen_cryptsetup(LOG_DEBUG);
+        (void) dlopen_libmount(LOG_DEBUG);
+        (void) dlopen_libseccomp(LOG_DEBUG);
         /* Needed for userspace verity verification fallback */
-        (void) DLOPEN_LIBCRYPTO(LOG_DEBUG, recommended);
+        (void) dlopen_libcrypto(LOG_DEBUG);
 
         /* Let's now disable further dlopen()ing of libraries, since we are about to do namespace
          * shenanigans, and do not want to mix resources from host and namespace */

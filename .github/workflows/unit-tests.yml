@@ -47,8 +47,11 @@ jobs:
     env:
       CROSS_ARCH: ${{ matrix.cross_arch || '' }}
     steps:
+      # FIXME: revert this once https://github.com/actions/runner-images/issues/14477 is resolved
+      - name: Fix /etc and /usr ownership
+        run: sudo chown -v root:root /etc /usr
       - name: Repository checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install build dependencies
@@ -70,7 +73,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Repository checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -94,11 +97,9 @@ jobs:
                   -Dslow-tests=true \
                   -Dfuzz-tests=true \
                   -Dlibc=musl \
+                  -Ddlopen-tests=true \
                   build
           mkosi box -- ninja -v -C build
 
       - name: Test
         run: mkosi box -- meson test -C build --print-errorlogs --no-stdsplit --quiet
-
-      - name: Test (dlopen)
-        run: mkosi box -- meson test -C build --print-errorlogs --no-stdsplit --quiet --suite=dlopen

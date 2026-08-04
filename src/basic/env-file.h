@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 int parse_env_filev(FILE *f, const char *fname, va_list ap);
 int parse_env_file_fdv(int fd, const char *fname, va_list ap);
@@ -24,7 +24,10 @@ typedef enum WriteEnvFileFlags {
         WRITE_ENV_FILE_LABEL = 1 << 0,
 } WriteEnvFileFlags;
 
-int write_env_file(int dir_fd, const char *fname, char **headers, char **l, WriteEnvFileFlags flags);
+int write_env_file_label(int dir_fd, const char *fname, char **headers, char **l, WriteEnvFileFlags flags, LabelContext *label_context);
+static inline int write_env_file(int dir_fd, const char *fname, char **headers, char **l, WriteEnvFileFlags flags) {
+        return write_env_file_label(dir_fd, fname, headers, l, flags, /* label_context= */ NULL);
+}
 
 int write_vconsole_conf(int dir_fd, const char *fname, char **l);
 

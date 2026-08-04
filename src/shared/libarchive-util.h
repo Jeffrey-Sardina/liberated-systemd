@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBARCHIVE
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBARCHIVE
@@ -86,9 +86,3 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct archive*, sym_archive_read_free, 
 #endif
 
 int dlopen_libarchive(int log_level) _dlopen_loader_;
-
-#define DLOPEN_LIBARCHIVE(log_level, priority)                          \
-        ({                                                              \
-                LIBARCHIVE_NOTE(priority);                              \
-                dlopen_libarchive(log_level);                           \
-        })

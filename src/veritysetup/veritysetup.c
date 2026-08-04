@@ -300,13 +300,13 @@ static int parse_options(const char *options) {
                         r = isempty(val) ? 0 : parse_boolean(val);
                         if (r == 0) {
                                 arg_tpm2_measure_nvpcr = mfree(arg_tpm2_measure_nvpcr);
-                                return 0;
+                                continue;
                         }
                         if (r > 0)
                                 val = "verity";
                         else if (!tpm2_nvpcr_name_is_valid(val)) {
                                 log_warning("Invalid NvPCR name, ignoring: %s", word);
-                                return 0;
+                                continue;
                         }
 
                         if (free_and_strdup(&arg_tpm2_measure_nvpcr, val) < 0)
@@ -495,8 +495,9 @@ static int run(int argc, char *argv[]) {
         log_setup();
 
         LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(required);
 
-        r = DLOPEN_CRYPTSETUP(LOG_ERR, required);
+        r = dlopen_cryptsetup(LOG_ERR);
         if (r < 0)
                 return r;
 

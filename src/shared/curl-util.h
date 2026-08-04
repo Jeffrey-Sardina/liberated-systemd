@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBCURL
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBCURL
@@ -78,9 +78,3 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct curl_slist*, sym_curl_slist_free_
 #endif
 
 int dlopen_curl(int log_level) _dlopen_loader_;
-
-#define DLOPEN_CURL(log_level, priority)                                \
-        ({                                                              \
-                LIBCURL_NOTE(priority);                                 \
-                dlopen_curl(log_level);                                 \
-        })

@@ -4,7 +4,7 @@
 #include <syslog.h>
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBBPF
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBBPF
@@ -95,9 +95,3 @@ int bpf_get_error_translated(const void *ptr);
 #endif
 
 int dlopen_bpf(int log_level) _dlopen_loader_;
-
-#define DLOPEN_BPF(log_level, priority)                                 \
-        ({                                                              \
-                LIBBPF_NOTE(priority);                                  \
-                dlopen_bpf(log_level);                                  \
-        })

@@ -469,7 +469,7 @@ static int setup_microhttpd_server(RemoteServer *s,
 #if HAVE_MICROHTTPD
         int r;
 
-        r = DLOPEN_MICROHTTPD(LOG_ERR, required);
+        r = dlopen_microhttpd(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -532,8 +532,9 @@ static int setup_microhttpd_server(RemoteServer *s,
         d = new(MHDDaemonWrapper, 1);
         if (!d)
                 return log_oom();
-
-        d->fd = (uint64_t) fd;
+        *d = (MHDDaemonWrapper) {
+                .fd = (uint64_t) fd,
+        };
 
         d->daemon = sym_MHD_start_daemon(
                         flags,
@@ -1169,6 +1170,7 @@ static int run(int argc, char **argv) {
         COMPRESS_DEFAULT_NOTE;
         LIBCRYPTO_NOTE(suggested);
         LIBGNUTLS_NOTE(suggested);
+        LIBMICROHTTPD_NOTE(required);
         LIBSELINUX_NOTE(recommended);
 
         log_setup();

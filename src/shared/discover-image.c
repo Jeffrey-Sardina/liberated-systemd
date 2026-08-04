@@ -618,7 +618,7 @@ static int image_make(
                 (*ret)->foreign_uid_owned = uid_is_foreign(st->st_uid);
                 return 0;
 
-        } else if (S_ISREG(st->st_mode) && endswith(path, ".raw")) {
+        } else if (S_ISREG(st->st_mode) && (endswith(path, ".raw") || pretty)) {
                 usec_t crtime = 0;
 
                 /* It's a RAW disk image */
@@ -1625,7 +1625,7 @@ static int clone_auxiliary_file(const char *path, const char *new_name, const ch
         if (r < 0)
                 return r;
 
-        return copy_file_atomic(path, rs, 0664, COPY_REFLINK);
+        return copy_file_atomic(path, rs, 0664, /* copy_flags= */ 0);
 }
 
 static int get_pool_directory(
@@ -1805,7 +1805,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
                         return r;
 
                 r = copy_file_atomic(i->path, new_path, read_only ? 0444 : 0644,
-                                     COPY_REFLINK|COPY_CRTIME|COPY_NOCOW_AFTER);
+                                     COPY_CRTIME|COPY_NOCOW_AFTER);
                 break;
         }
 
@@ -2199,7 +2199,7 @@ int image_setup_pool(RuntimeScope scope, ImageClass class, bool use_btrfs_subvol
         if (!use_btrfs_subvol)
                 return 0;
 
-        (void) btrfs_subvol_make_label(pool);
+        (void) btrfs_subvol_make_label(pool, /* label_context= */ NULL);
 
         if (!use_btrfs_quota)
                 return 0;

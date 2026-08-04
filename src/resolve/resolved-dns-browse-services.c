@@ -178,8 +178,8 @@ int dns_add_new_service(DnsServiceBrowser *sb, DnsResourceRecord *rr, int owner_
                 .query = NULL,
                 .rr_ttl_state = DNS_RECORD_TTL_STATE_80_PERCENT,
         };
-
-        LIST_PREPEND(dns_services, sb->dns_services, s);
+        if (!s->rr)
+                return log_oom();
 
         /* Schedule the first cache maintenance query at 80% of the record's
          * TTL. Subsequent queries issued at 5% increments until 100% of the
@@ -218,6 +218,8 @@ int dns_add_new_service(DnsServiceBrowser *sb, DnsResourceRecord *rr, int owner_
                 return log_error_errno(
                                 r,
                                 "Failed to schedule mDNS maintenance query for DNS service: %m");
+
+        LIST_PREPEND(dns_services, sb->dns_services, s);
 
         TAKE_PTR(s);
         return 0;
@@ -487,10 +489,21 @@ int mdns_browser_revisit_cache(DnsServiceBrowser *sb, int owner_family) {
         assert(sb);
         assert(sb->manager);
 
-        /* ifindex=0 means "all interfaces" */
+        /* ifindex=0 means "all interfaces". Collect the cached answers from
+         * every matching mDNS scope into a single combined answer and reconcile
+         * once. Reconciling per-scope would be wrong: mdns_manage_services_answer()
+         * derives removals by diffing the browser's global service list against
+         * the answer it is handed, so a single scope's answer would spuriously
+         * "remove" (and then, on the next scope/pass, re-"add") services that are
+         * still present on other interfaces — resulting in a continuous
+         * added/removed event flap for services seen on more than the current
+         * scope. */
         if (sb->ifindex == 0) {
+                _cleanup_(dns_answer_unrefp) DnsAnswer *combined = NULL;
+
                 LIST_FOREACH(scopes, scope, sb->manager->dns_scopes) {
                         _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL;
+                        DnsAnswerItem *item;
 
                         if (scope->protocol != DNS_PROTOCOL_MDNS)
                                 continue;
@@ -513,11 +526,24 @@ int mdns_browser_revisit_cache(DnsServiceBrowser *sb, int owner_family) {
                                 return log_error_errno(r, "Failed to look up DNS cache for service browser key on scope %s: %m",
                                                        dns_scope_ifname(scope) ?: "global");
 
-                        r = mdns_manage_services_answer(sb, answer, owner_family);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to manage mDNS services after cache lookup on scope %s: %m",
-                                                       dns_scope_ifname(scope) ?: "global");
+                        /* Merge preserving each item's ifindex, flags, rrsig and
+                         * cache-expiry 'until'. (dns_answer_extend()/merge() would
+                         * reset 'until' to USEC_INFINITY, which would skew the RFC
+                         * 6762 §5.2 TTL-maintenance schedule that
+                         * mdns_manage_services_answer() derives from item->until.) */
+                        DNS_ANSWER_FOREACH_ITEM(item, answer) {
+                                r = dns_answer_add_extend_full(&combined, item->rr, item->ifindex,
+                                                               item->flags, item->rrsig, item->until);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to merge mDNS cache answer from scope %s: %m",
+                                                               dns_scope_ifname(scope) ?: "global");
+                        }
                 }
+
+                r = mdns_manage_services_answer(sb, combined, owner_family);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to manage mDNS services after cache lookup for all interfaces: %m");
+
                 return 0;
         }
 

@@ -1309,15 +1309,17 @@ static int dissect_image(
                 start = sym_blkid_partition_get_start(pp);
                 if (start < 0)
                         return errno_or_else(EIO);
-
-                assert((uint64_t) start < UINT64_MAX/512);
+                if ((uint64_t) start >= UINT64_MAX/512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition start LBA too large to convert to a byte offset, refusing.");
 
                 errno = 0;
                 size = sym_blkid_partition_get_size(pp);
                 if (size < 0)
                         return errno_or_else(EIO);
-
-                assert((uint64_t) size < UINT64_MAX/512);
+                if ((uint64_t) size >= UINT64_MAX/512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition size in LBA too large to convert to a byte offset, refusing.");
 
                 /* While probing we need the non-diskseq device node name to access the thing, hence mask off
                  * DISSECT_IMAGE_DISKSEQ_DEVNODE. */
@@ -2866,8 +2868,9 @@ static DecryptedImage* decrypted_image_free(DecryptedImage *d) {
         if (!d)
                 return NULL;
 
-        for (size_t i = 0; i < d->n_decrypted; i++) {
-                DecryptedPartition *p = d->decrypted + i;
+        /* Detach in reverse order so that nested dm-verity and dm-crypt are detached in the right order. */
+        for (size_t i = d->n_decrypted; i > 0; i--) {
+                DecryptedPartition *p = d->decrypted + i - 1;
 
                 if (p->device && p->name && !p->relinquished) {
                         _cleanup_free_ char *node = NULL;
@@ -3003,6 +3006,13 @@ static int decrypt_partition(
         if (!FLAGS_SET(policy_flags, PARTITION_POLICY_ENCRYPTED))
                 return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL), "Attempted to unlock partition via LUKS, but it's prohibited.");
 
+        /* If a dm-verity device was already set up on this partition, then the partition is both Verity
+         * protected and LUKS encrypted, with Verity being the outer envelope and LUKS the inner. In that
+         * case open the LUKS device on top of the verity device, so that everything we read is
+         * authenticated. Since verity devices are read-only, the LUKS layer must then be read-only, too. */
+        const char *source_node = m->decrypted_node ?: m->node;
+        bool on_verity = !!m->decrypted_node;
+
         r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
@@ -3014,7 +3024,7 @@ static int decrypt_partition(
         if (!GREEDY_REALLOC0(d->decrypted, d->n_decrypted + 1))
                 return -ENOMEM;
 
-        r = sym_crypt_init(&cd, m->node);
+        r = sym_crypt_init(&cd, source_node);
         if (r < 0)
                 return log_debug_errno(r, "Failed to initialize dm-crypt: %m");
 
@@ -3025,8 +3035,8 @@ static int decrypt_partition(
                 return log_debug_errno(r, "Failed to load LUKS metadata: %m");
 
         r = sym_crypt_activate_by_passphrase(cd, name, CRYPT_ANY_SLOT, passphrase, strlen(passphrase),
-                                             ((flags & DISSECT_IMAGE_DEVICE_READ_ONLY) ? CRYPT_ACTIVATE_READONLY : 0) |
-                                             ((flags & DISSECT_IMAGE_DISCARD_ON_CRYPTO) ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0));
+                                             ((flags & DISSECT_IMAGE_DEVICE_READ_ONLY) || on_verity ? CRYPT_ACTIVATE_READONLY : 0) |
+                                             ((flags & DISSECT_IMAGE_DISCARD_ON_CRYPTO) && !on_verity ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0));
         if (r < 0) {
                 log_debug_errno(r, "Failed to activate LUKS device: %m");
                 return r == -EPERM ? -EKEYREJECTED : r;
@@ -3041,7 +3051,7 @@ static int decrypt_partition(
                 .device = TAKE_PTR(cd),
         };
 
-        m->decrypted_node = TAKE_PTR(node);
+        free_and_replace(m->decrypted_node, node);
         close_and_replace(m->mount_node_fd, fd);
 
         return 0;
@@ -3540,7 +3550,7 @@ success:
                 .device = TAKE_PTR(cd),
         };
 
-        m->decrypted_node = TAKE_PTR(node);
+        free_and_replace(m->decrypted_node, node);
         close_and_replace(m->mount_node_fd, mount_node_fd);
 
         return 0;
@@ -3600,16 +3610,20 @@ int dissected_image_decrypt(
 
                 PartitionPolicyFlags fl = image_policy_get_exhaustively(policy, i);
 
-                r = decrypt_partition(m, p, passphrase, flags, fl, d);
-                if (r < 0)
-                        return r;
-
+                /* Set up Verity first, and only then LUKS: if a partition is both Verity protected and
+                 * encrypted, Verity is the outer envelope and LUKS the inner, i.e. the Verity hash data
+                 * covers the LUKS ciphertext, and decrypt_partition() then stacks the LUKS device on top of
+                 * the verity device. */
                 k = partition_verity_hash_of(i);
                 if (k >= 0) {
                         r = verity_partition(m, i, p, m->partitions + k, root, verity, flags, fl, d);
                         if (r < 0)
                                 return r;
                 }
+
+                r = decrypt_partition(m, p, passphrase, flags, fl, d);
+                if (r < 0)
+                        return r;
 
                 if (!p->decrypted_fstype && p->mount_node_fd >= 0 && p->decrypted_node) {
                         r = probe_filesystem_full(p->mount_node_fd, p->decrypted_node, 0, UINT64_MAX, /* bool restrict_fstypes= */ true, &p->decrypted_fstype);
@@ -5609,7 +5623,7 @@ int copy_tree_at_foreign(int source_fd, int target_fd, int userns_fd) {
                                 target_fd, /* to= */ NULL,
                                 /* override_uid= */ UID_INVALID,
                                 /* override_gid= */ GID_INVALID,
-                                COPY_REFLINK|COPY_HARDLINKS|COPY_MERGE_EMPTY|COPY_MERGE_APPLY_STAT|COPY_SAME_MOUNT|COPY_ALL_XATTRS,
+                                COPY_HARDLINKS|COPY_MERGE_EMPTY|COPY_MERGE_APPLY_STAT|COPY_SAME_MOUNT|COPY_ALL_XATTRS,
                                 /* denylist= */ NULL,
                                 /* subvolumes= */ NULL);
                 if (r < 0) {

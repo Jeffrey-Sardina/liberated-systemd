@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum PromptFlags {
         PROMPT_MAY_SKIP        = 1 << 0, /* Question may be skipped */
@@ -26,7 +26,7 @@ int prompt_loop(const char *text,
                 PromptFlags flags,
                 char **ret);
 
-int prompt_loop_yes_no(const char *question, bool def, bool *ret);
+int prompt_loop_yes_no(const char *question, const char *prefill, bool def, bool *ret);
 
 int chrome_show(const char *top, const char *bottom);
 void chrome_hide(void);

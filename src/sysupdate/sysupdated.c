@@ -323,13 +323,24 @@ static int job_on_exit(sd_event_source *s, const siginfo_t *si, void *userdata) 
                 sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
                                   "Job terminated abnormally with signal %s.",
                                   signal_to_string(si->si_status));
-        } else if (si->si_status != EXIT_SUCCESS)
-                if (j->status_errno != 0)
-                        sd_bus_error_set_errno(&error, j->status_errno);
-                else
-                        sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
-                                          "Job failed with exit code %i.", si->si_status);
-        else {
+        } else if (si->si_status != EXIT_SUCCESS) {
+                bool check_new_no_update = false;
+
+                if (j->type == JOB_CHECK_NEW &&
+                    si->si_status == EXIT_FAILURE &&
+                    job_parse_child_output(TAKE_FD(j->stdout_fd), &json) >= 0) {
+                        sd_json_variant *v = sd_json_variant_by_key(json, "available");
+                        check_new_no_update = v && sd_json_variant_is_null(v);
+                }
+
+                if (!check_new_no_update) {
+                        if (j->status_errno != 0)
+                                sd_bus_error_set_errno(&error, j->status_errno);
+                        else
+                                sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
+                                                  "Job failed with exit code %i.", si->si_status);
+                }
+        } else {
                 r = job_parse_child_output(TAKE_FD(j->stdout_fd), &json);
                 if (r < 0)
                         sd_bus_error_set_errnof(&error, r, "Failed to parse job worker output: %m");
@@ -952,7 +963,7 @@ static int target_method_describe(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        if (!version_is_valid(version))
+        if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
         if ((flags & ~SD_SYSUPDATE_FLAGS_ALL) != 0)
@@ -1102,7 +1113,7 @@ static int target_method_acquire(sd_bus_message *msg, void *userdata, sd_bus_err
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
         else {
-                if (!version_is_valid(version))
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
                 action = "org.freedesktop.sysupdate1.update-to-version";
@@ -1190,7 +1201,7 @@ static int target_method_install(sd_bus_message *msg, void *userdata, sd_bus_err
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
         else {
-                if (!version_is_valid(version))
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
                 action = "org.freedesktop.sysupdate1.update-to-version";
@@ -1380,7 +1391,7 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
 
-        r = sysupdate_run_simple(&json, t, "features", NULL);
+        r = sysupdate_run_simple(&json, t, "--offline", "features", NULL);
         if (r < 0)
                 return r;
 

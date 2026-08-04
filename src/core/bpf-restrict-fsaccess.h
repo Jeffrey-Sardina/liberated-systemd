@@ -3,7 +3,7 @@
 
 #include "core-forward.h"
 #include "macro.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum RestrictFileSystemAccess {
         RESTRICT_FILESYSTEM_ACCESS_NO,
@@ -34,7 +34,6 @@ enum {
 extern const char* const restrict_fsaccess_link_names[_RESTRICT_FILESYSTEM_ACCESS_LINK_MAX];
 
 bool dm_verity_require_signatures(void);
-bool bpf_restrict_fsaccess_supported(void);
 int bpf_restrict_fsaccess_setup(Manager *m);
 int bpf_restrict_fsaccess_prepare(struct restrict_fsaccess_bpf **ret);
 int bpf_restrict_fsaccess_populate_guard(struct restrict_fsaccess_bpf *obj);

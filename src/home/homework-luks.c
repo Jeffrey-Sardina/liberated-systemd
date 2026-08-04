@@ -146,7 +146,7 @@ static int probe_file_system_by_fd(
         assert(ret_fstype);
         assert(ret_uuid);
 
-        r = DLOPEN_LIBBLKID(LOG_DEBUG, recommended);
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -529,7 +529,7 @@ static int acquire_open_luks_device(
         assert(setup);
         assert(!setup->crypt_device);
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -684,7 +684,7 @@ static int luks_validate(
         assert(ret_size);
         assert(sector_size > 0);
 
-        r = DLOPEN_LIBBLKID(LOG_DEBUG, recommended);
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -805,7 +805,7 @@ static int crypt_device_to_evp_cipher(struct crypt_device *cd, const EVP_CIPHER 
         assert(cd);
         assert(ret);
 
-        r = DLOPEN_LIBCRYPTO(LOG_ERR, recommended);
+        r = dlopen_libcrypto(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -1293,7 +1293,7 @@ int home_setup_luks(
         assert(setup);
         assert(user_record_storage(h) == USER_LUKS);
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1594,7 +1594,7 @@ int home_activate_luks(
         assert(setup);
         assert(ret_home);
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2211,11 +2211,11 @@ int home_create_luks(
         assert(setup->image_fd < 0);
         assert(ret_home);
 
-        r = DLOPEN_FDISK(LOG_DEBUG, recommended);
+        r = dlopen_fdisk(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2561,7 +2561,7 @@ int home_create_luks(
         setup->loop = loop_device_unref(setup->loop);
 
         if (!user_record_luks_offline_discard(h)) {
-                r= run_fallocate(setup->image_fd, NULL /* refresh stat() data */);
+                r = run_fallocate(setup->image_fd, NULL /* refresh stat() data */);
                 if (r < 0)
                         return r;
         }
@@ -3250,11 +3250,11 @@ int home_resize_luks(
         assert(user_record_storage(h) == USER_LUKS);
         assert(setup);
 
-        r = DLOPEN_FDISK(LOG_DEBUG, recommended);
+        r = dlopen_fdisk(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3702,7 +3702,7 @@ int home_passwd_luks(
                 const PasswordCache *cache, /* the passwords acquired via PKCS#11/FIDO2 security tokens */
                 char **effective_passwords  /* new passwords */) {
 
-        size_t volume_key_size, max_key_slots, n_effective;
+        size_t volume_key_size, max_key_slots, n_effective, n_occupied = 0;
         _cleanup_(erase_and_freep) void *volume_key = NULL;
         struct crypt_pbkdf_type good_pbkdf, minimal_pbkdf;
         const char *type;
@@ -3712,7 +3712,7 @@ int home_passwd_luks(
         assert(user_record_storage(h) == USER_LUKS);
         assert(setup);
 
-        r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3742,44 +3742,97 @@ int home_passwd_luks(
 
         n_effective = strv_length(effective_passwords);
 
+        for (size_t i = 0; i < max_key_slots; i++)
+                switch (sym_crypt_keyslot_status(setup->crypt_device, i)) {
+                case CRYPT_SLOT_INACTIVE:
+                        break;
+                case CRYPT_SLOT_ACTIVE:
+                case CRYPT_SLOT_ACTIVE_LAST:
+                case CRYPT_SLOT_UNBOUND:
+                        n_occupied++;
+                        break;
+                default:
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO),
+                                               "Failed to determine state of LUKS key slot %zu.", i);
+                }
+
+        if (n_effective > max_key_slots - n_occupied)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
+                                       "Not enough free LUKS key slots (%zu required, %zu available).",
+                                       n_effective, max_key_slots - n_occupied);
+
         build_good_pbkdf(&good_pbkdf, h);
         build_minimal_pbkdf(&minimal_pbkdf, h);
 
-        for (size_t i = 0; i < max_key_slots; i++) {
-                r = sym_crypt_keyslot_destroy(setup->crypt_device, i);
-                if (r < 0 && !IN_SET(r, -ENOENT, -EINVAL)) /* Returns EINVAL or ENOENT if there's no key in this slot already */
-                        return log_error_errno(r, "Failed to destroy LUKS password: %m");
+        /* Rotate the LUKS key slots in two passes, so that at every on-disk state at least one valid key slot
+         * exists for each password the user currently holds. First add all new passwords into free key slots
+         * (purely additive, hence non-destructive), and only once that fully succeeded destroy the old slots.
+         * If an add fails (e.g. the argon2 PBKDF, which is intentionally memory hungry, hits OOM), we roll
+         * back the slots added so far and return with the pre-existing slots untouched. The reverse order
+         * (destroy a slot first, then add its replacement at the same index) would, on such a failure, leave
+         * the slot destroyed with no replacement, permanently locking the user out. */
 
-                if (i >= n_effective) {
-                        if (r >= 0)
-                                log_info("Destroyed LUKS key slot %zu.", i);
-                        continue;
-                }
+        _cleanup_free_ int *new_slots = new(int, n_effective);
+        if (!new_slots)
+                return log_oom();
 
+        size_t n_added = 0;
+        for (size_t i = 0; i < n_effective; i++) {
                 if (password_cache_contains(cache, effective_passwords[i])) { /* Is this a FIDO2 or PKCS#11 password? */
-                        log_debug("Using minimal PBKDF for slot %zu", i);
+                        log_debug("Using minimal PBKDF for new key slot.");
                         r = sym_crypt_set_pbkdf_type(setup->crypt_device, &minimal_pbkdf);
                 } else {
-                        log_debug("Using good PBKDF for slot %zu", i);
+                        log_debug("Using good PBKDF for new key slot.");
                         r = sym_crypt_set_pbkdf_type(setup->crypt_device, &good_pbkdf);
                 }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to tweak PBKDF for slot %zu: %m", i);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to tweak PBKDF for new key slot: %m");
+                        goto rollback;
+                }
 
                 r = sym_crypt_keyslot_add_by_volume_key(
                                 setup->crypt_device,
-                                i,
+                                CRYPT_ANY_SLOT,
                                 volume_key,
                                 volume_key_size,
                                 effective_passwords[i],
                                 strlen(effective_passwords[i]));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set up LUKS password: %m");
+                if (r < 0) {
+                        log_error_errno(r, "Failed to set up LUKS password: %m");
+                        goto rollback;
+                }
 
-                log_info("Updated LUKS key slot %zu.", i);
+                new_slots[n_added++] = r;
+                log_info("Added LUKS key slot %i.", r);
+        }
+
+        /* All replacement slots are committed now; drop every slot that isn't one we just added. */
+        for (size_t i = 0; i < max_key_slots; i++) {
+                bool keep = false;
+
+                for (size_t j = 0; j < n_added; j++)
+                        if (new_slots[j] == (int) i) {
+                                keep = true;
+                                break;
+                        }
+                if (keep)
+                        continue;
+
+                r = sym_crypt_keyslot_destroy(setup->crypt_device, i);
+                if (r < 0 && !IN_SET(r, -ENOENT, -EINVAL)) /* Returns EINVAL or ENOENT if there's no key in this slot already */
+                        return log_error_errno(r, "Failed to destroy LUKS password: %m");
+                if (r >= 0)
+                        log_info("Destroyed LUKS key slot %zu.", i);
         }
 
         return 1;
+
+rollback:
+        /* Undo the slots added in this call, so that the header is left exactly as we found it. */
+        for (size_t i = 0; i < n_added; i++)
+                (void) sym_crypt_keyslot_destroy(setup->crypt_device, new_slots[i]);
+
+        return r;
 }
 
 int home_lock_luks(UserRecord *h, HomeSetup *setup) {

@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBMOUNT
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBMOUNT
@@ -77,6 +77,8 @@ int libmount_is_leaf(
                 struct libmnt_table *table,
                 struct libmnt_fs *fs);
 
+int libmount_fs_id_matches_path(struct libmnt_fs *fs, const char *path);
+
 #else
 
 struct libmnt_monitor;
@@ -89,9 +91,3 @@ static inline void* sym_mnt_unref_monitor(struct libmnt_monitor *p) {
 #endif
 
 int dlopen_libmount(int log_level) _dlopen_loader_;
-
-#define DLOPEN_LIBMOUNT(log_level, priority)                            \
-        ({                                                              \
-                LIBMOUNT_NOTE(priority);                                \
-                dlopen_libmount(log_level);                             \
-        })

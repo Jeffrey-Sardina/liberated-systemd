@@ -8,6 +8,10 @@ CHANGES WITH 262:
           the symlink target. Previously, these were only expanded in the
           source.
 
+        * systemd-repart no longer honors the legacy "FactoryReset" EFI
+          variable in the initrd. The newer "FactoryResetRequest" EFI variable
+          remains supported and should be used instead.
+
         * As part of changes to systemd-sysupdate, the existing
           "systemd-sysupdate.service" and "systemd-sysupdate.timer" units –
           which periodically ran "systemd-sysupdate" to update the host system –
@@ -26,6 +30,20 @@ CHANGES WITH 262:
           TPM-bound credentials minted after this change are not recognized by
           older systemd versions, however systemd continues to accept TPM-sealed
           credentials that were created before this change.
+
+        * The "tpm2-measure-bank=" crypttab option of systemd-cryptsetup is
+          now deprecated and has no effect. Volume key measurements are
+          performed via varlink call to systemd-pcrextend, which automatically
+          selects all suitable TPM2 PCR banks; the banks can no longer be
+          restricted per volume.
+
+        * The legacy socket for controlling systemd-udevd has been removed, and
+          udevadm now unconditionally uses Varlink IPC. The legacy UNIX socket
+          /run/udev/control, which is sometimes used to check whether udevd is
+          running, has been replaced with a symlink to the Varlink socket. This
+          change does not mean the legacy protocol is supported on this path;
+          rather, the symlink is maintained to ensure the socket is bound under
+          the same conditions as before.
 
         Changes in the system and service manager:
 
@@ -46,6 +64,61 @@ CHANGES WITH 262:
           via credentials). This is useful for unattended installations that
           should be provisioned as far as possible without ever blocking on a
           prompt.
+
+        Changes in systemd-networkd:
+
+        * A new IPv4ProxyARPAddress= setting has been added to the [Network]
+          section of .network files. It is the IPv4 counterpart to
+          IPv6ProxyNDPAddress= and allows manual entries to be added to the
+          kernel's IPv4 neighbor proxy table. The setting implies
+          IPv4ProxyARP=yes but has no effect if IPv4ProxyARP= has been set to
+          false. This mirrors the behavior of IPv6ProxyNDPAddress=.
+
+        Changes in various tools:
+
+        * bootctl, systemd-oomd, systemd-repart, systemd-sysusers, and
+          systemd-tmpfiles now accept -n as a short option for --dry-run.
+
+        Changes in systemd-tmpfiles:
+
+        * systemd-tmpfiles now rejects non-empty argument fields for tmpfiles.d
+          line types that do not use the argument field. This is a compatibility
+          change: fields that were previously ignored after a warning will now
+          cause the tmpfiles.d configuration to be rejected, so downstreams
+          should audit shipped tmpfiles.d snippets before upgrading.
+
+        * The r and R tmpfiles.d line types now honor the age field when
+          systemd-tmpfiles is invoked with --clean.
+
+        Changes in the TPM Subsystem:
+
+        * The way that NvPCRs are anchored has been improved. They are now
+          created with a write policy which only permits the initial extend to
+          be performed from the initrd environment, and no longer rely on a
+          secret that is sealed to the TPM (the "anchor secret"). For NvPCRs to
+          work, all NvPCR definitions (/usr/lib/nvpcr/*.nvpcr) must now be
+          shipped in the UKI. The UKI must also embed a signed PCR policy that
+          is bound to the initrd boot phase and with the "initrd" policy
+          reference. This can be created by supplying the --sign-initrd-pcrs
+          option to ukify. NvPCRs that are not defined or initialized in the
+          initrd will fail to initialize lazily during runtime if an attempt is
+          made to extend them with systemd-pcrextend. Existing NvPCRs that were
+          created with a previous systemd version will be automatically
+          upgraded, and the existing "anchor secret" stored in /var/lib and the
+          ESP/XBOOTLDR will be removed.
+
+        Changes in systemd-report:
+
+        * The "generate" and "upload" commands of systemd-report can now
+          cryptographically sign the reports they produce. Signatures are
+          acquired from backend Varlink signers linked into
+          /run/systemd/report.sign/. The new "--sign=" option selects the
+          signing policy: "no" (the default) emits an unsigned report;
+          "best-effort" attaches whatever signatures can be acquired but never
+          fails; "require-one" requires at least one signature; and
+          "require-all" requires every available signer to succeed. A signed
+          report is emitted as a JSON-SEQ stream: the report object followed by
+          one signature object per acquired signature.
 
 CHANGES WITH 261:
 

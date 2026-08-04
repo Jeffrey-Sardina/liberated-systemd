@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_PAM
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBPAM
@@ -111,9 +111,3 @@ int pam_putenv_assign(pam_handle_t *pamh, const char *name, const char *value);
 #endif
 
 int dlopen_libpam(int log_level) _dlopen_loader_;
-
-#define DLOPEN_LIBPAM(log_level, priority)                              \
-        ({                                                              \
-                LIBPAM_NOTE(priority);                                  \
-                dlopen_libpam(log_level);                               \
-        })

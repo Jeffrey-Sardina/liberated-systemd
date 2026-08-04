@@ -4,7 +4,7 @@
 #include <string.h>
 
 #include "alloc-util.h"
-#include "basic-forward.h"
+#include "forward.h"
 
 #include "../fundamental/string-util.h" /* IWYU pragma: export */
 
@@ -286,6 +286,7 @@ typedef enum MakeCStringMode {
 int make_cstring(const void *s, size_t n, MakeCStringMode mode, char **ret);
 
 size_t strspn_from_end(const char *str, const char *accept) _pure_;
+size_t strnspn(const char *str, const char *accept, size_t n) _pure_ _nonnull_if_nonzero_(1, 3);
 
 char* strdupspn(const char *a, const char *accept);
 char* strdupcspn(const char *a, const char *reject);
@@ -315,8 +316,13 @@ char* find_line_after_internal(const char *haystack, const char *needle);
 #define find_line_after(haystack, needle) \
         const_generic(haystack, find_line_after_internal(haystack, needle))
 
-bool version_is_valid(const char *s) _pure_;
-bool version_is_valid_versionspec(const char *s) _pure_;
+typedef enum VersionFlags {
+        VERSION_ALLOW_EMPTY      = 1 << 0,
+        VERSION_ALLOW_UNDERSCORE = 1 << 1, /* Allow "_" as separator (recommended separator) */
+        VERSION_ALLOW_PLUS       = 1 << 2, /* Allow "+" as separator (sometimes used as separator for boot attempt counters) */
+} VersionFlags;
+
+bool version_is_valid(const char *s, VersionFlags flags) _pure_;
 
 ssize_t strlevenshtein(const char *x, const char *y);
 

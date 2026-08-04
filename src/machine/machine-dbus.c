@@ -391,7 +391,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
                 return r;
         user = isempty(user) ? "root" : user;
 
-        if (!valid_user_group_name(user, VALID_USER_RELAX))
+        if (!valid_user_group_name(user, VALID_USER_RELAX | VALID_USER_ALLOW_NUMERIC))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid user name '%s'", user);
 
         /* Ensure only root can shell into the root namespace. This is to avoid unprivileged users registering
@@ -567,7 +567,7 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
 int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         const char *src, *dest, *host_path, *container_path;
-        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS;
+        CopyFlags copy_flags = COPY_MERGE|COPY_HARDLINKS;
         Machine *m = ASSERT_PTR(userdata);
         Manager *manager = m->manager;
         bool copy_from;

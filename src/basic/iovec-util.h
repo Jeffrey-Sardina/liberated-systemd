@@ -3,7 +3,7 @@
 
 #include <sys/uio.h>                /* IWYU pragma: export */
 
-#include "basic-forward.h"
+#include "forward.h"
 
 #include "../fundamental/iovec-util.h" /* IWYU pragma: export */
 
@@ -29,7 +29,7 @@ struct iovec* iovec_make_string(struct iovec *iovec, const char *s);
 
 #define IOVEC_MAKE_BYTE(c)                                      \
         (const struct iovec) {                                  \
-                .iov_base = (char*) ((const char[]) { c }),     \
+                .iov_base = (char*) ((const char[]) { (c) }),   \
                 .iov_len = 1,                                   \
         }
 

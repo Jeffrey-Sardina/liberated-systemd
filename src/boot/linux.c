@@ -217,7 +217,11 @@ EFI_STATUS linux_exec(
                         },
                         .MemoryType = EfiLoaderData,
                         .StartingAddress = POINTER_TO_PHYSICAL_ADDRESS(kernel->iov_base),
-                        .EndingAddress = POINTER_TO_PHYSICAL_ADDRESS(kernel->iov_base) + kernel->iov_len,
+                        /* NB: the UEFI spec doesn't clarify whether the EndingAddress field should point to
+                         * the very last byte or the byte one after. EDK2 puts the very last byte in this
+                         * field, hence let's do so here too. Note that iovec_is_set() check above ensured
+                         * this cannot underflow. */
+                        .EndingAddress = POINTER_TO_PHYSICAL_ADDRESS(kernel->iov_base) + kernel->iov_len - 1,
                 },
                 .end_path = DEVICE_PATH_END_NODE,
         };
@@ -267,10 +271,7 @@ EFI_STATUS linux_exec(
                  * if required for NX_COMPAT */
                 err = BS->LocateProtocol(MAKE_GUID_PTR(EFI_MEMORY_ATTRIBUTE_PROTOCOL), /* Registration= */ NULL, (void **) &memory_proto);
                 if (err != EFI_SUCCESS)
-                        /* Only warn if the UEFI should have support in the first place (version >= 2.10) */
-                        log_full(err,
-                                 ST->Hdr.Revision >= ((2U << 16) | 100U) ? LOG_WARNING : LOG_DEBUG,
-                                 "No EFI_MEMORY_ATTRIBUTE_PROTOCOL found, skipping NX_COMPAT support.");
+                        log_debug_status(err, "No EFI_MEMORY_ATTRIBUTE_PROTOCOL found, skipping NX_COMPAT support.");
         }
 
         const PeSectionHeader *headers;

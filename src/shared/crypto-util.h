@@ -2,9 +2,9 @@
 #pragma once
 
 #include "dlopen-note.h"
+#include "forward.h"
 #include "iovec-util.h"
 #include "sha256.h"
-#include "shared-forward.h"
 
 typedef enum CertificateSourceType {
         OPENSSL_CERTIFICATE_SOURCE_FILE,
@@ -132,6 +132,7 @@ extern DLSYM_PROTOTYPE(ERR_error_string_n);
 extern DLSYM_PROTOTYPE(ERR_get_error);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_ctrl);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_free);
+extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_get_tag_length);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_new);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_free);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_get_block_size);
@@ -392,6 +393,8 @@ int kdf_ss_derive(const char *digest, const void *key, size_t key_size, const vo
 
 int kdf_kb_hmac_derive(const char *mode, const char *digest, const void *key, size_t key_size, const void *salt, size_t salt_size, const void *info, size_t info_size, const void *seed, size_t seed_size, size_t derive_size, void **ret);
 
+int kdf_hkdf_derive(const char *digest, const struct iovec *key, const struct iovec *salt, const struct iovec *info, size_t derive_size, struct iovec *ret);
+
 int rsa_oaep_encrypt_bytes(const EVP_PKEY *pkey, const char *digest_alg, const char *label, const void *decrypted_key, size_t decrypted_key_size, void **ret_encrypt_key, size_t *ret_encrypt_key_size);
 
 int rsa_pkey_to_suitable_key_size(EVP_PKEY *pkey, size_t *ret_suitable_key_size);
@@ -448,12 +451,6 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OpenSSLAskPasswordUI*, openssl_ask_password_ui_
 
 int dlopen_libcrypto(int log_level) _dlopen_loader_;
 bool dlopen_libcrypto_has_argon2id(void);
-
-#define DLOPEN_LIBCRYPTO(log_level, priority)                           \
-        ({                                                              \
-                LIBCRYPTO_NOTE(priority);                               \
-                dlopen_libcrypto(log_level);                            \
-        })
 
 typedef struct Argon2IdParameters {
         uint64_t memcost_bytes;

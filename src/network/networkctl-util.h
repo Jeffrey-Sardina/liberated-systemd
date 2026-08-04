@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 int varlink_connect_networkd(sd_varlink **ret_varlink);
-int reload_networkd(void);
+int reload_networkd(bool reconfigure_links);
 int reload_udevd(void);
 bool networkd_is_running(void);
 

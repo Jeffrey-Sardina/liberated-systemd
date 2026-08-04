@@ -494,7 +494,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("make-archive", NULL, "Convert the DDI to an archive file"):
-                        r = DLOPEN_LIBARCHIVE(LOG_ERR, recommended);
+                        r = dlopen_libarchive(LOG_ERR);
                         if (r < 0)
                                 return r;
 
@@ -890,7 +890,6 @@ static int action_dissect(
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_(table_unrefp) Table *t = NULL;
         _cleanup_free_ char *bn = NULL;
-        uint64_t size = UINT64_MAX;
         int r;
 
         assert(m);
@@ -1009,7 +1008,7 @@ static int action_dissect(
                 r = sd_json_buildo(
                                 &v,
                                 SD_JSON_BUILD_PAIR_STRING("name", bn),
-                                SD_JSON_BUILD_PAIR_CONDITION(size != UINT64_MAX, "size", SD_JSON_BUILD_INTEGER(size)),
+                                SD_JSON_BUILD_PAIR_CONDITION(m->image_size != UINT64_MAX, "size", SD_JSON_BUILD_INTEGER(m->image_size)),
                                 SD_JSON_BUILD_PAIR_INTEGER("sectorSize", m->sector_size),
                                 SD_JSON_BUILD_PAIR_CONDITION(a >= 0, "architecture", SD_JSON_BUILD_STRING(architecture_to_string(a))),
                                 SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->image_uuid), "imageUuid", SD_JSON_BUILD_UUID(m->image_uuid)),
@@ -1402,7 +1401,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
 
                 /* Copying to stdout? */
                 if (streq(arg_target, "-")) {
-                        r = copy_bytes(source_fd, STDOUT_FILENO, UINT64_MAX, COPY_REFLINK);
+                        r = copy_bytes(source_fd, STDOUT_FILENO, UINT64_MAX, /* copy_flags= */ 0);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy bytes from %s in mage '%s' to stdout: %m", arg_source, arg_image);
 
@@ -1416,7 +1415,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                                 AT_FDCWD, arg_target,
                                 arg_copy_ownership == 0 ? getuid() : UID_INVALID,
                                 arg_copy_ownership == 0 ? getgid() : GID_INVALID,
-                                COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS);
+                                COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS);
                 if (r >= 0)
                         return 0;
                 if (r != -ENOTDIR)
@@ -1433,7 +1432,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                 if (target_fd < 0)
                         return log_error_errno(errno, "Failed to create regular file at target path '%s': %m", arg_target);
 
-                r = copy_bytes(source_fd, target_fd, UINT64_MAX, COPY_REFLINK);
+                r = copy_bytes(source_fd, target_fd, UINT64_MAX, /* copy_flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy bytes from %s in mage '%s' to '%s': %m", arg_source, arg_image, arg_target);
 
@@ -1472,7 +1471,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                         if (target_fd < 0)
                                 return log_error_errno(errno, "Failed to open target file '%s': %m", arg_target);
 
-                        r = copy_bytes(STDIN_FILENO, target_fd, UINT64_MAX, COPY_REFLINK);
+                        r = copy_bytes(STDIN_FILENO, target_fd, UINT64_MAX, /* copy_flags= */ 0);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy bytes from stdin to '%s' in image '%s': %m", arg_target, arg_image);
 
@@ -1505,7 +1504,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                                                 dfd, bn,
                                                 arg_copy_ownership == 0 ? getuid() : UID_INVALID,
                                                 arg_copy_ownership == 0 ? getgid() : GID_INVALID,
-                                                COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS,
+                                                COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS,
                                                 /* denylist= */ NULL,
                                                 /* subvolumes= */ NULL);
                         } else
@@ -1514,7 +1513,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                                                 target_fd, ".",
                                                 arg_copy_ownership == 0 ? getuid() : UID_INVALID,
                                                 arg_copy_ownership == 0 ? getgid() : GID_INVALID,
-                                                COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS,
+                                                COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS,
                                                 /* denylist= */ NULL,
                                                 /* subvolumes= */ NULL);
                         if (r < 0)
@@ -1531,7 +1530,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                 if (target_fd < 0)
                         return log_error_errno(errno, "Failed to open target file '%s': %m", arg_target);
 
-                r = copy_bytes(source_fd, target_fd, UINT64_MAX, COPY_REFLINK);
+                r = copy_bytes(source_fd, target_fd, UINT64_MAX, /* copy_flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy bytes from '%s' to '%s' in image '%s': %m", arg_source, arg_target, arg_image);
 
@@ -1970,6 +1969,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         LIBACL_NOTE(recommended);
+        LIBARCHIVE_NOTE(recommended);
         LIBBLKID_NOTE(recommended);
         LIBCRYPTO_NOTE(suggested);
         LIBCRYPTSETUP_NOTE(suggested);

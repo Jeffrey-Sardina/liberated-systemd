@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_LIBIDN2
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBIDN2
@@ -19,9 +19,3 @@ extern DLSYM_PROTOTYPE(idn2_to_unicode_8z8z);
 #endif
 
 int dlopen_idn(int log_level) _dlopen_loader_;
-
-#define DLOPEN_IDN(log_level, priority)                                 \
-        ({                                                              \
-                LIBIDN2_NOTE(priority);                                 \
-                dlopen_idn(log_level);                                  \
-        })

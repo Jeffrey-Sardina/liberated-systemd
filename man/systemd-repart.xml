@@ -171,13 +171,15 @@
 
     <variablelist>
       <varlistentry>
+        <term><option>-n</option></term>
         <term><option>--dry-run=</option></term>
 
         <listitem><para>Takes a boolean. If this switch is not specified, <option>--dry-run=yes</option> is
         the implied default. Controls whether <filename>systemd-repart</filename> executes the requested
         re-partition operations or whether it should only show what it would do. Unless
         <option>--dry-run=no</option> is specified <filename>systemd-repart</filename> will not actually
-        touch the device's partition table.</para>
+        touch the device's partition table. The short option <option>-n</option> is equivalent to
+        <option>--dry-run=yes</option> and was added in version 262.</para>
 
         <xi:include href="version-info.xml" xpointer="v245"/></listitem>
       </varlistentry>
@@ -242,6 +244,18 @@
         limit.</para>
 
         <xi:include href="version-info.xml" xpointer="v246"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--cow=<replaceable>BOOL</replaceable></option></term>
+
+        <listitem><para>Controls copy-on-write for newly created image files on filesystems that support it.
+        If true, copy-on-write is enabled; if false, it is disabled. If set to <literal>auto</literal>, the
+        filesystem or parent directory default is left unchanged. Copy-on-write allows files to be reflinked
+        into the image, reducing both build time and disk usage, but may result in fragmentation for images
+        subject to frequent random writes. Defaults to <literal>auto</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
       </varlistentry>
 
       <varlistentry>

@@ -32,7 +32,6 @@
 #include "devnum-util.h"
 #include "dirent-util.h"
 #include "dissect-image.h"
-#include "efivars.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "factory-reset.h"
@@ -99,9 +98,6 @@
 
 /* We know up front we're never going to put more than this in a verity sig partition. */
 #define VERITY_SIG_SIZE (HARD_MIN_SIZE*4ULL)
-
-/* libfdisk takes off slightly more than 1M of the disk size when creating a GPT disk label */
-#define GPT_METADATA_SIZE (1044ULL*1024ULL)
 
 /* LUKS2 takes off 16M of the partition size with its metadata by default */
 #define LUKS2_METADATA_SIZE (16ULL*1024ULL*1024ULL)
@@ -218,6 +214,7 @@ static char *arg_generate_crypttab = NULL;
 static Set *arg_verity_settings = NULL;
 static bool arg_relax_copy_block_security = false;
 static bool arg_varlink = false;
+static int arg_cow = -1;
 static bool arg_eltorito = false;
 static char *arg_eltorito_system = NULL;
 static char *arg_eltorito_volume = NULL;
@@ -1652,23 +1649,14 @@ static bool context_grow_partitions_phase(
         return !try_again;
 }
 
-static void context_grow_partition_one(Context *context, FreeArea *a, Partition *p, uint64_t *span) {
+static void context_grow_partition_one(Context *context, Partition *p, uint64_t *span) {
         uint64_t m;
 
         assert(context);
-        assert(a);
         assert(p);
         assert(span);
 
-        if (*span == 0)
-                return;
-
-        if (p->allocated_to_area != a)
-                return;
-
-        if (PARTITION_IS_FOREIGN(p))
-                return;
-
+        assert(*span > 0);
         assert(p->new_size != UINT64_MAX);
 
         /* Calculate new size and align. */
@@ -1708,15 +1696,15 @@ static int context_grow_partitions_on_free_area(Context *context, FreeArea *a) {
                 if (context_grow_partitions_phase(context, a, phase, &span, &weight_sum))
                         phase++; /* go to the next phase */
 
-        /* We still have space left over? Donate to preceding partition if we have one */
-        if (span > 0 && a->after)
-                context_grow_partition_one(context, a, a->after, &span);
 
-        /* What? Even still some space left (maybe because there was no preceding partition, or it had a
-         * size limit), then let's donate it to whoever wants it. */
+        /* What? Even still some space left (because one partition had max_size < share
+         * and another had min_size > share), then let's donate it to whoever wants it. */
         if (span > 0)
                 LIST_FOREACH(partitions, p, context->partitions) {
-                        context_grow_partition_one(context, a, p, &span);
+                        if (p->allocated_to_area != a && p->padding_area != a)
+                                continue;
+
+                        context_grow_partition_one(context, p, &span);
                         if (span == 0)
                                 break;
                 }
@@ -1726,15 +1714,12 @@ static int context_grow_partitions_on_free_area(Context *context, FreeArea *a) {
                 Partition *last_partition = NULL;
 
                 LIST_FOREACH(partitions, p, context->partitions)
-                        if (p->allocated_to_area == a)
+                        if (p->allocated_to_area == a || p->padding_area == a)
                                 last_partition = p;
 
                 if (last_partition) {
                         assert(last_partition->new_padding != UINT64_MAX);
                         last_partition->new_padding += round_down_size(span, context->grain_size);
-                } else if (a->after) {
-                        assert(a->after->new_padding != UINT64_MAX);
-                        a->after->new_padding += round_down_size(span, context->grain_size);
                 }
         }
 
@@ -2143,7 +2128,7 @@ static int config_parse_copy_files(
         if (!isempty(p))
                 return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EINVAL), "Too many arguments: %s", rvalue);
 
-        CopyFlags flags = COPY_REFLINK|COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE|COPY_RESTORE_DIRECTORY_TIMESTAMPS;
+        CopyFlags flags = COPY_HOLES|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS|COPY_ALL_XATTRS|COPY_GRACEFUL_WARN|COPY_TRUNCATE|COPY_RESTORE_DIRECTORY_TIMESTAMPS;
         for (const char *opts = options;;) {
                 _cleanup_free_ char *word = NULL;
                 const char *val;
@@ -3122,7 +3107,7 @@ static int partition_read_definition(
                                   "Cannot format %s filesystem without source files, refusing.", p->format);
 
         if (p->verity != VERITY_OFF || p->encrypt != ENCRYPT_OFF) {
-                r = DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+                r = dlopen_cryptsetup(LOG_DEBUG);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, path, 1, r,
                                           "libcryptsetup not found, Verity=/Encrypt= are not supported: %m");
@@ -3152,9 +3137,9 @@ static int partition_read_definition(
                                    verity_mode_to_string(p->verity));
         }
 
-        if (p->verity != VERITY_OFF && p->encrypt != ENCRYPT_OFF)
+        if (IN_SET(p->verity, VERITY_HASH, VERITY_SIG) && p->encrypt != ENCRYPT_OFF)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
-                                  "Encrypting verity hash/data partitions is not supported.");
+                                  "Encrypting verity hash/signature partitions is not supported.");
 
         if (p->verity == VERITY_SIG && (p->size_min != UINT64_MAX || p->size_max != UINT64_MAX))
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
@@ -3681,6 +3666,13 @@ static int context_read_definitions(Context *context) {
                 if (dp->minimize == MINIMIZE_OFF && !(dp->copy_blocks_path || dp->copy_blocks_auto))
                         return log_syntax(NULL, LOG_ERR, p->definition_path, 1, SYNTHETIC_ERRNO(EINVAL),
                                           "Minimize= set for verity hash partition but data partition does not set CopyBlocks= or Minimize=.");
+
+                /* The verity hash of an encrypted data partition covers the ciphertext, which is generated
+                 * with a fresh volume key only when the final image is built, hence it cannot be
+                 * precalculated for minimizing purposes. */
+                if (dp->encrypt != ENCRYPT_OFF)
+                        return log_syntax(NULL, LOG_ERR, p->definition_path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                          "Minimize= cannot be set for verity hash partitions whose data partition is encrypted, use SizeMaxBytes= on the data partition instead.");
         }
 
         LIST_FOREACH(partitions, p, context->partitions) {
@@ -4765,7 +4757,7 @@ static int context_wipe_range(Context *context, uint64_t offset, uint64_t size) 
         assert(offset != UINT64_MAX);
         assert(size != UINT64_MAX);
 
-        r = DLOPEN_LIBBLKID(LOG_ERR, required);
+        r = dlopen_libblkid(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -5337,6 +5329,15 @@ static int partition_target_prepare(
         return 0;
 }
 
+static void partition_target_drop_decrypted(PartitionTarget *t) {
+        assert(t);
+
+        /* Deactivate the dm-crypt device again, so that subsequent access to the target reaches the
+         * encrypted data as it is stored on disk (i.e. the ciphertext). Requires the target to have been
+         * sync'ed first. */
+        t->decrypted = decrypted_partition_target_free(t->decrypted);
+}
+
 static int partition_target_grow(PartitionTarget *t, uint64_t size) {
         int r;
 
@@ -5396,7 +5397,7 @@ static int partition_target_sync(Context *context, Partition *p, PartitionTarget
                                                "Partition %" PRIu64 "'s contents (%s) don't fit in the partition (%s).",
                                                p->partno, FORMAT_BYTES(st.st_size), FORMAT_BYTES(p->new_size));
 
-                r = copy_bytes(t->fd, whole_fd, UINT64_MAX, COPY_REFLINK|COPY_HOLES|COPY_FSYNC|COPY_SEEK0_SOURCE);
+                r = copy_bytes(t->fd, whole_fd, UINT64_MAX, COPY_HOLES|COPY_FSYNC|COPY_SEEK0_SOURCE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy bytes to partition: %m");
         } else {
@@ -5457,7 +5458,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
         assert(p);
         assert(p->encrypt != ENCRYPT_OFF);
 
-        r = DLOPEN_CRYPTSETUP(LOG_ERR, recommended);
+        r = dlopen_cryptsetup(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -6000,9 +6001,12 @@ static int partition_format_verity_hash(
 
         (void) partition_hint(p, node, &hint);
 
-        r = DLOPEN_CRYPTSETUP(LOG_ERR, recommended);
+        r = dlopen_cryptsetup(LOG_ERR);
         if (r < 0)
                 return r;
+
+        if (p->partno != UINT64_MAX)
+                log_info("Calculating Verity protection data for future partition %" PRIu64 "...", p->partno);
 
         if (!node) {
                 r = partition_target_prepare(context, p, p->new_size, /* need_path= */ true, &t);
@@ -6102,7 +6106,7 @@ static int sign_verity_roothash(
         assert(iovec_is_set(roothash));
         assert(ret_signature);
 
-        r = DLOPEN_LIBCRYPTO(LOG_ERR, recommended);
+        r = dlopen_libcrypto(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -6385,7 +6389,21 @@ static int context_copy_blocks(Context *context) {
                                 return log_error_errno(errno, "Failed to seek to copy blocks offset in %s: %m", p->copy_blocks_path);
                 }
 
-                r = copy_bytes_full(p->copy_blocks_fd, partition_target_fd(t), p->copy_blocks_size, COPY_REFLINK, /* ret_remains= */ NULL, /* ret_remains_size= */ NULL, progress_bytes, p);
+                /* We call copy_bytes_full() instead of copy_file_range() directly, because copy_file_range()
+                 * needs to be called with a size limit to allow for progress updates. But we don't want that
+                 * for cloning, we want one big massive reflink if possible, and unfortunately we can't know
+                 * if copy_file_range() will do reflink or not, so we can't call it without the size limit.
+                 * Hence, call copy_bytes_full(), which tries FICLONE/BTRFS_IOC_CLONE first to do one big
+                 * clone, and then falls back to copying in chunks. */
+                r = copy_bytes_full(
+                                p->copy_blocks_fd,
+                                partition_target_fd(t),
+                                p->copy_blocks_size,
+                                /* copy_flags= */ 0,
+                                /* ret_remains= */ NULL,
+                                /* ret_remains_size= */ NULL,
+                                progress_bytes,
+                                p);
                 clear_progress_bar(/* prefix= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy in data from '%s': %m", p->copy_blocks_path);
@@ -6411,6 +6429,11 @@ static int context_copy_blocks(Context *context) {
                                  p->partno, FORMAT_TIMESPAN(time_spent, 0));
 
                 if (p->siblings[VERITY_HASH] && !partition_defer(context, p->siblings[VERITY_HASH])) {
+                        /* The verity hash must cover the partition contents as stored on disk, i.e. the
+                         * ciphertext if the partition is encrypted, hence tear down the dm-crypt device
+                         * first. */
+                        partition_target_drop_decrypted(t);
+
                         r = partition_format_verity_hash(context, p->siblings[VERITY_HASH],
                                                          /* node= */ NULL, partition_target_path(t));
                         if (r < 0)
@@ -6909,7 +6932,7 @@ static int do_copy_files(Context *context, Partition *p, const char *root) {
                         if (tfd < 0)
                                 return log_error_errno(errno, "Failed to create target file '%s': %m", line->target);
 
-                        r = copy_bytes(sfd, tfd, UINT64_MAX, COPY_REFLINK|COPY_HOLES|COPY_SIGINT|COPY_TRUNCATE);
+                        r = copy_bytes(sfd, tfd, UINT64_MAX, COPY_HOLES|COPY_SIGINT|COPY_TRUNCATE);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy '%s' to '%s%s': %m", line->source, strempty(arg_copy_source), line->target);
 
@@ -7194,7 +7217,7 @@ static int partition_populate_filesystem(Context *context, Partition *p, const c
          * appear in the host namespace. Hence we fork a child that has its own file system namespace and
          * detached mount propagation. */
 
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
+        (void) dlopen_libmount(LOG_DEBUG);
 
         r = pidref_safe_fork(
                         "(sd-copy)",
@@ -7600,6 +7623,11 @@ static int context_mkfs(Context *context) {
                         return r;
 
                 if (p->siblings[VERITY_HASH] && !partition_defer(context, p->siblings[VERITY_HASH])) {
+                        /* The verity hash must cover the partition contents as stored on disk, i.e. the
+                         * ciphertext if the partition is encrypted, hence tear down the dm-crypt device
+                         * first. */
+                        partition_target_drop_decrypted(t);
+
                         r = partition_format_verity_hash(context, p->siblings[VERITY_HASH],
                                                          /* node= */ NULL, partition_target_path(t));
                         if (r < 0)
@@ -8182,7 +8210,7 @@ static int context_split(Context *context) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to write to split partition %s: %m", p->split_path);
                 } else {
-                        r = copy_bytes(fd, fdt, p->new_size, COPY_REFLINK|COPY_HOLES|COPY_TRUNCATE);
+                        r = copy_bytes(fd, fdt, p->new_size, COPY_HOLES|COPY_TRUNCATE);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy to split partition %s: %m", p->split_path);
                 }
@@ -8825,7 +8853,7 @@ static int resolve_copy_blocks_auto_candidate(
                 return log_error_errno(r, "Failed to open block device " DEVNUM_FORMAT_STR ": %m",
                                        DEVNUM_FORMAT_VAL(whole_devno));
 
-        r = DLOPEN_LIBBLKID(LOG_ERR, required);
+        r = dlopen_libblkid(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -9464,6 +9492,11 @@ static int context_fstab(Context *context) {
                 return 0;
         }
 
+        if (arg_dry_run) {
+                log_notice("Running in dry run mode, not generating %s", arg_generate_fstab);
+                return 0;
+        }
+
         path = path_join(arg_copy_source, arg_generate_fstab);
         if (!path)
                 return log_oom();
@@ -9593,6 +9626,11 @@ static int context_crypttab(Context *context, bool late) {
         if (!need_crypttab(context)) {
                 log_notice("EncryptedVolume= is not specified for any eligible partitions, not generating %s",
                            arg_generate_crypttab);
+                return 0;
+        }
+
+        if (arg_dry_run) {
+                log_notice("Running in dry run mode, not generating %s", arg_generate_crypttab);
                 return 0;
         }
 
@@ -10213,6 +10251,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 OPTION_GROUP("Operation"): {}
 
+                OPTION_SHORT('n', NULL, "Run dry-run operation"):
+                        arg_dry_run = true;
+                        break;
+
                 OPTION_LONG("dry-run", "BOOL",
                             "Whether to run dry-run operation"):
                         r = parse_boolean_argument("--dry-run=", opts.arg, &arg_dry_run);
@@ -10243,6 +10285,13 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG("discard", "BOOL",
                             "Whether to discard backing blocks for new partitions"):
                         r = parse_boolean_argument("--discard=", opts.arg, &arg_discard);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("cow", "BOOL|auto",
+                            "Whether to enable copy-on-write for newly created image files"):
+                        r = parse_tristate_argument_with_auto("--cow=", opts.arg, &arg_cow);
                         if (r < 0)
                                 return r;
                         break;
@@ -10878,54 +10927,6 @@ static int parse_proc_cmdline_factory_reset(void) {
         return 0;
 }
 
-static int parse_efi_variable_factory_reset(void) {
-        _cleanup_free_ char *value = NULL;
-        int r;
-
-        /* NB: This is legacy, people should move to the newer FactoryResetRequest variable! */
-
-        // FIXME: Remove this in v260
-
-        if (arg_factory_reset >= 0) /* Never override what is specified on the process command line */
-                return 0;
-
-        if (!in_initrd()) /* Never honour EFI variable factory reset request outside of the initrd */
-                return 0;
-
-        r = efi_get_variable_string(EFI_SYSTEMD_VARIABLE_STR("FactoryReset"), &value);
-        if (r == -ENOENT || ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return 0;
-        if (r < 0)
-                return log_error_errno(r, "Failed to read EFI variable FactoryReset: %m");
-
-        log_warning("Warning, EFI variable FactoryReset is in use, please migrate to use FactoryResetRequest instead, support will be removed in v260!");
-
-        r = parse_boolean(value);
-        if (r < 0)
-                return log_error_errno(r, "Failed to parse EFI variable FactoryReset: %m");
-
-        arg_factory_reset = r;
-        if (r)
-                log_notice("Factory reset requested via EFI variable FactoryReset.");
-
-        return 0;
-}
-
-static int remove_efi_variable_factory_reset(void) {
-        int r;
-
-        // FIXME: Remove this in v260, see above
-
-        r = efi_set_variable(EFI_SYSTEMD_VARIABLE_STR("FactoryReset"), NULL, 0);
-        if (r == -ENOENT || ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return 0;
-        if (r < 0)
-                return log_error_errno(r, "Failed to remove EFI variable FactoryReset: %m");
-
-        log_info("Successfully unset EFI variable FactoryReset.");
-        return 0;
-}
-
 static int acquire_root_devno(
                 const char *p,
                 const char *root,
@@ -11033,7 +11034,12 @@ static int find_root(Context *context) {
                         if (!s)
                                 return log_oom();
 
-                        fd = xopenat_full(AT_FDCWD, arg_node, open_flags|O_CREAT|O_EXCL|O_NOFOLLOW, XO_NOCOW, 0666);
+                        fd = xopenat_full(
+                                        AT_FDCWD,
+                                        arg_node,
+                                        open_flags|O_CREAT|O_EXCL|O_NOFOLLOW,
+                                        arg_cow < 0 ? 0 : (arg_cow > 0 ? XO_COW : XO_NOCOW),
+                                        0666);
                         if (fd < 0)
                                 return log_error_errno(fd, "Failed to create '%s': %m", arg_node);
 
@@ -11262,12 +11268,26 @@ static int determine_auto_size(
 
         assert(c);
 
-        minimal_size = round_up_size(GPT_METADATA_SIZE, 4096);
+        /* At the beginning of the image, some size is reserved for:
+         * Protective MBR (1 block) + GPT header (1 block) +
+         * Primary partition table (minimum 16KiB) = (2 * c->sector_size) + (16 * 1024)
+         *
+         * Note that fdisk usually sets the first usable block to 1MiB (at least for
+         * disks larger than 4MiB), so we just force it to that as well. If fdisk
+         * decides to set it lower, we made the image a bit larger than necessary,
+         * if it sets it higher, we'd have a problem. */
+        minimal_size = 1024 * 1024;
+        /* Of course need to align the start to our grain size as well */
+        minimal_size = round_up_size(minimal_size, c->grain_size);
+
+        /* At the end of the image, there is size reserved for:
+         * Secondary partition table (minimum 16KiB) + GPT header (1 block) */
+        minimal_size += (16 * 1024) + c->sector_size;
 
         if (c->from_scratch)
                 current_size = 0;
         else
-                current_size = round_up_size(GPT_METADATA_SIZE, 4096);
+                current_size = minimal_size;
 
         foreign_size = 0;
 
@@ -11382,10 +11402,13 @@ static int context_ponder(Context *context) {
                 if (context_drop_or_foreignize_one_priority(context))
                         continue; /* Still no luck. Let's drop a priority and try again. */
 
-                /* No more priorities left to drop. This configuration just doesn't fit on this disk... */
-                return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
-                                       "Can't fit requested partitions into available free space (%s), refusing.",
-                                       FORMAT_BYTES(largest_free_area));
+                /* No more priorities left to drop. This configuration just doesn't fit on this disk...
+                 * In Varlink service mode the failure is reported to the client as a structured error,
+                 * hence only log at debug level here. */
+                return log_full_errno(arg_varlink ? LOG_DEBUG : LOG_ERR,
+                                      SYNTHETIC_ERRNO(ENOSPC),
+                                      "Can't fit requested partitions into available free space (%s), refusing.",
+                                      FORMAT_BYTES(largest_free_area));
         }
 
         LIST_FOREACH(partitions, p, context->partitions) {
@@ -11562,7 +11585,7 @@ static int vl_method_run(
                         return sd_varlink_errorbo(
                                         link,
                                         "io.systemd.Repart.DiskTooSmall",
-                                        SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", current_size),
+                                        SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", context->total),
                                         SD_JSON_BUILD_PAIR_UNSIGNED("minimalSizeBytes", minimal_size));
 
                 /* Or if the disk would fit, but theres's not enough unallocated space */
@@ -11570,7 +11593,7 @@ static int vl_method_run(
                 return sd_varlink_errorbo(
                                 link,
                                 "io.systemd.Repart.InsufficientFreeSpace",
-                                SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", current_size),
+                                SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", context->total),
                                 JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("needFreeBytes", need_free),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("minimalSizeBytes", minimal_size));
         }
@@ -11578,17 +11601,28 @@ static int vl_method_run(
                 return r;
 
         if (p.dry_run) {
-                uint64_t current_size, minimal_size;
+                uint64_t minimal_size;
 
                 /* If we are doing a dry-run, report the minimal size. */
-                r = determine_auto_size(context, LOG_DEBUG, &current_size, /* ret_foreign_size= */ NULL, &minimal_size);
+                r = determine_auto_size(context, LOG_DEBUG, /* ret_current_size= */ NULL, /* ret_foreign_size= */ NULL, &minimal_size);
                 if (r < 0)
                         return r;
 
+                bool count_partitions = IN_SET(context->empty, EMPTY_REFUSE, EMPTY_ALLOW);
+                uint64_t n_partitions = 0;
+
+                if (count_partitions)
+                        LIST_FOREACH(partitions, pp, context->partitions)
+                                n_partitions += PARTITION_EXISTS(pp);
+
+                /* In 'force' and 'require' modes the existing partition table is not read, hence we don't
+                 * know how many partitions the disk contains, and say nothing about it. */
                 return sd_varlink_replybo(
                                 link,
                                 SD_JSON_BUILD_PAIR_UNSIGNED("minimalSizeBytes", minimal_size),
-                                SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", current_size));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("currentSizeBytes", context->total),
+                                SD_JSON_BUILD_PAIR_CONDITION(count_partitions,
+                                                             "partitionCount", SD_JSON_BUILD_UNSIGNED(n_partitions)));
         }
 
         r = context_write_partition_table(context);
@@ -11641,6 +11675,11 @@ static int run(int argc, char *argv[]) {
         bool node_is_our_loop = false;
         int r;
 
+        LIBBLKID_NOTE(required);
+        LIBCRYPTO_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBFDISK_NOTE(required);
+        LIBMOUNT_NOTE(required);
         LIBSELINUX_NOTE(recommended);
         TPM2_NOTE(suggested);
 
@@ -11650,7 +11689,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = DLOPEN_FDISK(LOG_ERR, required);
+        r = dlopen_fdisk(LOG_ERR);
         if (r < 0)
                 return r;
 
@@ -11658,10 +11697,6 @@ static int run(int argc, char *argv[]) {
                 return vl_server();
 
         r = parse_proc_cmdline_factory_reset();
-        if (r < 0)
-                return r;
-
-        r = parse_efi_variable_factory_reset();
         if (r < 0)
                 return r;
 
@@ -11799,11 +11834,6 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
         if (r > 0) {
-                /* We actually did a factory reset! */
-                r = remove_efi_variable_factory_reset();
-                if (r < 0)
-                        return r;
-
                 /* Reload the reduced partition table */
                 context_unload_partition_table(context);
                 r = context_load_partition_table(context);

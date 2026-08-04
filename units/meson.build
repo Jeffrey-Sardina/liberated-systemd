@@ -873,6 +873,10 @@ units = [
           'conditions' : ['ENABLE_SYSINSTALL'],
         },
         {
+          'file' : 'systemd-sysupdate-auto-enable.service',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
           'file' : 'systemd-sysupdate-reboot.service',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
@@ -982,18 +986,13 @@ units = [
           'install_tag' : 'udev',
         },
         {
-          'file' : 'systemd-udevd-control.socket',
-          'symlinks' : ['sockets.target.wants/'],
-          'install_tag' : 'udev',
-        },
-        {
           'file' : 'systemd-udevd-kernel.socket',
           'symlinks' : ['sockets.target.wants/'],
           'install_tag' : 'udev',
         },
         {
           'file' : 'systemd-udevd-varlink.socket',
-          'symlinks' : ['sockets.target.wants/'],
+          'symlinks' : ['sockets.target.wants/', 'systemd-udevd-control.socket'],
           'install_tag' : 'udev',
         },
         {

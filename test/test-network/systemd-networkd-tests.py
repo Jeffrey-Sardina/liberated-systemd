@@ -1699,6 +1699,35 @@ class NetworkctlTests(unittest.TestCase, Utilities):
         networkctl_reload()
         self.wait_operstate('test1', 'degraded')
 
+    def test_reload_no_reconfigure(self):
+        copy_network_unit('12-dummy.netdev', '25-address-static.network', copy_dropins=False)
+        start_networkd()
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip -4 address show dev dummy98')
+        print(output)
+        self.assertIn('inet 10.1.2.3/16 brd 10.1.255.255 scope global dummy98', output)
+
+        with open(
+            os.path.join(network_unit_dir, '25-address-static.network'), mode='w', encoding='utf-8'
+        ) as f:
+            f.write('[Match]\nName=dummy98\n\n[Network]\nIPv6AcceptRA=no\nAddress=10.99.0.1/24\n')
+
+        networkctl('reload', '--no-reconfigure')
+
+        output = check_output('ip -4 address show dev dummy98')
+        print(output)
+        self.assertIn('inet 10.1.2.3/16 brd 10.1.255.255 scope global dummy98', output)
+        self.assertNotIn('inet 10.99.0.1/24', output)
+
+        networkctl_reconfigure('dummy98')
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip -4 address show dev dummy98')
+        print(output)
+        self.assertIn('inet 10.99.0.1/24 brd 10.99.0.255 scope global dummy98', output)
+        self.assertNotIn('inet 10.1.2.3/16', output)
+
     def test_glob(self):
         copy_network_unit('11-dummy.netdev', '11-dummy.network')
         start_networkd()
@@ -5343,6 +5372,37 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         print(output)
         for i in range(1, 5):
             self.assertRegex(output, f'2607:5300:203:5215:{i}::1 *proxy')
+
+    def test_ipv4_proxy_arp(self):
+        copy_network_unit('25-ipv4-proxy-arp.network', '12-dummy.netdev')
+        start_networkd()
+
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip -4 neighbor show proxy dev dummy98')
+        print(output)
+        for i in range(1, 6):
+            self.assertRegex(output, f'192.0.2.{i} *proxy')
+
+        # IPv4ProxyARPAddress= implies IPv4ProxyARP=yes, mirroring IPv6ProxyNDPAddress=.
+        self.check_ipv4_sysctl_attr('dummy98', 'proxy_arp', '1')
+
+        # Explicit IPv4ProxyARP=no must suppress all IPv4ProxyARPAddress= entries and
+        # must not force proxy_arp=1. The module is add-only (no reconcile/remove pass),
+        # so phase 2 starts from a clean interface: stop networkd, delete the dummy to
+        # flush the kernel neighbor-proxy table, swap the .network file, and restart.
+        stop_networkd()
+        remove_link('dummy98')
+        remove_network_unit('25-ipv4-proxy-arp.network')
+        copy_network_unit('25-ipv4-proxy-arp-disabled.network', '12-dummy.netdev')
+        start_networkd()
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip -4 neighbor show proxy dev dummy98')
+        print(output)
+        for i in range(1, 6):
+            self.assertNotIn(f'192.0.2.{i}', output)
+        self.check_ipv4_sysctl_attr('dummy98', 'proxy_arp', '0')
 
     def test_ipv6_neigh_retrans_time(self):
         link = 'test25'

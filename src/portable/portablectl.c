@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "ansi-color.h"
 #include "build.h"
+#include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-unit-util.h"
@@ -169,6 +170,27 @@ static int extract_prefix(const char *path, char **ret) {
         return 0;
 }
 
+static int log_unit_file_matches(char **matches) {
+        if (arg_quiet)
+                return 0;
+
+        if (strv_isempty(matches))
+                log_info("(Matching all unit files.)");
+        else if (strv_length(matches) == 1)
+                log_info("(Matching unit files with prefix '%s'.)", matches[0]);
+        else {
+                _cleanup_free_ char *joined = NULL;
+
+                joined = strv_join(matches, "', '");
+                if (!joined)
+                        return log_oom();
+
+                log_info("(Matching unit files with prefixes '%s'.)", joined);
+        }
+
+        return 0;
+}
+
 static int determine_matches(const char *image, char **l, bool allow_any, char ***ret) {
         _cleanup_strv_free_ char **k = NULL;
         int r;
@@ -184,9 +206,6 @@ static int determine_matches(const char *image, char **l, bool allow_any, char *
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract prefix of image name '%s': %m", image);
 
-                if (!arg_quiet)
-                        log_info("(Matching unit files with prefix '%s'.)", prefix);
-
                 r = strv_consume(&k, prefix);
                 if (r < 0)
                         return log_oom();
@@ -197,24 +216,16 @@ static int determine_matches(const char *image, char **l, bool allow_any, char *
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Refusing all unit file match.");
 
-                if (!arg_quiet)
-                        log_info("(Matching all unit files.)");
         } else {
 
                 k = strv_copy(l);
                 if (!k)
                         return log_oom();
-
-                if (!arg_quiet) {
-                        _cleanup_free_ char *joined = NULL;
-
-                        joined = strv_join(k, "', '");
-                        if (!joined)
-                                return log_oom();
-
-                        log_info("(Matching unit files with prefixes '%s'.)", joined);
-                }
         }
+
+        r = log_unit_file_matches(k);
+        if (r < 0)
+                return r;
 
         *ret = TAKE_PTR(k);
 
@@ -329,15 +340,78 @@ static int verb_list_images(int argc, char *argv[], uintptr_t _data, void *userd
         return 0;
 }
 
-static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd_bus_message **reply) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+static int determine_matches_from_os_release(sd_bus *bus, const char *image, char ***ret) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_strv_free_ char **matches = NULL;
+        int r;
+
+        assert(bus);
+        assert(image);
+        assert(ret);
+
+        r = bus_call_method(bus, bus_portable_mgr, "GetImageOSRelease", &error, &reply, "s", image);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to inspect image os-release: %s", bus_error_message(&error, r));
+                *ret = NULL;
+                return 0;
+        }
+
+        r = sd_bus_message_enter_container(reply, 'a', "{ss}");
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        for (;;) {
+                _cleanup_strv_free_ char **split = NULL;
+                const char *key, *value;
+
+                r = sd_bus_message_read(reply, "{ss}", &key, &value);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+                if (r == 0)
+                        break;
+
+                if (!streq(key, "PORTABLE_PREFIXES"))
+                        continue;
+
+                split = strv_split(value, WHITESPACE);
+                if (!split)
+                        return log_oom();
+
+                STRV_FOREACH(prefix, split)
+                        if (!string_is_safe(*prefix, STRING_FILENAME_PART))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid PORTABLE_PREFIXES= entry in image os-release, refusing.");
+
+                strv_free_and_replace(matches, split);
+        }
+
+        r = sd_bus_message_exit_container(reply);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        if (strv_isempty(matches)) {
+                *ret = NULL;
+                return 0;
+        }
+
+        *ret = TAKE_PTR(matches);
+        return 0;
+}
+
+static int make_get_image_metadata_message(
+                sd_bus *bus,
+                const char *image,
+                char **matches,
+                sd_bus_message **ret) {
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         uint64_t flags = arg_force ? PORTABLE_FORCE_EXTENSION : 0;
         const char *method;
         int r;
 
         assert(bus);
-        assert(reply);
+        assert(ret);
 
         method = strv_isempty(arg_extension_images) && !arg_force ? "GetImageMetadata" : "GetImageMetadataWithExtensions";
 
@@ -363,19 +437,42 @@ static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd
                         return bus_log_create_error(r);
         }
 
+        *ret = TAKE_PTR(m);
+        return 0;
+}
+
+static int log_image_metadata_error(int r, const sd_bus_error *error) {
+        return log_error_errno(r, "Failed to inspect image metadata: %s", bus_error_message(error, r));
+}
+
+static int get_image_metadata(sd_bus *bus, const char *image, char **matches, sd_bus_message **reply) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        int r;
+
+        r = make_get_image_metadata_message(bus, image, matches, &m);
+        if (r < 0)
+                return r;
+
         r = sd_bus_call(bus, m, 0, &error, reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to inspect image metadata: %s", bus_error_message(&error, r));
+                return log_image_metadata_error(r, &error);
 
         return 0;
+}
+
+static bool image_metadata_error_is_no_match(const sd_bus_error *error) {
+        return sd_bus_error_has_name(error, BUS_ERROR_NO_MATCHING_UNIT_FILES);
 }
 
 VERB(verb_inspect_image, "inspect", "NAME|PATH [PREFIX…]", 2, VERB_ANY, 0,
      "Show details of specified portable service image");
 static int verb_inspect_image(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_strv_free_ char **matches = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_strv_free_ char **matches = NULL, **fallback_matches = NULL;
         _cleanup_free_ char *image = NULL;
         bool nl = false, header = false;
         const char *path;
@@ -387,17 +484,43 @@ static int verb_inspect_image(int argc, char *argv[], uintptr_t _data, void *use
         if (r < 0)
                 return r;
 
-        r = determine_matches(argv[1], argv + 2, true, &matches);
-        if (r < 0)
-                return r;
-
         r = acquire_bus(&bus);
         if (r < 0)
                 return r;
 
-        r = get_image_metadata(bus, image, matches, &reply);
+        r = determine_matches(argv[1], argv + 2, true, &matches);
         if (r < 0)
                 return r;
+
+        r = make_get_image_metadata_message(bus, image, matches, &m);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_call(bus, m, 0, &error, &reply);
+        if (r < 0) {
+                int first_error = r;
+
+                if (!strv_isempty(argv + 2) || !image_metadata_error_is_no_match(&error))
+                        return log_image_metadata_error(r, &error);
+
+                r = determine_matches_from_os_release(bus, image, &fallback_matches);
+                if (r < 0)
+                        return r;
+
+                if (strv_isempty(fallback_matches))
+                        return log_image_metadata_error(first_error, &error);
+
+                if (!arg_quiet)
+                        log_info("(No matching unit files found with the image name prefix, retrying with PORTABLE_PREFIXES= from os-release.)");
+
+                r = log_unit_file_matches(fallback_matches);
+                if (r < 0)
+                        return r;
+
+                r = get_image_metadata(bus, image, fallback_matches, &reply);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_bus_message_read(reply, "s", &path);
         if (r < 0)
@@ -433,7 +556,7 @@ static int verb_inspect_image(int argc, char *argv[], uintptr_t _data, void *use
                        strna(pretty_os));
         }
 
-        if (!strv_isempty(arg_extension_images)) {
+        if (!strv_isempty(arg_extension_images) || arg_force) {
                 /* If we specified any extensions, we'll first get back exactly the paths (and
                  * extension-release content) for each one of the arguments. */
 
@@ -1276,6 +1399,7 @@ VERB(verb_read_only_image, "read-only", "NAME|PATH [BOOL]", 2, 3, 0,
 static int verb_read_only_image(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_free_ char *image = NULL;
         int b = true, r;
 
         if (argc > 2) {
@@ -1284,13 +1408,17 @@ static int verb_read_only_image(int argc, char *argv[], uintptr_t _data, void *u
                         return log_error_errno(b, "Failed to parse boolean argument: %s", argv[2]);
         }
 
+        r = determine_image(argv[1], false, &image);
+        if (r < 0)
+                return r;
+
         r = acquire_bus(&bus);
         if (r < 0)
                 return r;
 
         (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = bus_call_method(bus, bus_portable_mgr, "MarkImageReadOnly", &error, NULL, "sb", argv[1], b);
+        r = bus_call_method(bus, bus_portable_mgr, "MarkImageReadOnly", &error, NULL, "sb", image, b);
         if (r < 0)
                 return log_error_errno(r, "Could not mark image read-only: %s", bus_error_message(&error, r));
 
@@ -1312,12 +1440,17 @@ static int verb_remove_image(int argc, char *argv[], uintptr_t _data, void *user
         for (i = 1; i < argc; i++) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+                _cleanup_free_ char *image = NULL;
+
+                r = determine_image(argv[i], false, &image);
+                if (r < 0)
+                        return r;
 
                 r = bus_message_new_method_call(bus, &m, bus_portable_mgr, "RemoveImage");
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_message_append(m, "s", argv[i]);
+                r = sd_bus_message_append(m, "s", image);
                 if (r < 0)
                         return bus_log_create_error(r);
 
@@ -1335,6 +1468,7 @@ VERB(verb_set_limit, "set-limit", "[NAME|PATH] LIMIT", 2, 3, 0,
 static int verb_set_limit(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_free_ char *image = NULL;
         uint64_t limit;
         int r;
 
@@ -1352,10 +1486,14 @@ static int verb_set_limit(int argc, char *argv[], uintptr_t _data, void *userdat
                         return log_error_errno(r, "Failed to parse size: %s", argv[argc-1]);
         }
 
-        if (argc > 2)
+        if (argc > 2) {
                 /* With two arguments changes the quota limit of the specified image */
-                r = bus_call_method(bus, bus_portable_mgr, "SetImageLimit", &error, NULL, "st", argv[1], limit);
-        else
+                r = determine_image(argv[1], false, &image);
+                if (r < 0)
+                        return r;
+
+                r = bus_call_method(bus, bus_portable_mgr, "SetImageLimit", &error, NULL, "st", image, limit);
+        } else
                 /* With one argument changes the pool quota limit */
                 r = bus_call_method(bus, bus_portable_mgr, "SetPoolLimit", &error, NULL, "t", limit);
 

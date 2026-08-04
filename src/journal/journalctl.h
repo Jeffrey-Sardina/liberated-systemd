@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 #include "pcre2-util.h"
 
 typedef enum JournalctlAction {
@@ -45,6 +45,7 @@ extern bool arg_merge;
 extern int arg_boot;
 extern sd_id128_t arg_boot_id;
 extern int arg_boot_offset;
+extern bool arg_boot_filter;
 extern bool arg_dmesg;
 extern bool arg_no_hostname;
 extern char *arg_cursor;

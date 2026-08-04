@@ -293,13 +293,15 @@ static size_t previous_ansi_sequence(const char *s, size_t length, const char **
                 return 0;
         }
 
-        for (size_t i = length - 2; i > 0; i--) {  /* -2 because at least two bytes are needed */
-                size_t slen = ansi_sequence_length(s + (i - 1), length - (i - 1));
-                if (slen == 0)
-                        continue;
+        for (size_t i = length - 2;; i--) {  /* -2 because at least two bytes are needed */
+                size_t slen = ansi_sequence_length(s + i, length - i);
+                if (slen > 0) {
+                        *ret_where = s + i;
+                        return slen;
+                }
 
-                *ret_where = s + (i - 1);
-                return slen;
+                if (i == 0)
+                        break;
         }
 
         *ret_where = NULL;
@@ -357,6 +359,33 @@ static char *ascii_ellipsize_mem(const char *s, size_t old_length, size_t new_le
         return t;
 }
 
+/* Walk backwards from 'end' (exclusive) to the start of the last complete UTF-8 character, without
+ * descending below 'start', validate it and return a pointer to its first byte, optionally decoding it
+ * into *ret_c. Returns NULL on a truncated or otherwise malformed sequence. */
+static const char* find_previous_unichar(const char *start, const char *end, char32_t *ret_c) {
+        const char *p;
+        int r;
+
+        assert(start);
+        assert(end);
+        assert(end > start);
+
+        for (p = end; p > start; ) {
+                p--;
+                if (((uint8_t) *p & 0xc0) != 0x80) /* Found a non-continuation byte, i.e. a character start. */
+                        break;
+        }
+
+        r = utf8_encoded_valid_unichar(p, end - p);
+        if (r < 0 || p + r != end)
+                return NULL;
+
+        if (ret_c)
+                assert_se(utf8_encoded_to_unichar(p, ret_c) == r);
+
+        return p;
+}
+
 char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigned percent) {
         size_t x, k, len, len2;
         const char *i, *j;
@@ -400,10 +429,12 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;  /* ANSI sequences don't take up any space in output */
                 }
 
-                char32_t c;
-                r = utf8_encoded_to_unichar(i, &c);
+                r = utf8_encoded_valid_unichar(i, s + old_length - i);
                 if (r < 0)
                         return NULL;
+
+                char32_t c;
+                assert_se(utf8_encoded_to_unichar(i, &c) == r);
 
                 int w = unichar_iswide(c) ? 2 : 1;
                 if (k + w > x)
@@ -431,9 +462,9 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
                         continue;
                 }
 
-                tt = utf8_prev_char(t);
-                r = utf8_encoded_to_unichar(tt, &c);
-                if (r < 0)
+                /* Find the previous complete UTF-8 character inside the retained suffix. */
+                tt = find_previous_unichar(i, t, &c);
+                if (!tt)
                         return NULL;
 
                 w = unichar_iswide(c) ? 2 : 1;
@@ -451,11 +482,21 @@ char* ellipsize_mem(const char *s, size_t old_length, size_t new_length, unsigne
         if (k >= new_length) {
                 /* Make space for ellipsis, if required and possible. We know that the edge character is not
                  * part of an ANSI sequence (because then we'd skip it). If the last character we looked at
-                 * was wide, we don't need to make space. */
-                if (j < s + old_length)
-                        j = utf8_next_char(j);
-                else if (i > s)
-                        i = utf8_prev_char(i);
+                 * was wide, we don't need to make space.
+                 * Move the edge by one complete UTF-8 character within the input slice. */
+                if (j < s + old_length) {
+                        r = utf8_encoded_valid_unichar(j, s + old_length - j);
+                        if (r < 0)
+                                return NULL;
+
+                        j += r;
+                } else if (i > s) {
+                        const char *tt = find_previous_unichar(s, i, NULL);
+                        if (!tt)
+                                return NULL;
+
+                        i = tt;
+                }
         }
 
         len = i - s;
@@ -1389,6 +1430,23 @@ size_t strspn_from_end(const char *str, const char *accept) {
         return n;
 }
 
+size_t strnspn(const char *str, const char *accept, size_t n) {
+        size_t i;
+
+        /* Like strspn(), but reads at most 'n' bytes from 'str'. Returns the length of the initial
+         * run of 'str' (capped at 'n') that consists solely of bytes found in 'accept'. Stops at a
+         * NUL byte too. Unlike strspn() this is safe on a buffer that is not NUL terminated within
+         * 'n' bytes. */
+
+        assert(str || n == 0);
+        assert(accept);
+
+        for (i = 0; i < n && str[i] != '\0' && strchr(accept, str[i]); i++)
+                ;
+
+        return i;
+}
+
 char* strdupspn(const char *a, const char *accept) {
         if (isempty(a) || isempty(accept))
                 return strdup("");
@@ -1462,28 +1520,47 @@ char* find_line_after_internal(const char *haystack, const char *needle) {
         return NULL;
 }
 
-bool version_is_valid(const char *s) {
-        if (isempty(s))
+bool version_is_valid(const char *s, VersionFlags flags) {
+
+        /* Validates a version string superficially. This does not process the version string in any
+         * semantical way, it mostly just validates that its charset is reasonable. */
+
+        if (FLAGS_SET(flags, VERSION_ALLOW_EMPTY) ? !s : isempty(s))
                 return false;
 
         if (!filename_part_is_valid(s))
                 return false;
 
-        /* This is a superset of the characters used by semver. We additionally allow "," and "_". */
-        if (!in_charset(s, ALPHANUMERICAL ".,_-+"))
-                return false;
+        /* We always allow all characters specified by the UAPI.10 Version Specification, i.e. 0-9, a-z, A-Z,
+         * ".", "-", "~", "^".
+         *
+         * If the relevant flags are set we'll also allow "+" and "_" separators.
+         *
+         * Note that with SemVer allows 0-9, a-z, A-Z, "+", "-", ".", hence with VERSION_ALLOW_PLUS we
+         * implement a superset of it.
+         *
+         * If you wonder when to use which flags: when validating foreign versions (e.g. distribution
+         * versions in /etc/os-release or so) validate liberally, i.e. add
+         * VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS. When validating our own versioned objects (e.g. vpick
+         * or so) validate more strictly, and in particular refuse characters such as "_" and "+" that may be
+         * used for separating component names or boot attempt counters. Also: first – if appropriate – split
+         * the string into individual components. For example, if the string consists of a name and a
+         * version, separated by some character, only pass the version part to this function. The name part
+         * may pass verification, but it's cleaner to not rely on that.
+         *
+         * For details about UAPI.10 see:
+         *
+         * → https://uapi-group.org/specifications/specs/version_format_specification/ */
 
-        return true;
-}
+        char charset[] = ALPHANUMERICAL ".-~^" /* plus room for the two chars below: */ "\0\0";
+        size_t l = strlen(charset);
 
-bool version_is_valid_versionspec(const char *s) {
-        if (!filename_part_is_valid(s))
-                return false;
+        if (FLAGS_SET(flags, VERSION_ALLOW_UNDERSCORE))
+                charset[l++] = '_';
+        if (FLAGS_SET(flags, VERSION_ALLOW_PLUS))
+                charset[l++] = '+';
 
-        if (!in_charset(s, ALPHANUMERICAL "-.~^"))
-                return false;
-
-        return true;
+        return in_charset(s, charset);
 }
 
 ssize_t strlevenshtein(const char *x, const char *y) {

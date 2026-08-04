@@ -130,6 +130,60 @@ static int create_hole(int fd, off_t size) {
         return 0;
 }
 
+static int try_reflink_copy_bytes(
+                int fdf,
+                int fdt,
+                uint64_t max_bytes,
+                CopyFlags copy_flags) {
+
+        int r;
+
+        assert(fdf >= 0);
+        assert(fdt >= 0);
+
+        if (max_bytes == 0)
+                return -EOPNOTSUPP;
+
+        off_t foffset = FLAGS_SET(copy_flags, COPY_SEEK0_SOURCE) ? 0 : lseek(fdf, 0, SEEK_CUR);
+        if (foffset < 0)
+                return -EOPNOTSUPP;
+
+        off_t toffset = FLAGS_SET(copy_flags, COPY_SEEK0_TARGET) ? 0 : lseek(fdt, 0, SEEK_CUR);
+        if (toffset < 0)
+                return -EOPNOTSUPP;
+
+        r = reflink_range(fdf, foffset, fdt, toffset, max_bytes);
+        if (r < 0)
+                return -EOPNOTSUPP;
+
+        if (max_bytes == UINT64_MAX) {
+                off_t end;
+
+                end = lseek(fdf, 0, SEEK_END);
+                if (end < 0)
+                        return -errno;
+                if (end < foffset)
+                        return -ESPIPE;
+
+                if (lseek(fdt, toffset + (end - foffset), SEEK_SET) < 0)
+                        return -errno;
+        } else {
+                if (lseek(fdf, foffset + max_bytes, SEEK_SET) < 0)
+                        return -errno;
+                if (lseek(fdt, toffset + max_bytes, SEEK_SET) < 0)
+                        return -errno;
+        }
+
+        if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
+                r = fd_verify_linked(fdf);
+                if (r < 0)
+                        return r;
+        }
+
+        return max_bytes == UINT64_MAX ? 0 /* we copied until EOF */
+                                       : 1 /* we copied the requested range */;
+}
+
 int copy_bytes_full(
                 int fdf, int fdt,
                 uint64_t max_bytes,
@@ -177,77 +231,9 @@ int copy_bytes_full(
             lseek(fdt, 0, SEEK_SET) < 0)
                 return -errno;
 
-        /* Try btrfs reflinks first. This only works on regular, seekable files, hence let's check the file offsets of
-         * source and destination first. */
-        if ((copy_flags & COPY_REFLINK)) {
-                off_t foffset;
-
-                /* In reflink mode, we need to know the current file offset, unless we already sought to 0 anyway. */
-                foffset = FLAGS_SET(copy_flags, COPY_SEEK0_SOURCE) ? 0 : lseek(fdf, 0, SEEK_CUR);
-                if (foffset >= 0) {
-                        off_t toffset;
-
-                        toffset = FLAGS_SET(copy_flags, COPY_SEEK0_TARGET) ? 0 : lseek(fdt, 0, SEEK_CUR);
-                        if (toffset >= 0) {
-
-                                if (foffset == 0 && toffset == 0 && max_bytes == UINT64_MAX)
-                                        r = reflink(fdf, fdt); /* full file reflink */
-                                else
-                                        r = reflink_range(fdf, foffset, fdt, toffset, max_bytes == UINT64_MAX ? 0 : max_bytes); /* partial reflink */
-                                if (r >= 0) {
-                                        off_t t;
-                                        int ret;
-
-                                        /* This worked, yay! Now — to be fully correct — let's adjust the file pointers */
-                                        if (max_bytes == UINT64_MAX) {
-
-                                                /* We cloned to the end of the source file, let's position the read
-                                                 * pointer there, and query it at the same time. */
-                                                t = lseek(fdf, 0, SEEK_END);
-                                                if (t < 0)
-                                                        return -errno;
-                                                if (t < foffset)
-                                                        return -ESPIPE;
-
-                                                /* Let's adjust the destination file write pointer by the same number
-                                                 * of bytes. */
-                                                t = lseek(fdt, toffset + (t - foffset), SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
-                                                        r = fd_verify_linked(fdf);
-                                                        if (r < 0)
-                                                                return r;
-                                                }
-
-                                                /* We copied the whole thing, hence hit EOF, return 0. */
-                                                ret = 0;
-                                        } else {
-                                                t = lseek(fdf, foffset + max_bytes, SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                t = lseek(fdt, toffset + max_bytes, SEEK_SET);
-                                                if (t < 0)
-                                                        return -errno;
-
-                                                /* We copied only some number of bytes, which worked, but
-                                                 * this means we didn't hit EOF, return 1. */
-                                                ret = 1;
-                                        }
-
-                                        if (FLAGS_SET(copy_flags, COPY_VERIFY_LINKED)) {
-                                                r = fd_verify_linked(fdf);
-                                                if (r < 0)
-                                                        return r;
-                                        }
-
-                                        return ret;
-                                }
-                        }
-                }
-        }
+        r = try_reflink_copy_bytes(fdf, fdt, max_bytes, copy_flags);
+        if (r != -EOPNOTSUPP)
+                return r;
 
         usec_t start_timestamp = USEC_INFINITY;
         if (progress)
@@ -494,7 +480,7 @@ static int fd_copy_symlink(
                 return r;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFLNK);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFLNK, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -850,7 +836,7 @@ static int fd_copy_regular(
                 return fdf;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFREG);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFREG, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -937,7 +923,7 @@ static int fd_copy_fifo(
                 return 0;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, S_IFIFO);
+                r = mac_selinux_create_file_prepare_at(dt, to, S_IFIFO, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -959,7 +945,7 @@ static int fd_copy_fifo(
                      AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        if (fchmodat(dt, to, st->st_mode & 07777, 0) < 0)
+        if (fchmodat(dt, to, st->st_mode & 07777, AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
         (void) utimensat(dt, to, (struct timespec[]) { st->st_atim, st->st_mtim }, AT_SYMLINK_NOFOLLOW);
@@ -990,7 +976,7 @@ static int fd_copy_node(
                 return 0;
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dt, to, st->st_mode & S_IFMT);
+                r = mac_selinux_create_file_prepare_at(dt, to, st->st_mode & S_IFMT, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1012,7 +998,7 @@ static int fd_copy_node(
                      AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
-        if (fchmodat(dt, to, st->st_mode & 07777, 0) < 0)
+        if (fchmodat(dt, to, st->st_mode & 07777, AT_SYMLINK_NOFOLLOW) < 0)
                 r = -errno;
 
         (void) utimensat(dt, to, (struct timespec[]) { st->st_atim, st->st_mtim }, AT_SYMLINK_NOFOLLOW);
@@ -1591,7 +1577,7 @@ int copy_file_atomic_at_full(
         assert(!FLAGS_SET(copy_flags, COPY_LOCK_BSD));
 
         if (copy_flags & COPY_MAC_CREATE) {
-                r = mac_selinux_create_file_prepare_at(dir_fdt, to, S_IFREG);
+                r = mac_selinux_create_file_prepare_at(dir_fdt, to, S_IFREG, /* label_context= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -1762,22 +1748,19 @@ int reflink(int infd, int outfd) {
 
 assert_cc(sizeof(struct file_clone_range) == sizeof(struct btrfs_ioctl_clone_range_args));
 
-int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, uint64_t sz) {
-        struct file_clone_range args = {
-                .src_fd = infd,
-                .src_offset = in_offset,
-                .src_length = sz,
-                .dest_offset = out_offset,
-        };
+int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, uint64_t size) {
         int r;
 
         assert(infd >= 0);
         assert(outfd >= 0);
 
+        /* size==UINT64_MAX mean "clone everything". Translate to 0 for the kernel. */
+        if (size == UINT64_MAX)
+                size = 0;
+
         /* Inside the kernel, FICLONE is identical to FICLONERANGE with offsets and size set to zero, let's
-         * simplify things and use the simple ioctl in that case. Also, do the same if the size is
-         * UINT64_MAX, which is how we usually encode "everything". */
-        if (in_offset == 0 && out_offset == 0 && IN_SET(sz, 0, UINT64_MAX))
+         * simplify things and use the simple ioctl in that case. */
+        if (in_offset == 0 && out_offset == 0 && size == 0)
                 return reflink(infd, outfd);
 
         r = fd_verify_regular(outfd);
@@ -1786,5 +1769,11 @@ int reflink_range(int infd, uint64_t in_offset, int outfd, uint64_t out_offset, 
 
         assert_cc(FICLONERANGE == BTRFS_IOC_CLONE_RANGE);
 
+        struct file_clone_range args = {
+                .src_fd = infd,
+                .src_offset = in_offset,
+                .src_length = size,
+                .dest_offset = out_offset,
+        };
         return RET_NERRNO(ioctl(outfd, FICLONERANGE, &args));
 }

@@ -2,7 +2,7 @@
 #pragma once
 
 #include "dlopen-note.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 #if HAVE_KMOD
 #ifndef SYSTEMD_CFLAGS_MARKER_LIBKMOD
@@ -54,9 +54,3 @@ static inline int module_load_and_warn(struct kmod_ctx *ctx, const char *module,
 #endif
 
 int dlopen_libkmod(int log_level) _dlopen_loader_;
-
-#define DLOPEN_LIBKMOD(log_level, priority)                             \
-        ({                                                              \
-                LIBKMOD_NOTE(priority);                                 \
-                dlopen_libkmod(log_level);                              \
-        })
