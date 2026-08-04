@@ -14,7 +14,11 @@ What this also means is that Liberated `systemd` is not a divergent development 
 Detailed blog post: https://medium.com/@jeffrey.sardina/installing-liberating-systemd-a-guide-by-the-author-2a9823192dd3
 
 ### Risks (read this!)
-You must understand the risks. Liberated systemd can be installed 2 ways: from a named release, or from a nightly build.
+You must understand the risks.
+
+New pushes of Liberated `systemd` code are only made under the condition that it appears *as stable as* base `systemd`. That means that it may be pushed in a state that contains errors, bugs, or failed tests *if base `systemd` also contains those errors, bugs,or failed tests*. Note also that *I make mistakes*. Reinstalling `systemd`is not something you should do lightly -- please always test it yourself *especially when intsalling a nightly build that might be unstable*.
+
+Liberated systemd can be installed 2 ways: from a named release, or from a nightly build.
 
 For a nightly build, the risks are higher. This means:
 1. if you are not installing a named release, you should expect a higher potential for instability
