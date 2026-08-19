@@ -350,7 +350,7 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:rvnDefaultstring:rnCherryTrailCR:*:sku2017
 # Cytrix (Mytrix)
 #########################################
 
-sensor:modalias:acpi:KIOX000A:*:dmi:svnCytrixTechnology:pnComplex11t:*    # Complex 11t
+sensor:modalias:acpi:KIOX000A:*:dmi:*:svnCytrixTechnology:pnComplex11t:*    # Complex 11t
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
 
 #########################################
@@ -1000,6 +1000,13 @@ sensor:modalias:acpi:KIOX000A:*:dmi:*:svnRCA:pnW101SA23T1:*    # W101SA23T1
 
 sensor:modalias:acpi:BOSC0200*:dmi:bvnAmericanMegatrendsInc.:bvrSCH12i.WJ210Z.KtBJRCA*:*    # SCT101CTM
  ACCEL_MOUNT_MATRIX=-1, 0, 0; 0, 1, 0; 0, 0, 1
+
+#########################################
+# Shift
+#########################################
+
+sensor:modalias:acpi:SMOCF00:*:dmi:*:svnSHIFT:pnSHIFT13mi:*    # SHIFTbook 1
+ ACCEL_MOUNT_MATRIX=1, 0, 0; 0, -1, 0; 0, 0, 1
 
 #########################################
 # Teclast

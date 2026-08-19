@@ -3,27 +3,29 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
+#include "cpu-set-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "format-table.h"
 #include "hashmap.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "procfs-util.h"
 #include "sort-util.h"
 #include "string-table.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "verbs.h"
 #include "virt.h"
 
 typedef struct Group {
@@ -87,6 +89,13 @@ static bool arg_recursive_unset = false;
 static PidsCount arg_count = COUNT_PIDS;
 static Order arg_order = ORDER_CPU;
 static CPUType arg_cpu_type = CPU_PERCENTAGE;
+
+COMMAND(
+        "systemd-cgtop\0",
+        "Show top control groups by their resource usage.",
+        .argspec = "[CGROUP]\0",
+        .man_pages = "systemd-cgtop.1\0",
+);
 
 static const char *order_table[_ORDER_MAX] = {
         [ORDER_PATH]   = "path",
@@ -581,7 +590,8 @@ static void display(Hashmap *a) {
         Group *g;
         Group **array;
         signed path_columns;
-        unsigned rows, n = 0, maxtcpu = 0, maxtpath = 3; /* 3 for ellipsize() to work properly */
+        unsigned rows, n = 0, maxtcpu = 0, maxtpath = 3, /* 3 for ellipsize() to work properly */
+                maxpcpu = 6; /* minimum width for "%CPU" header */
 
         assert(a);
 
@@ -604,13 +614,19 @@ static void display(Hashmap *a) {
                                strlen(array[j]->path));
         }
 
+        if (arg_cpu_type == CPU_PERCENTAGE) {
+                unsigned n_cpus;
+                if (cpus_online(&n_cpus) >= 0)
+                        maxpcpu = MAX(maxpcpu, DECIMAL_STR_WIDTH(n_cpus) + STRLEN("00.0"));
+        }
+
         rows = lines();
         if (rows <= 10)
                 rows = 10;
 
         if (on_tty()) {
                 const char *on, *off;
-                int cpu_len = arg_cpu_type == CPU_PERCENTAGE ? 6 : maxtcpu;
+                int cpu_len = arg_cpu_type == CPU_PERCENTAGE ? (int) maxpcpu : (int) maxtcpu;
 
                 path_columns = columns() - 36 - cpu_len;
                 if (path_columns < 10)
@@ -660,9 +676,9 @@ static void display(Hashmap *a) {
 
                 if (arg_cpu_type == CPU_PERCENTAGE) {
                         if (g->cpu_valid)
-                                printf(" %6.1f", g->cpu_fraction*100);
+                                printf(" %*.1f", (int) maxpcpu, g->cpu_fraction*100);
                         else
-                                fputs("      -", stdout);
+                                printf(" %*s", (int) maxpcpu, "-");
                 } else
                         printf(" %*s",
                                (int) maxtcpu,
@@ -676,33 +692,6 @@ static void display(Hashmap *a) {
         }
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-cgtop", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        printf("%s [OPTIONS...] [CGROUP]\n\n"
-               "%sShow top control groups by their resource usage.%s\n\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 1);
         assert(argv);
@@ -714,7 +703,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help("systemd-cgtop");
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -814,6 +803,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_COMMON_MACHINE:
                         arg_machine = opts.arg;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         size_t n_args = option_parser_get_n_args(&opts);

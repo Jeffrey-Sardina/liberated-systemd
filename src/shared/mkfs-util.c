@@ -6,6 +6,7 @@
 
 #include "escape.h"
 #include "log.h"
+#include "memory-util.h"
 #include "mkfs-util.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -188,13 +189,13 @@ static int mcopy_flush_files(
                 const char *dest_rel,
                 char ***file_batch) {
 
-        _cleanup_strv_free_ char **argv = NULL, **batch = TAKE_PTR(*file_batch);
-        _cleanup_free_ char *dest = NULL;
-
         assert(mcopy_bin);
         assert(node);
         assert(dest_rel);
         assert(file_batch);
+
+        _cleanup_strv_free_ char **argv = NULL, **batch = TAKE_PTR(*file_batch);
+        _cleanup_free_ char *dest = NULL;
 
         if (strv_isempty(batch))
                 return 0;
@@ -619,6 +620,12 @@ int make_filesystem(
                         if (strv_extend(&argv, c) < 0)
                                 return log_oom();
                 }
+
+                /* mkfs.erofs defaults to the page size and rejects block sizes larger than
+                 * that, so only pass an explicit block size when it is actually smaller. */
+                if (sector_size > 0 && sector_size < (uint64_t) page_size() &&
+                    strv_extendf(&argv, "-b%"PRIu64, sector_size) < 0)
+                        return log_oom();
 
                 if (strv_extend_many(&argv, node, root) < 0)
                         return log_oom();

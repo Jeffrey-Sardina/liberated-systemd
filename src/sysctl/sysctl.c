@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
 #include <sys/stat.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -9,26 +10,34 @@
 #include "constants.h"
 #include "creds-util.h"
 #include "errno-util.h"
-#include "format-table.h"
 #include "glob-util.h"
 #include "hashmap.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "pager.h"
 #include "path-util.h"
 #include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
 #include "sysctl-util.h"
+#include "verbs.h"
 
 static char **arg_prefixes = NULL;
 static CatFlags arg_cat_flags = CAT_CONFIG_OFF;
 static bool arg_strict = false;
+static bool arg_verify = false;
 static bool arg_inline = false;
 static PagerFlags arg_pager_flags = 0;
 
 STATIC_DESTRUCTOR_REGISTER(arg_prefixes, strv_freep);
+
+COMMAND(
+        "systemd-sysctl\0",
+        "Apply kernel sysctl settings.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_pages = "systemd-sysctl.service.8\0",
+        .pager_flags = &arg_pager_flags,
+);
 
 typedef struct SysctlOption {
         char *key;
@@ -89,7 +98,10 @@ static SysctlOption* sysctl_option_new(
 static int sysctl_write_or_warn(const char *key, const char *value, bool ignore_failure, bool ignore_enoent) {
         int r;
 
-        r = sysctl_write(key, value);
+        if (arg_verify)
+                r = sysctl_write_verify(key, value);
+        else
+                r = sysctl_write(key, value);
         if (r < 0) {
                 /* Proceed without failing if ignore_failure is true.
                  * If the sysctl is not available in the kernel or we are running with reduced privileges and
@@ -313,48 +325,6 @@ static int cat_config(char **files) {
         return cat_files(NULL, files, arg_cat_flags);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        _cleanup_(table_unrefp) Table *commands = NULL, *options = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-sysctl.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        r = option_parser_get_help_table(&commands);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table_group("Options", &options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, commands, options);
-
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n"
-               "\n%sApplies kernel sysctl settings.%s\n"
-               "\n%sCommands:%s\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               ansi_underline(),
-               ansi_normal());
-
-        r = table_print_or_warn(commands);
-        if (r < 0)
-                return r;
-
-        printf("\n%sOptions:%s\n", ansi_underline(), ansi_normal());
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        printf("\nSee the %s for details.\n", link);
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
@@ -365,8 +335,10 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
+                OPTION_GROUP("Commands"): {}
+
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help("systemd-sysctl");
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -409,10 +381,18 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                         arg_strict = true;
                         break;
 
+                OPTION_LONG("verify", NULL,
+                            "Verify sysctl values after write"):
+                        arg_verify = true;
+                        break;
+
                 OPTION_LONG("inline", NULL,
                             "Treat arguments as configuration lines"):
                         arg_inline = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         *remaining_args = option_parser_get_args(&opts);
@@ -425,18 +405,18 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_ordered_hashmap_free_ OrderedHashmap *sysctl_options = NULL;
         int r;
+
+        log_setup();
 
         char **args = NULL;
         r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        log_setup();
-
         umask(0022);
 
+        _cleanup_ordered_hashmap_free_ OrderedHashmap *sysctl_options = NULL;
         if (!strv_isempty(args)) {
                 unsigned pos = 0;
 

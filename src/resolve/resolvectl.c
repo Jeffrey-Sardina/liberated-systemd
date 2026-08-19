@@ -30,7 +30,6 @@
 #include "format-ifname.h"
 #include "format-table.h"
 #include "glyph-util.h"
-#include "help-util.h"
 #include "hostname-util.h"
 #include "json-util.h"
 #include "main-func.h"
@@ -71,6 +70,7 @@ static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
 bool arg_ifindex_permissive = false; /* If true, don't generate an error if the specified interface index doesn't exist */
 static const char *arg_service_family = NULL;
+static bool arg_service_txt_set = false;
 static bool arg_ask_password = true;
 
 typedef enum RawType {
@@ -95,6 +95,15 @@ STATIC_DESTRUCTOR_REGISTER(arg_ifname, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_set_dns, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_set_domain, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_set_nta, strv_freep);
+
+COMMAND(
+        "resolvectl\0",
+        "Send control commands to the network name resolution manager, or "
+        "resolve domain names, IPv4 and IPv6 addresses, DNS records, and services.",
+        .man_pages = "resolvectl.1\0",
+        .option_namespace = "resolvectl",
+        .pager_flags = &arg_pager_flags,
+);
 
 typedef enum StatusMode {
         STATUS_ALL,
@@ -278,6 +287,27 @@ static void print_ifindex_comment(int printed_so_far, int ifindex) {
                ansi_grey(), ifname, ansi_normal());
 }
 
+static int dump_resolve_error_json(const char *name, const char *error_id, sd_json_variant *parameters, int ret) {
+        int r;
+
+        assert(name);
+        assert(!isempty(error_id));
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = sd_json_variant_ref(parameters);
+        r = sd_json_variant_merge_objectbo(
+                        &j,
+                        SD_JSON_BUILD_PAIR_STRING("name", name),
+                        SD_JSON_BUILD_PAIR_STRING("error", error_id));
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_dump(j, arg_json_format_flags, /* f= */ NULL, /* prefix= */ NULL);
+        if (r < 0)
+                return r;
+
+        return ret;
+}
+
 static int varlink_log_resolve_error(const char *name, const char *error_id, sd_json_variant *reply, bool warn_missing) {
         int r;
 
@@ -285,6 +315,26 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
         assert(!isempty(error_id));
 
         int ret = sd_varlink_error_to_errno(error_id, reply);
+        _cleanup_(resolve_error_done) ResolveError error = {
+                .rcode = _DNS_RCODE_INVALID,
+                .ede_rcode = _DNS_EDE_RCODE_INVALID,
+        };
+        if (reply) {
+                r = dispatch_resolve_error(/* name = */ NULL, reply, SD_JSON_LOG, &error);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to dispatch error JSON, ignoring: %m");
+        }
+
+        if (error.rcode == DNS_RCODE_NXDOMAIN && !warn_missing)
+                return -ENXIO;
+
+        if (sd_json_format_enabled(arg_json_format_flags))
+                return dump_resolve_error_json(
+                                name,
+                                error_id,
+                                reply,
+                                error.rcode == DNS_RCODE_NXDOMAIN ? -ENXIO : ret);
+
         static const struct {
                 const char *error_id;
                 const char *msg;
@@ -318,14 +368,6 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
         if (streq(error_id, "io.systemd.Resolve.InconsistentServiceRecords"))
                 return log_error_errno(ret, "%s: resolve call failed: '%s' does not provide a consistent set of service resource records", name, name);
 
-        _cleanup_(resolve_error_done) ResolveError error = {
-                .rcode = _DNS_RCODE_INVALID,
-                .ede_rcode = _DNS_EDE_RCODE_INVALID,
-        };
-        r = dispatch_resolve_error(/* name = */ NULL, reply, SD_JSON_LOG, &error);
-        if (r < 0)
-                log_debug_errno(r, "Failed to dispatch error JSON, ignoring: %m");
-
         _cleanup_free_ char *msg_extended = NULL;
         if (error.ede_rcode >= 0) {
                 msg_extended = strjoin(" (",
@@ -342,9 +384,6 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
 
         if (error.rcode != _DNS_RCODE_INVALID) {
                 if (error.rcode == DNS_RCODE_NXDOMAIN) {
-                        if (!warn_missing)
-                                return -ENXIO;
-
                         return log_error_errno(SYNTHETIC_ERRNO(ENXIO), "%s: resolve call failed: Name '%s' not found%s%s",
                                                name, error.query_string ?: name, error.ede_rcode >= 0 ? ":" : "", strempty(msg_extended));
                 }
@@ -859,6 +898,10 @@ static int verb_query(int argc, char *argv[], uintptr_t _data, void *userdata) {
                                 int family, ifindex;
                                 union in_addr_union a;
 
+                                if (arg_raw != RAW_NONE)
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "--raw may only be combined with --type= or dns: URIs.");
+
                                 r = in_addr_ifindex_from_string_auto(*p, &family, &a, &ifindex);
                                 if (r >= 0)
                                         RET_GATHER(ret, resolve_address(family, &a, ifindex));
@@ -870,7 +913,7 @@ static int verb_query(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return ret;
 }
 
-static int resolve_service(const char *name, const char *type, const char *domain) {
+static int resolve_service(const char *name, const char *type, const char *domain, uint64_t flags) {
         int r;
 
         assert(domain);
@@ -904,7 +947,7 @@ static int resolve_service(const char *name, const char *type, const char *domai
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("type", type),
                         JSON_BUILD_PAIR_CONDITION_UNSIGNED(arg_ifindex > 0, "ifindex", arg_ifindex),
                         JSON_BUILD_PAIR_CONDITION_UNSIGNED(arg_family != AF_UNSPEC, "family", arg_family),
-                        JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("flags", arg_flags));
+                        JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("flags", flags));
         if (r < 0)
                 return log_error_errno(r, "Failed to issue varlink call: %m");
 
@@ -985,15 +1028,20 @@ static int resolve_service(const char *name, const char *type, const char *domai
 VERB(verb_service, "service", "[[NAME] TYPE] DOMAIN", 2, 4, 0,
      "Resolve service (SRV)");
 static int verb_service(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        uint64_t flags = arg_flags;
+
         if (sd_json_format_enabled(arg_json_format_flags))
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Use --json=pretty with --type= to acquire resource record information in JSON format.");
 
+        if (argc < 4 && !arg_service_txt_set)
+                flags |= SD_RESOLVED_NO_TXT;
+
         if (argc == 2)
-                return resolve_service(NULL, NULL, argv[1]);
-        else if (argc == 3)
-                return resolve_service(NULL, argv[1], argv[2]);
-        else
-                return resolve_service(argv[1], argv[2], argv[3]);
+                return resolve_service(NULL, NULL, argv[1], flags);
+        if (argc == 3)
+                return resolve_service(NULL, argv[1], argv[2], flags);
+
+        return resolve_service(argv[1], argv[2], argv[3], flags);
 }
 
 #if HAVE_OPENSSL
@@ -1126,6 +1174,9 @@ static int verb_tlsa(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 args = strv_skip(argv, 2);
         } else
                 args = strv_skip(argv, 1);
+
+        if (strv_isempty(args))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The tlsa command requires at least one domain.");
 
         STRV_FOREACH(p, args)
                 RET_GATHER(ret, resolve_tlsa(family, *p));
@@ -1477,6 +1528,7 @@ static int print_configuration(DNSConfiguration *configuration, StatusMode mode,
         int r;
 
         assert(configuration);
+        POINTER_MAY_BE_NULL(empty_line);
 
         pager_open(arg_pager_flags);
 
@@ -3177,67 +3229,15 @@ static void help_dns_classes(void) {
         DUMP_STRING_TABLE(dns_class, int, _DNS_CLASS_MAX);
 }
 
-static int compat_help(void) {
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
+VERB_COMMON_HELP_AUTO_HIDDEN("resolvectl");
 
-        r = option_parser_get_help_table_ns("systemd-resolve", &options);
-        if (r < 0)
-                return r;
-
-        pager_open(arg_pager_flags);
-
-        help_cmdline("[OPTIONS…] HOSTNAME|ADDRESS…");
-        help_cmdline("[OPTIONS…] --service [[NAME] TYPE] DOMAIN");
-        help_cmdline("[OPTIONS…] --openpgp EMAIL@DOMAIN…");
-        help_cmdline("[OPTIONS…] --statistics");
-        help_cmdline("[OPTIONS…] --reset-statistics");
-        help_abstract("Resolve domain names, IPv4 and IPv6 addresses, DNS records, and services.");
-
-        help_section("Options");
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        help_man_page_reference("resolvectl", "1");
-        return 0;
-}
-
-static int native_help(void) {
-        _cleanup_(table_unrefp) Table *verbs = NULL, *options = NULL;
-        int r;
-
-        r = verbs_get_help_table(&verbs);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table_ns("resolvectl", &options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, verbs, options);
-
-        pager_open(arg_pager_flags);
-
-        help_cmdline("[OPTIONS…] COMMAND …");
-        help_abstract("Send control commands to the network name resolution manager, or\n"
-                      "resolve domain names, IPv4 and IPv6 addresses, DNS records, and services.");
-
-        help_section("Commands");
-        r = table_print_or_warn(verbs);
-        if (r < 0)
-                return r;
-
-        help_section("Options");
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        help_man_page_reference("resolvectl", "1");
-        return 0;
-}
-
-VERB_COMMON_HELP_HIDDEN(native_help);
+COMMAND(
+        "systemd-resolve\0",
+        "This command is deprecated. Use resolvectl.1 instead.",
+        .man_pages = "resolvectl.1\0",
+        .option_namespace = "systemd-resolve",
+        .pager_flags = &arg_pager_flags,
+);
 
 static int compat_parse_argv(int argc, char *argv[], char ***remaining_args) {
         int r;
@@ -3254,7 +3254,8 @@ static int compat_parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_NAMESPACE("systemd-resolve"): {}
 
                 OPTION_COMMON_HELP:
-                        return compat_help();
+                        printf("systemd-resolve is deprecated. Call resolvectl instead.\n");
+                        return 0;
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -3326,6 +3327,7 @@ static int compat_parse_argv(int argc, char *argv[], char ***remaining_args) {
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_flags, SD_RESOLVED_NO_TXT, r == 0);
+                        arg_service_txt_set = true;
                         break;
 
                 OPTION_LONG("openpgp", NULL, "Query OpenPGP public key"):
@@ -3451,6 +3453,9 @@ static int compat_parse_argv(int argc, char *argv[], char ***remaining_args) {
                         if (r < 0)
                                 return r;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if (arg_type == 0 && arg_class != 0)
@@ -3493,7 +3498,7 @@ static int native_parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_NAMESPACE("resolvectl"): {}
 
                 OPTION_COMMON_HELP:
-                        return native_help();
+                        return command_print_help("resolvectl");
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -3560,6 +3565,7 @@ static int native_parse_argv(int argc, char *argv[], char ***remaining_args) {
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_flags, SD_RESOLVED_NO_TXT, r == 0);
+                        arg_service_txt_set = true;
                         break;
 
                 OPTION_LONG("cname", "BOOL", "Follow CNAME redirects (default: yes)"):
@@ -3677,6 +3683,9 @@ static int native_parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if (arg_raw != RAW_NONE && sd_json_format_enabled(arg_json_format_flags))

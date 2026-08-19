@@ -197,6 +197,20 @@ TEST(option_parse) {
                               NULL);
 
         test_option_parse_one(STRV_MAKE("arg0",
+                                        "string1",
+                                        "--help",
+                                        "string2"),
+                              options,
+                              (Entry[]) {
+                                      { "help" },
+                                      {}
+                              },
+                              STRV_MAKE("string1",
+                                        "string2"),
+                              OPTION_PARSER_NORMAL,
+                              NULL);
+
+        test_option_parse_one(STRV_MAKE("arg0",
                                         "-h"),
                               options,
                               (Entry[]) {
@@ -1564,6 +1578,26 @@ TEST(option_get_synopsis) {
 
         test_option_get_synopsis_one(&(const Option) { 0, OPTION_HELP_ENTRY_VERBATIM, 'u', "special special",  "unused" }, "/",  true, "special special");
         test_option_get_synopsis_one(&(const Option) { 0, OPTION_POSITIONAL_ENTRY, 'u', "(fixed)", "unused" }, "/",  true, "(fixed)");
+}
+
+TEST(option_empty_long_name) {
+        static const Option one_option[] = {
+                { 1, .short_code = 'o', .long_code = "output", .metavar = "ARG" },
+                {}
+        };
+
+        static const Option two_options[] = {
+                { 1, .short_code = 'o', .long_code = "output", .metavar = "ARG" },
+                { 2, .long_code = "help" },
+                {}
+        };
+
+        /* "--=…" carries an empty long option name, which must not prefix-match every defined option.
+         * With a single option defined that would otherwise look like a unique partial match. */
+        test_option_invalid_one(STRV_MAKE("arg0", "--=foo"), one_option);
+        test_option_invalid_one(STRV_MAKE("arg0", "--="), one_option);
+        test_option_invalid_one(STRV_MAKE("arg0", "--=foo"), two_options);
+        test_option_invalid_one(STRV_MAKE("arg0", "--="), two_options);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);
