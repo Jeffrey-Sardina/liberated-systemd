@@ -56,6 +56,11 @@ cat /etc/*-release # see the line DISTRIB_RELEASE=<release>
 # in some cases (such as Ubuntu) you instead must use DISTRIB_CODENAME=<release>
 ```
 
+In some cases, you might need to install some python build dependencies:
+```bash
+pip3 install jinja2 pefile pyelftools
+```
+
 Then, we pull and build Liberated systemd from source:
 
 ```bash
