@@ -145,7 +145,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_fixate_volume_key, freep);
 COMMAND(
         "systemd-cryptsetup\0",
         "Attach or detach an encrypted block device.",
-        .man_pages = "systemd-cryptsetup.8\0",
+        .man_pages = "systemd-cryptsetup(8)\0",
 );
 
 static const char* const passphrase_type_table[_PASSPHRASE_TYPE_MAX] = {
@@ -2379,7 +2379,7 @@ static int attach_luks_or_plain_or_bitlk(
         return attach_luks_or_plain_or_bitlk_by_passphrase(cd, name, passwords, flags, pass_volume_key);
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-cryptsetup");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -2392,7 +2392,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-cryptsetup");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -2484,7 +2484,7 @@ static int discover_key(const char *key_file, const char *volume, TokenType toke
         return r;
 }
 
-VERB(verb_attach, "attach", "VOLUME SOURCE-DEVICE [KEY-FILE] [CONFIG]", 3, 5, 0,
+VERB(verb_attach, "attach", "VOLUME SOURCE-DEVICE [KEY-FILE] [CONFIG]\0", 3, 5, 0,
      "Attach an encrypted block device");
 static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
@@ -2731,7 +2731,7 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
-VERB(verb_detach, "detach", "VOLUME", 2, 2, 0,
+VERB(verb_detach, "detach", "VOLUME\0", 2, 2, 0,
      "Detach an encrypted block device");
 static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;

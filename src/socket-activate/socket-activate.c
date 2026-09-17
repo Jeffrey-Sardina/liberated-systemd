@@ -40,7 +40,7 @@ COMMAND(
         "Listen on sockets and launch child on connection.",
         .argspec = "COMMAND…\0",
         .footer = "Note: file descriptors from sd_listen_fds() will be passed through.",
-        .man_pages = "systemd-socket-activate.1\0",
+        .man_pages = "systemd-socket-activate(1)\0",
 );
 
 static int add_epoll(int epoll_fd, int fd) {
@@ -339,7 +339,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-socket-activate");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

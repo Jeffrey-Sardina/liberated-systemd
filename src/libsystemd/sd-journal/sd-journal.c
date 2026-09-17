@@ -1127,69 +1127,88 @@ static int compare_locations(sd_journal *j, JournalFile *af, JournalFile *bf) {
 }
 
 static int real_journal_next(sd_journal *j, direction_t direction) {
-        JournalFile *new_file = NULL, *exact_match = NULL;
         unsigned n_files;
         const void **files;
-        Object *o;
         int r;
 
         assert_return(j, -EINVAL);
         assert_return(!journal_origin_changed(j), -ECHILD);
 
-        r = iterated_cache_get(j->files_cache, NULL, &files, &n_files);
-        if (r < 0)
-                return r;
+        for (;;) {
+                JournalFile *new_file = NULL, *exact_match = NULL;
+                Object *o;
 
-        FOREACH_ARRAY(_f, files, n_files) {
-                JournalFile *f = (JournalFile*) *_f;
-                bool found;
+                r = iterated_cache_get(j->files_cache, NULL, &files, &n_files);
+                if (r < 0)
+                        return r;
 
-                r = next_beyond_location(j, f, direction);
-                if (r < 0) {
-                        log_debug_errno(r, "Can't iterate through %s, ignoring: %m", f->path);
-                        remove_file_real(j, f);
-                        continue;
-                } else if (r == 0) {
-                        f->location_type = direction == DIRECTION_DOWN ? LOCATION_TAIL : LOCATION_HEAD;
-                        continue;
+                FOREACH_ARRAY(_f, files, n_files) {
+                        JournalFile *f = (JournalFile*) *_f;
+                        bool found;
+
+                        r = next_beyond_location(j, f, direction);
+                        if (r < 0) {
+                                log_debug_errno(r, "Can't iterate through %s, ignoring: %m", f->path);
+                                remove_file_real(j, f);
+                                continue;
+                        } else if (r == 0) {
+                                f->location_type = direction == DIRECTION_DOWN ?
+                                        LOCATION_TAIL : LOCATION_HEAD;
+                                continue;
+                        }
+
+                        if (!new_file)
+                                found = true;
+                        else {
+                                r = compare_locations(j, f, new_file);
+                                found = direction == DIRECTION_DOWN ? r < 0 : r > 0;
+                        }
+
+                        if (found)
+                                new_file = f;
+
+                        /* Track the file that holds the cursor's exact entry (matching seqnum_id and
+                         * seqnum). On systems without a reliable (or missing) RTC, compare_boot_ids() can
+                         * produce incorrect cross-boot ordering. After the loop, we detect when
+                         * compare_locations() preferred the wrong file and override the choice if needed.
+                         *
+                         * See https://github.com/systemd/systemd/issues/31516 */
+                        if (j->current_location.type == LOCATION_SEEK &&
+                            j->current_location.seqnum_set &&
+                            sd_id128_equal(f->header->seqnum_id, j->current_location.seqnum_id) &&
+                            f->current_seqnum == j->current_location.seqnum)
+                                exact_match = f;
                 }
+
+                if (exact_match)
+                        new_file = exact_match;
 
                 if (!new_file)
-                        found = true;
-                else {
-                        r = compare_locations(j, f, new_file);
-                        found = direction == DIRECTION_DOWN ? r < 0 : r > 0;
+                        return 0;
+
+                r = journal_file_move_to_object(new_file, OBJECT_ENTRY, new_file->current_offset, &o);
+                if (r < 0) {
+                        /* Vacuuming can unlink and deallocate the file we just picked, which surfaces as
+                         * one of these errors. Confirm the file is really gone before dropping it: -EIDRM
+                         * already comes from the journal_file_fstat() inside the lookup, the others need a
+                         * stat of our own. */
+                        if (!IN_SET(r, -EADDRNOTAVAIL, -EBADMSG, -EIDRM, -EIO))
+                                return r;
+                        if (r != -EIDRM && journal_file_fstat(new_file) != -EIDRM)
+                                return r;
+
+                        log_debug_errno(r, "Can't read selected entry from removed journal file '%s', ignoring: %m",
+                                        new_file->path);
+                        remove_file_real(j, new_file);
+
+                        /* Removing the selected file guarantees that the next iteration makes progress. */
+                        continue;
                 }
 
-                if (found)
-                        new_file = f;
+                set_location(j, new_file, o);
 
-                /* Track the file that holds the cursor's exact entry (matching seqnum_id and seqnum). On
-                 * systems without a reliable (or missing) RTC, compare_boot_ids() can produce incorrect
-                 * cross-boot ordering causing compare_locations() above to prefer a wrong file. We detect
-                 * this after the loop and override the choice if needed.
-                 *
-                 * See https://github.com/systemd/systemd/issues/31516 */
-                if (j->current_location.type == LOCATION_SEEK &&
-                    j->current_location.seqnum_set &&
-                    sd_id128_equal(f->header->seqnum_id, j->current_location.seqnum_id) &&
-                    f->current_seqnum == j->current_location.seqnum)
-                        exact_match = f;
+                return 1;
         }
-
-        if (exact_match)
-                new_file = exact_match;
-
-        if (!new_file)
-                return 0;
-
-        r = journal_file_move_to_object(new_file, OBJECT_ENTRY, new_file->current_offset, &o);
-        if (r < 0)
-                return r;
-
-        set_location(j, new_file, o);
-
-        return 1;
 }
 
 _public_ int sd_journal_next(sd_journal *j) {
@@ -2607,7 +2626,7 @@ static int journal_file_entry_get_machine_id(JournalFile *f, Object *o, sd_id128
         uint64_t n = journal_file_entry_n_items(f, o);
         for (uint64_t i = 0; i < n; i++) {
                 uint64_t p;
-                void *d;
+                const void *d;
                 size_t l;
                 int r;
 
@@ -2913,7 +2932,7 @@ _public_ int sd_journal_get_data(sd_journal *j, const char *field, const void **
         uint64_t n = journal_file_entry_n_items(f, o);
         for (uint64_t i = 0; i < n; i++) {
                 uint64_t p;
-                void *d;
+                const void *d;
                 size_t l;
 
                 p = journal_file_entry_item_object_offset(f, o, i);
@@ -2962,7 +2981,7 @@ _public_ int sd_journal_enumerate_data(sd_journal *j, const void **ret_data, siz
 
         for (uint64_t n = journal_file_entry_n_items(f, o); j->current_field < n; j->current_field++) {
                 uint64_t p;
-                void *d;
+                const void *d;
                 size_t l;
 
                 p = journal_file_entry_item_object_offset(f, o, j->current_field);
@@ -3452,7 +3471,7 @@ _public_ int sd_journal_enumerate_unique(
         for (;;) {
                 JournalFile *of;
                 Object *o;
-                void *odata;
+                const void *odata;
                 size_t ol;
                 bool found;
                 int r;

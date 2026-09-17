@@ -40,7 +40,7 @@ COMMAND(
         "systemd-modules-load\0",
         "Load statically configured kernel modules.",
         .argspec = "[CONFIGURATION FILE…]\0",
-        .man_pages = "systemd-modules-load.service.8\0",
+        .man_pages = "systemd-modules-load.service(8)\0",
 );
 
 static int modules_list_append_suffix(OrderedSet **module_set, char *modp) {
@@ -350,7 +350,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-modules-load");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

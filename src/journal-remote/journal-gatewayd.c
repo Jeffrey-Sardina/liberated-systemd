@@ -55,7 +55,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
 COMMAND(
         "systemd-journal-gatewayd\0",
         "Serve journal events over HTTP.",
-        .man_pages = "systemd-journal-gatewayd.service.8\0",
+        .man_pages = "systemd-journal-gatewayd.service(8)\0",
 );
 
 typedef struct RequestMeta {
@@ -1112,7 +1112,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-journal-gatewayd");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

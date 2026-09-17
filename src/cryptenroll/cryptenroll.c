@@ -122,7 +122,7 @@ COMMAND(
         "systemd-cryptenroll\0",
         "Enroll a security token or authentication credential to a LUKS volume.",
         .argspec = "[BLOCK-DEVICE]\0",
-        .man_pages = "systemd-cryptenroll.1\0",
+        .man_pages = "systemd-cryptenroll(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -365,7 +365,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-cryptenroll");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

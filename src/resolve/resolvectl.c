@@ -100,7 +100,7 @@ COMMAND(
         "resolvectl\0",
         "Send control commands to the network name resolution manager, or "
         "resolve domain names, IPv4 and IPv6 addresses, DNS records, and services.",
-        .man_pages = "resolvectl.1\0",
+        .man_pages = "resolvectl(1)\0",
         .option_namespace = "resolvectl",
         .pager_flags = &arg_pager_flags,
 );
@@ -881,7 +881,7 @@ invalid:
                                "Invalid DNS URI: %s", name);
 }
 
-VERB(verb_query, "query", "HOSTNAME|ADDRESS…", 2, VERB_ANY, 0,
+VERB(verb_query, "query", "HOSTNAME|ADDRESS…\0", 2, VERB_ANY, 0,
      "Resolve domain names, IPv4 and IPv6 addresses");
 static int verb_query(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int ret = 0, r;
@@ -1025,7 +1025,7 @@ static int resolve_service(const char *name, const char *type, const char *domai
         return 0;
 }
 
-VERB(verb_service, "service", "[[NAME] TYPE] DOMAIN", 2, 4, 0,
+VERB(verb_service, "service", "[[NAME] TYPE] DOMAIN\0", 2, 4, 0,
      "Resolve service (SRV)");
 static int verb_service(int argc, char *argv[], uintptr_t _data, void *userdata) {
         uint64_t flags = arg_flags;
@@ -1104,7 +1104,7 @@ static int resolve_openpgp(const char *address) {
 }
 #endif
 
-VERB(verb_openpgp, "openpgp", "EMAIL@DOMAIN…", 2, VERB_ANY, 0,
+VERB(verb_openpgp, "openpgp", "EMAIL@DOMAIN…\0", 2, VERB_ANY, 0,
      "Query OpenPGP public key");
 static int verb_openpgp(int argc, char *argv[], uintptr_t _data, void *userdata) {
 #if HAVE_OPENSSL
@@ -1157,7 +1157,7 @@ static bool service_family_is_valid(const char *s) {
         return STR_IN_SET(s, "tcp", "udp", "sctp");
 }
 
-VERB(verb_tlsa, "tlsa", "DOMAIN[:PORT]…", 2, VERB_ANY, 0,
+VERB(verb_tlsa, "tlsa", "DOMAIN[:PORT]…\0", 2, VERB_ANY, 0,
      "Query TLS public key");
 static int verb_tlsa(int argc, char *argv[], uintptr_t _data, void *userdata) {
         const char *family = "tcp";
@@ -1770,7 +1770,7 @@ static int status_ifindex(int ifindex, StatusMode mode) {
         return status_full(mode, STRV_MAKE(ifname));
 }
 
-VERB(verb_status, "status", "[LINK…]", VERB_ANY, VERB_ANY, VERB_DEFAULT,
+VERB(verb_status, "status", "[LINK…]\0", VERB_ANY, VERB_ANY, VERB_DEFAULT,
      "Show link and server status");
 static int verb_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return status_full(STATUS_ALL, strv_skip(argv, 1));
@@ -1969,37 +1969,39 @@ static int verb_reset_statistics(int argc, char *argv[], uintptr_t _data, void *
 VERB(verb_flush_caches, "flush-caches", NULL, VERB_ANY, 1, 0,
      "Flush all local DNS caches");
 static int verb_flush_caches(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
+        (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
 
-        r = bus_call_method(bus, bus_resolve_mgr, "FlushCaches", &error, NULL, NULL);
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        r = sd_varlink_connect_address(&vl, "/run/systemd/resolve/io.systemd.Resolve.Monitor");
         if (r < 0)
-                return log_error_errno(r, "Failed to flush caches: %s", bus_error_message(&error, r));
+                return log_error_errno(r, "Failed to connect to /run/systemd/resolve/io.systemd.Resolve.Monitor: %m");
 
-        return 0;
+        return varlink_callbo_and_log(
+                        vl,
+                        "io.systemd.Resolve.Monitor.FlushCaches",
+                        /* reply= */ NULL,
+                        SD_JSON_BUILD_PAIR_BOOLEAN("allowInteractiveAuthentication", arg_ask_password));
 }
 
 VERB(verb_reset_server_features, "reset-server-features", NULL, VERB_ANY, 1, 0,
      "Forget learnt DNS server feature levels");
 static int verb_reset_server_features(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
-        r = acquire_bus(&bus);
-        if (r < 0)
-                return r;
+        (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
 
-        r = bus_call_method(bus, bus_resolve_mgr, "ResetServerFeatures", &error, NULL, NULL);
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        r = sd_varlink_connect_address(&vl, "/run/systemd/resolve/io.systemd.Resolve.Monitor");
         if (r < 0)
-                return log_error_errno(r, "Failed to reset server features: %s", bus_error_message(&error, r));
+                return log_error_errno(r, "Failed to connect to /run/systemd/resolve/io.systemd.Resolve.Monitor: %m");
 
-        return 0;
+        return varlink_callbo_and_log(
+                        vl,
+                        "io.systemd.Resolve.Monitor.ResetServerFeatures",
+                        /* reply= */ NULL,
+                        SD_JSON_BUILD_PAIR_BOOLEAN("allowInteractiveAuthentication", arg_ask_password));
 }
 
 static int print_question(char prefix, const char *color, sd_json_variant *question) {
@@ -2656,7 +2658,7 @@ static int verb_show_server_state(int argc, char *argv[], uintptr_t _data, void 
         return sd_json_variant_dump(d, arg_json_format_flags, NULL, NULL);
 }
 
-VERB(verb_dns, "dns", "[LINK [SERVER…]]", VERB_ANY, VERB_ANY, 0,
+VERB(verb_dns, "dns", "[LINK [SERVER…]]\0", VERB_ANY, VERB_ANY, 0,
      "Get/set per-interface DNS server address");
 static int verb_dns(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2743,7 +2745,7 @@ static int call_domain(sd_bus *bus, char **domain, const BusLocator *locator, sd
         return sd_bus_call(bus, req, 0, error, NULL);
 }
 
-VERB(verb_domain, "domain", "[LINK [DOMAIN…]]", VERB_ANY, VERB_ANY, 0,
+VERB(verb_domain, "domain", "[LINK [DOMAIN…]]\0", VERB_ANY, VERB_ANY, 0,
      "Get/set per-interface search domain");
 static int verb_domain(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2784,7 +2786,7 @@ static int verb_domain(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
-VERB(verb_default_route, "default-route", "[LINK [BOOL]]", VERB_ANY, 3, 0,
+VERB(verb_default_route, "default-route", "[LINK [BOOL]]\0", VERB_ANY, 3, 0,
      "Get/set per-interface default route flag");
 static int verb_default_route(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2830,7 +2832,7 @@ static int verb_default_route(int argc, char *argv[], uintptr_t _data, void *use
         return 0;
 }
 
-VERB(verb_llmnr, "llmnr", "[LINK [MODE]]", VERB_ANY, 3, 0,
+VERB(verb_llmnr, "llmnr", "[LINK [MODE]]\0", VERB_ANY, 3, 0,
      "Get/set per-interface LLMNR mode");
 static int verb_llmnr(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2890,7 +2892,7 @@ static int verb_llmnr(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB(verb_mdns, "mdns", "[LINK [MODE]]", VERB_ANY, 3, 0,
+VERB(verb_mdns, "mdns", "[LINK [MODE]]\0", VERB_ANY, 3, 0,
      "Get/set per-interface MulticastDNS mode");
 static int verb_mdns(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2956,7 +2958,7 @@ static int verb_mdns(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB(verb_dns_over_tls, "dnsovertls", "[LINK [MODE]]", VERB_ANY, 3, 0,
+VERB(verb_dns_over_tls, "dnsovertls", "[LINK [MODE]]\0", VERB_ANY, 3, 0,
      "Get/set per-interface DNS-over-TLS mode");
 static int verb_dns_over_tls(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -3004,7 +3006,7 @@ static int verb_dns_over_tls(int argc, char *argv[], uintptr_t _data, void *user
         return 0;
 }
 
-VERB(verb_dnssec, "dnssec", "[LINK [MODE]]", VERB_ANY, 3, 0,
+VERB(verb_dnssec, "dnssec", "[LINK [MODE]]\0", VERB_ANY, 3, 0,
      "Get/set per-interface DNSSEC mode");
 static int verb_dnssec(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -3067,7 +3069,7 @@ static int call_nta(sd_bus *bus, char **nta, const BusLocator *locator,  sd_bus_
         return sd_bus_call(bus, req, 0, error, NULL);
 }
 
-VERB(verb_nta, "nta", "[LINK [DOMAIN…]]", VERB_ANY, VERB_ANY, 0,
+VERB(verb_nta, "nta", "[LINK [DOMAIN…]]\0", VERB_ANY, VERB_ANY, 0,
      "Get/set per-interface DNSSEC NTA");
 static int verb_nta(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -3127,7 +3129,7 @@ static int verb_nta(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB(verb_revert_link, "revert", "LINK", VERB_ANY, 2, 0,
+VERB(verb_revert_link, "revert", "LINK\0", VERB_ANY, 2, 0,
      "Revert per-interface configuration");
 static int verb_revert_link(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -3166,19 +3168,34 @@ static int verb_revert_link(int argc, char *argv[], uintptr_t _data, void *userd
         return 0;
 }
 
-VERB(verb_log_level, "log-level", "[LEVEL]", VERB_ANY, 2, 0,
+VERB(verb_log_level, "log-level", "[LEVEL]\0", VERB_ANY, 2, 0,
      "Get/set logging threshold for systemd-resolved");
 static int verb_log_level(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        r = acquire_bus(&bus);
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        r = sd_varlink_connect_address(&vl, "/run/systemd/resolve/io.systemd.Resolve");
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to connect to /run/systemd/resolve/io.systemd.Resolve: %m");
 
-        assert(IN_SET(argc, 1, 2));
+        if (argc == 1) {
+                /* Show current log level */
+                _cleanup_free_ char *level_str = NULL;
+                r = varlink_get_log_level_string(vl, &level_str);
+                if (r < 0)
+                        return r;
 
-        return verb_log_control_common(bus, "org.freedesktop.resolve1", argv[0], argc == 2 ? argv[1] : NULL);
+                puts(level_str);
+
+        } else if (argc == 2) {
+                /* Set new log level */
+                r = varlink_set_log_level_string(vl, argv[1]);
+                if (r < 0)
+                        return r;
+        } else
+                assert_not_reached();
+
+        return 0;
 }
 
 static int parse_protocol(const char *arg) {
@@ -3229,12 +3246,12 @@ static void help_dns_classes(void) {
         DUMP_STRING_TABLE(dns_class, int, _DNS_CLASS_MAX);
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("resolvectl");
+VERB_COMMON_HELP_AUTO_PROGRAM_HIDDEN("resolvectl");
 
 COMMAND(
         "systemd-resolve\0",
         "This command is deprecated. Use resolvectl.1 instead.",
-        .man_pages = "resolvectl.1\0",
+        .man_pages = "resolvectl(1)\0",
         .option_namespace = "systemd-resolve",
         .pager_flags = &arg_pager_flags,
 );
@@ -3498,7 +3515,7 @@ static int native_parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_NAMESPACE("resolvectl"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("resolvectl");
+                        return command_print_help_name("resolvectl");
 
                 OPTION_COMMON_VERSION:
                         return version();

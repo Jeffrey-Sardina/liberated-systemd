@@ -143,7 +143,7 @@ COMMAND(
         "systemd-imdsd\0",
         "Low-level IMDS data acquisition.",
         .argspec = "KEY\0",
-        .man_pages = "systemd-imdsd@.service.8\0",
+        .man_pages = "systemd-imdsd@.service(8)\0",
 );
 
 typedef struct Context Context;
@@ -2213,7 +2213,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-imdsd");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

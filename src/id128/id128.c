@@ -28,7 +28,7 @@ static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 COMMAND(
         "systemd-id128\0",
         "Generate and print 128-bit identifiers.",
-        .man_pages = "systemd-id128.1\0",
+        .man_pages = "systemd-id128(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -175,7 +175,7 @@ static int show_one(Table **table, const char *name, sd_id128_t uuid, bool first
                               arg_mode == ID128_PRINT_ID128 ? TABLE_ID128 : TABLE_UUID, uuid);
 }
 
-VERB(verb_show, "show", "[NAME|UUID]", VERB_ANY, VERB_ANY, 0, "Print one or more UUIDs");
+VERB(verb_show, "show", "[NAME|UUID]\0", VERB_ANY, VERB_ANY, 0, "Print one or more UUIDs");
 static int verb_show(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(table_unrefp) Table *table = NULL;
         int r;
@@ -234,7 +234,7 @@ static int verb_show(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB_COMMON_HELP_AUTO("systemd-id128");
+VERB_COMMON_HELP_AUTO();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
@@ -247,7 +247,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-id128");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

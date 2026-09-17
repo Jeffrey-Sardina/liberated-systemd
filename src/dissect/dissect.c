@@ -139,7 +139,7 @@ COMMAND(
                "--discover\0"
                "--validate IMAGE\0"
                "--shift IMAGE UIDBASE\0",
-        .man_pages = "systemd-dissect.1\0",
+        .man_pages = "systemd-dissect(1)\0",
         .option_namespace = "systemd-dissect",
         .pager_flags = &arg_pager_flags,
 );
@@ -404,7 +404,7 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_GROUP("Commands"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-dissect");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -715,7 +715,7 @@ static int parse_argv(int argc, char *argv[]) {
 COMMAND(
         "mount.ddi\0",
         "External helper for mount.8 to mount Discoverable Disk Images (DDIs).",
-        .man_pages = "systemd-dissect.1\0",
+        .man_pages = "systemd-dissect(1)\0",
         .option_namespace = "mount.ddi",
 );
 
@@ -1563,7 +1563,7 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
                         output_fd = STDOUT_FILENO;
                 }
 
-                r = tar_c(dfd, output_fd, arg_target, /* flags= */ 0);
+                r = tar_c(dfd, output_fd, arg_target, /* hardlink_db_fd= */ -EBADF, /* flags= */ 0);
                 if (r < 0)
                         return r;
 

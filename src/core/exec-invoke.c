@@ -1163,7 +1163,7 @@ static int pam_close_session_and_delete_credentials(pam_handle_t *pamh, int flag
 
         s = sym_pam_setcred(pamh, PAM_DELETE_CRED | flags);
         if (s != PAM_SUCCESS)
-                pam_syslog_pam_error(pamh, LOG_DEBUG, r, "pam_setcred(PAM_DELETE_CRED) failed: @PAMERR@");
+                pam_syslog_pam_error(pamh, LOG_DEBUG, s, "pam_setcred(PAM_DELETE_CRED) failed: @PAMERR@");
 
         return r != PAM_SUCCESS ? r : s;
 }
@@ -6665,18 +6665,6 @@ int exec_invoke(
 #endif
         }
 
-        if (!strv_isempty(context->unset_environment)) {
-                char **ee = NULL;
-
-                ee = strv_env_delete(accum_env, 1, context->unset_environment);
-                if (!ee) {
-                        *exit_status = EXIT_MEMORY;
-                        return log_oom();
-                }
-
-                strv_free_and_replace(accum_env, ee);
-        }
-
         _cleanup_strv_free_ char **replaced_argv = NULL, **argv_via_shell = NULL;
         char **final_argv = FLAGS_SET(command->flags, EXEC_COMMAND_VIA_SHELL) ? strv_skip(command->argv, 1) : command->argv;
 
@@ -6699,6 +6687,21 @@ int exec_invoke(
                         _cleanup_free_ char *jb = strv_join(bad_variables, ", ");
                         log_warning("Invalid environment variable name evaluates to an empty string: %s", strna(jb));
                 }
+        }
+
+        /* Apply UnsetEnvironment= after the command line has been expanded, so that the variables it
+         * removes are still available for expansion. Only the environment block passed to the executed
+         * process is affected, not the expansion. */
+        if (!strv_isempty(context->unset_environment)) {
+                char **ee = NULL;
+
+                ee = strv_env_delete(accum_env, 1, context->unset_environment);
+                if (!ee) {
+                        *exit_status = EXIT_MEMORY;
+                        return log_oom();
+                }
+
+                strv_free_and_replace(accum_env, ee);
         }
 
         if (FLAGS_SET(command->flags, EXEC_COMMAND_VIA_SHELL)) {

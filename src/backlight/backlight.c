@@ -26,7 +26,7 @@ COMMAND(
         "systemd-backlight\0",
         "Save and restore backlight brightness at shutdown and boot.",
         .argspec = "COMMAND [backlight|leds]:DEVICE\0",
-        .man_pages = "systemd-backlight.8\0",
+        .man_pages = "systemd-backlight(8)\0",
 );
 
 static int has_multiple_graphics_cards(void) {
@@ -530,7 +530,7 @@ static int device_new_from_arg(const char *s, sd_device **ret) {
         return 1; /* Found. */
 }
 
-VERB(verb_load, "load", "[backlight|leds]:DEVICE", 2, 2, VERB_ONLINE_ONLY,
+VERB(verb_load, "load", "[backlight|leds]:DEVICE\0", 2, 2, VERB_ONLINE_ONLY,
      "Set brightness to be the previously saved value");
 static int verb_load(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
@@ -582,7 +582,7 @@ static int verb_load(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB(verb_save, "save", "[backlight|leds]:DEVICE", 2, 2, VERB_ONLINE_ONLY,
+VERB(verb_save, "save", "[backlight|leds]:DEVICE\0", 2, 2, VERB_ONLINE_ONLY,
      "Save current brightness");
 static int verb_save(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
@@ -625,7 +625,7 @@ static int verb_save(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return 0;
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-backlight");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -638,7 +638,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-backlight");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -43,7 +43,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
 COMMAND(
         "systemd-tpm2-setup\0",
         "Set up the TPM2 Storage Root Key (SRK) and Endorsement Key (EK), and initialize NvPCRs.",
-        .man_pages = "systemd-tpm2-setup.8\0",
+        .man_pages = "systemd-tpm2-setup(8)\0",
 );
 
 #define TPM2_SRK_PEM_PERSISTENT_PATH "/var/lib/systemd/tpm2-srk-public-key.pem"
@@ -64,7 +64,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-tpm2-setup");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

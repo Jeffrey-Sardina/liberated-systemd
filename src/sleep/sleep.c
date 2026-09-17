@@ -48,7 +48,7 @@
 COMMAND(
         "systemd-sleep\0",
         "Suspend the system, hibernate the system, or both.",
-        .man_pages = "systemd-suspend.service.8\0",
+        .man_pages = "systemd-suspend.service(8)\0",
 );
 
 #if ENABLE_EFI
@@ -699,7 +699,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-sleep");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

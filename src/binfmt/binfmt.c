@@ -30,7 +30,7 @@ COMMAND(
         "systemd-binfmt\0",
         "Register binary formats with the kernel.",
         .argspec = "[CONFIGURATION FILE…]\0",
-        .man_pages = "systemd-binfmt.service.8\0",
+        .man_pages = "systemd-binfmt.service(8)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -126,7 +126,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-binfmt");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

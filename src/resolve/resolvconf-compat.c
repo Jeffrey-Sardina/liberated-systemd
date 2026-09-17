@@ -24,7 +24,7 @@ typedef enum LookupType  {
 COMMAND(
         "resolvconf\0",
         "Register DNS server and domain configuration with systemd-resolved.",
-        .man_pages = "resolvectl.1\0",
+        .man_pages = "resolvectl(1)\0",
         .argspec = "-a INTERFACE <FILE\0"
                    "-d INTERFACE\0",
         .footer =
@@ -181,7 +181,7 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
                 OPTION_NAMESPACE("resolvconf"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("resolvconf");
+                        return command_print_help_name("resolvconf");
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -41,7 +41,7 @@ COMMAND(
         "systemd-cgls\0",
         "Recursively show control group contents.",
         .argspec = "[CGROUP…]\0" "--unit|--user-unit UNIT…\0",
-        .man_pages = "systemd-cgls.1\0",
+        .man_pages = "systemd-cgls(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -56,7 +56,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-cgls");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -74,7 +74,7 @@ COMMAND(
         "systemd-sysinstall\0",
         "Install the OS to another block device.",
         .argspec = "[DEVICE]\0",
-        .man_pages = "systemd-sysinstall.8\0",
+        .man_pages = "systemd-sysinstall(8)\0",
 );
 
 typedef enum ProgressPhase {
@@ -174,7 +174,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-sysinstall");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -1821,6 +1821,10 @@ static int vl_method_list_candidate_devices(
         int r;
 
         assert(link);
+
+        /* Refuse multiple requests */
+        if (sd_varlink_get_userdata(link))
+                return -EBUSY;
 
         sd_varlink_server *varlink_server = sd_varlink_get_server(link);
         sd_event *event = sd_varlink_server_get_event(varlink_server);

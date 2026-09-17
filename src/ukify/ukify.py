@@ -81,6 +81,10 @@ EFI_ARCHES: list[str] = sum(EFI_ARCH_MAP.values(), [])
 DEFAULT_CONFIG_DIRS = ['/etc/systemd', '/run/systemd', '/usr/local/lib/systemd', '/usr/lib/systemd']
 DEFAULT_CONFIG_FILE = 'ukify.conf'
 
+# https://datatracker.ietf.org/doc/html/rfc5280 ub-common-name; bytes, not chars
+COMMON_NAME_MAX_LEN = 64
+INITRD_PCR_POLICY: tuple[list[str], str] = (['enter-initrd'], 'initrd')
+
 
 class Style:
     bold = '\033[0;1;39m' if sys.stderr.isatty() else ''
@@ -297,6 +301,7 @@ class UkifyConfig:
     policy_digest: bool
     profile: Optional[str]
     sb_cert: Union[str, Path, None]
+    sb_cert_common_name: Optional[str]
     sb_cert_name: Optional[str]
     sb_cert_validity: int
     sb_certdir: Path
@@ -744,6 +749,25 @@ def combine_signatures(pcrsigs: list[dict[str, str]]) -> str:
     return json.dumps(combined)
 
 
+def apply_pcr_signatures(pcrsig: dict[str, Any], signatures: dict[str, Any]) -> None:
+    for (bank, policies), (input_bank, input_policies) in itertools.product(
+        pcrsig.items(), signatures.items()
+    ):
+        if input_bank != bank:
+            continue
+        for policy, input_policy in itertools.product(policies, input_policies):
+            if 'tbs' in policy and 'tbs' in input_policy:
+                match = policy['tbs'] == input_policy['tbs']
+            else:
+                match = (policy['pol'], policy.get('ref')) == (
+                    input_policy['pol'],
+                    input_policy.get('ref'),
+                )
+
+            if match:
+                policy['sig'] = input_policy['sig']
+
+
 def key_path_groups(
     opts: UkifyConfig,
     include_extra: bool,
@@ -767,14 +791,13 @@ def key_path_groups(
     )
 
     # When requested, emit an extra signing group that reuses the first PCR signing key to produce
-    # a signed PCR policyy that can only be used from the initrd.
+    # a signed PCR policy that can only be used from the initrd.
     if opts.sign_initrd_pcrs and include_extra:
         yield (
             opts.pcr_private_keys[0],
             pub_keys[0] if pub_keys else None,
             certs[0] if certs else None,
-            ['enter-initrd'],
-            'initrd',
+            *INITRD_PCR_POLICY,
         )
 
 
@@ -835,39 +858,47 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             if dtbauto is not None:
                 to_measure[dtbauto.name] = dtbauto
 
-            pp_groups = opts.phase_path_groups or []
-
-            cmd = [
-                measure_tool,
-                'calculate' if opts.measure else 'policy-digest',
-                '--json',
-                opts.json,
-                *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
-                *(f'--bank={bank}' for bank in banks),
-                # For measurement, the keys are not relevant, so we can lump all the phase paths
-                # into one call to systemd-measure calculate.
-                *(f'--phase={phase_path}' for phase_path in itertools.chain.from_iterable(pp_groups)),
+            policy_groups: list[tuple[list[str], str]] = [
+                (list(itertools.chain.from_iterable(opts.phase_path_groups or [])), ''),
             ]
+            if opts.policy_digest and opts.sign_initrd_pcrs:
+                policy_groups += [INITRD_PCR_POLICY]
 
-            # The JSON object will be used for offline signing, include the public key
-            # so that the fingerprint is included too. In case a certificate is passed, use the
-            # right parameter so that systemd-measure can extract the public key from it.
-            if opts.policy_digest:
-                if opts.pcr_public_keys:
-                    cmd += ['--public-key', opts.pcr_public_keys[0]]
-                elif opts.pcr_certificates:
-                    cmd += ['--certificate', opts.pcr_certificates[0]]
-                    if opts.certificate_provider:
-                        cmd += ['--certificate-source', f'provider:{opts.certificate_provider}']
+            for phase_paths, policyref in policy_groups:
+                cmd = [
+                    measure_tool,
+                    'calculate' if opts.measure else 'policy-digest',
+                    '--json',
+                    opts.json,
+                    *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
+                    *(f'--bank={bank}' for bank in banks),
+                    # For measurement, the keys are not relevant, so we can lump all the phase paths
+                    # into one call to systemd-measure calculate.
+                    *(f'--phase={phase_path}' for phase_path in phase_paths),
+                ]
 
-            print('+', shell_join(cmd), file=sys.stderr)
-            output = subprocess.check_output(cmd, text=True)  # type: ignore
+                # The JSON object will be used for offline signing, include the public key
+                # so that the fingerprint is included too. In case a certificate is passed, use the
+                # right parameter so that systemd-measure can extract the public key from it.
+                if opts.policy_digest:
+                    if opts.pcr_public_keys:
+                        cmd += [f'--public-key={opts.pcr_public_keys[0]}']
+                    elif opts.pcr_certificates:
+                        cmd += [f'--certificate={opts.pcr_certificates[0]}']
+                        if opts.certificate_provider:
+                            cmd += [f'--certificate-source=provider:{opts.certificate_provider}']
 
-            if opts.policy_digest:
-                pcrsig = json.loads(output)
-                pcrsigs += [pcrsig]
-            else:
-                print(output)
+                    if policyref:
+                        cmd += [f'--policyref={policyref}']
+
+                print('+', shell_join(cmd), file=sys.stderr)
+                output = subprocess.check_output(cmd, text=True)  # type: ignore
+
+                if opts.policy_digest:
+                    pcrsig = json.loads(output)
+                    pcrsigs += [pcrsig]
+                else:
+                    print(output)
 
         if opts.policy_digest:
             combined = combine_signatures(pcrsigs)
@@ -1124,14 +1155,7 @@ def pe_add_sections(opts: UkifyConfig, uki: UKI, output: str) -> None:
                     .rstrip(b'\x00')
                     .decode()
                 )
-                for (bank, sigs), (input_bank, input_sigs) in itertools.product(
-                    j.items(), signatures.items()
-                ):
-                    if input_bank != bank:
-                        continue
-                    for sig, input_sig in itertools.product(sigs, input_sigs):
-                        if sig['pol'] == input_sig['pol']:
-                            sig['sig'] = input_sig['sig']
+                apply_pcr_signatures(j, signatures)
 
                 encoded = json.dumps(j).encode()
                 if len(encoded) > section.SizeOfRawData:
@@ -1365,8 +1389,10 @@ def make_uki(opts: UkifyConfig) -> None:
                 print(f'{linux} is not a valid PE file and cannot be decompressed either', file=sys.stderr)
             else:
                 print(f'{linux} is compressed and cannot be loaded by UEFI, decompressing', file=sys.stderr)
-                linux = Path(tempfile.NamedTemporaryFile(prefix='linux-decompressed').name)
-                linux.write_bytes(decompressed)
+                linux_decompressed = tempfile.NamedTemporaryFile(prefix='linux-decompressed')
+                linux_decompressed.write(decompressed)
+                linux_decompressed.flush()
+                linux = Path(linux_decompressed.name)
 
     if linux and sign_args_present:
         assert opts.signtool is not None
@@ -1682,12 +1708,24 @@ def generate_keys(opts: UkifyConfig) -> None:
     # This will generate keys and certificates and write them to the paths that
     # are specified as input paths.
     if opts.sb_key and opts.sb_cert:
-        fqdn = socket.getfqdn()
+        # The length of CN must not exceed 64 bytes
+        if opts.sb_cert_common_name is not None:
+            cn = opts.sb_cert_common_name
+            if len(cn) == 0:
+                raise ValueError('--secureboot-certificate-common-name= must not be empty')
 
-        cn = f'SecureBoot signing key on host {fqdn}'
-        if len(cn) > 64:
-            # The length of CN must not exceed 64 bytes
-            cn = cn[:61] + '...'
+            # Older cryptography versions (checked 41) don't check that by themselves.
+            # Newer (at least 49) do, but with a much less useful error message, so keep this extra check.
+            if len(cn.encode()) > COMMON_NAME_MAX_LEN:
+                raise ValueError(
+                    f'--secureboot-certificate-common-name= is longer than {COMMON_NAME_MAX_LEN} bytes: {cn!r}'
+                )
+        else:
+            fqdn = socket.getfqdn()
+
+            cn = f'SecureBoot signing key on host {fqdn}'
+            if len(cn) > COMMON_NAME_MAX_LEN:
+                cn = cn[: COMMON_NAME_MAX_LEN - 3] + '...'
 
         key_pem, cert_pem = generate_key_cert_pair(
             common_name=cn,
@@ -2204,6 +2242,13 @@ CONFIG_ITEMS = [
         config_key='UKI/SecureBootCertificate',
     ),
     ConfigItem(
+        '--secureboot-certificate-common-name',
+        metavar='CN',
+        dest='sb_cert_common_name',
+        help="common name of a certificate created by 'genkey'",
+        config_key='UKI/SecureBootCertificateCommonName',
+    ),
+    ConfigItem(
         '--secureboot-certificate-dir',
         dest='sb_certdir',
         default='/etc/pki/pesign',
@@ -2503,8 +2548,8 @@ def finalize_options(opts: argparse.Namespace) -> None:
         raise ValueError('--phases= specifications must match --pcr-private-key=')
     if n_policyrefs is not None and n_policyrefs != n_pcr_priv:
         raise ValueError('--policyref= specifications must match --pcr-private-key=')
-    if opts.sign_initrd_pcrs and not n_pcr_priv:
-        raise ValueError('--sign-initrd-pcrs requires at least one --pcr-private-key=')
+    if opts.sign_initrd_pcrs and not (n_pcr_priv or opts.policy_digest):
+        raise ValueError('--sign-initrd-pcrs requires --pcr-private-key= or --policy-digest')
 
     opts.cmdline = resolve_at_path(opts.cmdline)
 

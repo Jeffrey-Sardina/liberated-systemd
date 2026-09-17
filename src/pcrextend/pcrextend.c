@@ -52,7 +52,7 @@ COMMAND(
                 "--machine-id\0"
                 "--product-id\0"
                 "--login=UID|USER\0",
-        .man_pages = "systemd-pcrextend.8\0",
+        .man_pages = "systemd-pcrextend(8)\0",
 );
 
 #define EXTENSION_STRING_SAFE_LIMIT 1024
@@ -68,7 +68,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-pcrextend");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

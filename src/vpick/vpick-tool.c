@@ -47,7 +47,7 @@ COMMAND(
         "systemd-vpick\0",
         "Pick entry from versioned directory.",
         .argspec = "PATH…\0",
-        .man_pages = "systemd-vpick.1\0",
+        .man_pages = "systemd-vpick(1)\0",
 );
 
 static const char *print_table[_PRINT_MAX] = {
@@ -143,7 +143,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 OPTION_GROUP("Output"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-vpick");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

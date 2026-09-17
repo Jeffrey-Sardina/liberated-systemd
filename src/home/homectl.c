@@ -106,6 +106,7 @@ static int arg_fido2_cred_alg = COSE_ES256;
 static int arg_fido2_cred_alg = 0;
 #endif
 static bool arg_recovery_key = false;
+static char *arg_recovery_key_file = NULL;
 static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static ExportFormat arg_export_format = EXPORT_FORMAT_FULL;
 static uint64_t arg_capability_bounding_set = CAP_MASK_UNSET;
@@ -131,6 +132,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_identity_filter, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_identity_filter_rlimits, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_pkcs11_token_uri, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fido2_device, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_recovery_key_file, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_blob_dir, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_blob_files, hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_key_name, freep);
@@ -157,6 +159,7 @@ static bool identity_properties_specified(void) {
                 !strv_isempty(arg_identity_filter_rlimits) ||
                 !strv_isempty(arg_pkcs11_token_uri) ||
                 !strv_isempty(arg_fido2_device) ||
+                arg_recovery_key ||
                 arg_blob_dir ||
                 arg_blob_clear ||
                 !hashmap_isempty(arg_blob_files);
@@ -182,7 +185,7 @@ static int acquire_bus(sd_bus **bus) {
 COMMAND(
         "homectl\0",
         "Create, manipulate or inspect home directories.",
-        .man_pages = "homectl.1\0",
+        .man_pages = "homectl(1)\0",
         .pager_flags = &arg_pager_flags,
         .flags = COMMAND_HELP_SEPARATE,  /* the option table is very wide */
 );
@@ -708,7 +711,7 @@ static int inspect_home(sd_bus *bus, const char *name) {
         return 0;
 }
 
-VERB(verb_inspect_homes, "inspect", "USER…", VERB_ANY, VERB_ANY, 0,
+VERB(verb_inspect_homes, "inspect", "USER…\0", VERB_ANY, VERB_ANY, 0,
      "Inspect a home area");
 static int verb_inspect_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -1016,12 +1019,14 @@ static int add_disposition(sd_json_variant **v) {
         return 1;
 }
 
-static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
+static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret, char **ret_recovery_key) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         int r;
 
         assert(ret);
+        assert(ret_recovery_key);
 
         if (arg_identity) {
                 unsigned line = 0, column = 0;
@@ -1062,7 +1067,7 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
         }
 
         if (arg_recovery_key) {
-                r = identity_add_recovery_key(&v);
+                r = identity_add_recovery_key(&v, &recovery_key);
                 if (r < 0)
                         return r;
         }
@@ -1094,6 +1099,7 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
                 return r;
 
         *ret = TAKE_PTR(hr);
+        *ret_recovery_key = TAKE_PTR(recovery_key);
         return 0;
 }
 
@@ -1316,13 +1322,31 @@ static int bus_message_append_blobs(sd_bus_message *m, Hashmap *blobs) {
         return sd_bus_message_close_container(m);
 }
 
+static void finalize_recovery_key(const char *recovery_key, const char *recovery_key_file) {
+        int r;
+
+        if (!recovery_key)
+                return;
+
+        if (recovery_key_file) {
+                r = recovery_key_file_write(recovery_key_file, recovery_key);
+                if (r < 0)
+                        log_warning_errno(r,
+                                          "Failed to write recovery key file '%s', ignoring: %m",
+                                          recovery_key_file);
+        }
+
+        show_recovery_key(recovery_key);
+}
+
 static int create_home_common(sd_json_variant *input, bool show_enforce_password_policy_hint) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         int r;
 
-        r = acquire_new_home_record(input, &hr);
+        r = acquire_new_home_record(input, &hr, &recovery_key);
         if (r < 0)
                 return r;
 
@@ -1369,6 +1393,7 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
 
         if (arg_dry_run) {
                 sd_json_variant_dump(hr->json, SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_NEWLINE, stderr, /* prefix= */ NULL);
+                finalize_recovery_key(recovery_key, /* recovery_key_file= */ NULL);
                 return 0;
         }
 
@@ -1430,10 +1455,11 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                         break; /* done */
         }
 
+        finalize_recovery_key(recovery_key, arg_recovery_key_file);
         return 0;
 }
 
-VERB(verb_create_home, "create", "USER", VERB_ANY, 2, 0,
+VERB(verb_create_home, "create", "USER\0", VERB_ANY, 2, 0,
      "Create a home area");
 static int verb_create_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -1473,13 +1499,16 @@ static int verb_create_home(int argc, char *argv[], uintptr_t _data, void *userd
 static int acquire_updated_home_record(
                 sd_bus *bus,
                 const char *username,
-                UserRecord **ret) {
+                UserRecord **ret,
+                char **ret_recovery_key) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         int r;
 
         assert(ret);
+        assert(ret_recovery_key);
 
         if (arg_identity) {
                 unsigned line = 0, column = 0;
@@ -1561,7 +1590,7 @@ static int acquire_updated_home_record(
         }
 
         if (arg_recovery_key) {
-                r = identity_add_recovery_key(&json);
+                r = identity_add_recovery_key(&json, &recovery_key);
                 if (r < 0)
                         return r;
         }
@@ -1584,6 +1613,7 @@ static int acquire_updated_home_record(
                 return r;
 
         *ret = TAKE_PTR(hr);
+        *ret_recovery_key = TAKE_PTR(recovery_key);
         return 0;
 }
 
@@ -1611,12 +1641,13 @@ static int home_record_reset_human_interaction_permission(UserRecord *hr) {
         return 0;
 }
 
-VERB(verb_update_home, "update", "USER", VERB_ANY, 2, 0,
+VERB(verb_update_home, "update", "USER\0", VERB_ANY, 2, 0,
      "Update a home area");
 static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL, *secret = NULL;
         _cleanup_free_ char *buffer = NULL;
+        _cleanup_(erase_and_freep) char *recovery_key = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
         const char *username;
         uint64_t flags = 0;
@@ -1642,7 +1673,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
 
         (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = acquire_updated_home_record(bus, username, &hr);
+        r = acquire_updated_home_record(bus, username, &hr, &recovery_key);
         if (r < 0)
                 return r;
 
@@ -1661,6 +1692,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
 
         if (arg_dry_run) {
                 sd_json_variant_dump(hr->json, SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_NEWLINE, stderr, /* prefix= */ NULL);
+                finalize_recovery_key(recovery_key, /* recovery_key_file= */ NULL);
                 return 0;
         }
 
@@ -1715,6 +1747,8 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
                 } else
                         break;
         }
+
+        finalize_recovery_key(recovery_key, arg_recovery_key_file);
 
         if (and_resize)
                 log_info("Resizing home.");
@@ -1790,7 +1824,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
         return 0;
 }
 
-VERB(verb_passwd_home, "passwd", "USER", VERB_ANY, 2, 0,
+VERB(verb_passwd_home, "passwd", "USER\0", VERB_ANY, 2, 0,
      "Change password of a home area");
 static int verb_passwd_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(user_record_unrefp) UserRecord *old_secret = NULL, *new_secret = NULL;
@@ -1909,7 +1943,7 @@ static int parse_disk_size(const char *t, uint64_t *ret) {
         return 0;
 }
 
-VERB(verb_resize_home, "resize", "USER SIZE", 2, 3, 0,
+VERB(verb_resize_home, "resize", "USER SIZE\0", 2, 3, 0,
      "Resize a home area");
 static int verb_resize_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -1973,7 +2007,7 @@ static int verb_resize_home(int argc, char *argv[], uintptr_t _data, void *userd
         return 0;
 }
 
-VERB(verb_remove_home, "remove", "USER…", 2, VERB_ANY, 0,
+VERB(verb_remove_home, "remove", "USER…\0", 2, VERB_ANY, 0,
      "Remove a home area");
 static int verb_remove_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2009,7 +2043,7 @@ static int verb_remove_home(int argc, char *argv[], uintptr_t _data, void *userd
 }
 
 VERB_GROUP("Advanced User Manipulation Commands");
-VERB(verb_activate_home, "activate", "USER…", 2, VERB_ANY, 0,
+VERB(verb_activate_home, "activate", "USER…\0", 2, VERB_ANY, 0,
      "Activate a home area");
 static int verb_activate_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2059,7 +2093,7 @@ static int verb_activate_home(int argc, char *argv[], uintptr_t _data, void *use
         return ret;
 }
 
-VERB(verb_deactivate_home, "deactivate", "USER…", 2, VERB_ANY, 0,
+VERB(verb_deactivate_home, "deactivate", "USER…\0", 2, VERB_ANY, 0,
      "Deactivate a home area");
 static int verb_deactivate_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2134,7 +2168,7 @@ static int verb_deactivate_all_homes(int argc, char *argv[], uintptr_t _data, vo
         return 0;
 }
 
-VERB(verb_with_home, "with", "USER [COMMAND…]", 2, VERB_ANY, 0,
+VERB(verb_with_home, "with", "USER [COMMAND…]\0", 2, VERB_ANY, 0,
      "Run shell or command with access to a home area");
 static int verb_with_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -2293,7 +2327,7 @@ static int authenticate_home(sd_bus *bus, const char *name) {
         }
 }
 
-VERB(verb_authenticate_homes, "authenticate", "USER…", VERB_ANY, VERB_ANY, 0,
+VERB(verb_authenticate_homes, "authenticate", "USER…\0", VERB_ANY, VERB_ANY, 0,
      "Authenticate a home area");
 static int verb_authenticate_homes(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2321,7 +2355,7 @@ static int verb_authenticate_homes(int argc, char *argv[], uintptr_t _data, void
 }
 
 VERB_GROUP("User Migration Commands");
-VERB(verb_adopt_home, "adopt", "PATH…", VERB_ANY, VERB_ANY, 0,
+VERB(verb_adopt_home, "adopt", "PATH…\0", VERB_ANY, VERB_ANY, 0,
      "Add an existing home area on this system");
 static int verb_adopt_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r, ret = 0;
@@ -2405,7 +2439,7 @@ static int register_home_one(sd_bus *bus, FILE *f, const char *path) {
         return register_home_common(bus, v);
 }
 
-VERB(verb_register_home, "register", "PATH…", VERB_ANY, VERB_ANY, 0,
+VERB(verb_register_home, "register", "PATH…\0", VERB_ANY, VERB_ANY, 0,
      "Register a user record locally");
 static int verb_register_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -2438,7 +2472,7 @@ static int verb_register_home(int argc, char *argv[], uintptr_t _data, void *use
         return r;
 }
 
-VERB(verb_unregister_home, "unregister", "USER…", 2, VERB_ANY, 0,
+VERB(verb_unregister_home, "unregister", "USER…\0", 2, VERB_ANY, 0,
      "Unregister a user record locally");
 static int verb_unregister_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -2563,7 +2597,7 @@ static int verb_list_signing_keys(int argc, char *argv[], uintptr_t _data, void 
         return 0;
 }
 
-VERB(verb_get_signing_key, "get-signing-key", "[NAME…]", VERB_ANY, VERB_ANY, 0,
+VERB(verb_get_signing_key, "get-signing-key", "[NAME…]\0", VERB_ANY, VERB_ANY, 0,
      "Get a named home signing key");
 static int verb_get_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -2621,7 +2655,7 @@ static int add_signing_key_one(sd_bus *bus, const char *fn, FILE *key) {
         return 0;
 }
 
-VERB(verb_add_signing_key, "add-signing-key", "FILE…", VERB_ANY, VERB_ANY, 0,
+VERB(verb_add_signing_key, "add-signing-key", "FILE…\0", VERB_ANY, VERB_ANY, 0,
      "Add home signing key");
 static int verb_add_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -2730,7 +2764,7 @@ static int remove_signing_key_one(sd_bus *bus, const char *fn) {
         return 0;
 }
 
-VERB(verb_remove_signing_key, "remove-signing-key", "NAME…", 2, VERB_ANY, 0,
+VERB(verb_remove_signing_key, "remove-signing-key", "NAME…\0", 2, VERB_ANY, 0,
      "Remove home signing key");
 static int verb_remove_signing_key(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -2748,7 +2782,7 @@ static int verb_remove_signing_key(int argc, char *argv[], uintptr_t _data, void
 }
 
 VERB_GROUP("Lock/Unlock Commands");
-VERB(verb_lock_home, "lock", "USER…", 2, VERB_ANY, 0,
+VERB(verb_lock_home, "lock", "USER…\0", 2, VERB_ANY, 0,
      "Temporarily lock an active home area");
 static int verb_lock_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -2781,7 +2815,7 @@ static int verb_lock_home(int argc, char *argv[], uintptr_t _data, void *userdat
         return ret;
 }
 
-VERB(verb_unlock_home, "unlock", "USER…", 2, VERB_ANY, 0,
+VERB(verb_unlock_home, "unlock", "USER…\0", 2, VERB_ANY, 0,
      "Unlock a temporarily locked home area");
 static int verb_unlock_home(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -4009,7 +4043,7 @@ static int parse_fido2_device_field(const char *arg) {
         return 1;
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("homectl");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         _cleanup_strv_free_ char **arg_languages = NULL;
@@ -4038,7 +4072,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("homectl");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -4349,6 +4383,12 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                         arg_recovery_key = r;
 
                         r = drop_from_identity("recoveryKey", "recoveryKeyType");
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("recovery-key-file", "PATH", "Write the generated recovery key to a file"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_recovery_key_file);
                         if (r < 0)
                                 return r;
                         break;
@@ -4859,6 +4899,9 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                                 return r;
                 }
         }
+
+        if (arg_recovery_key_file && !arg_recovery_key)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--recovery-key-file= requires --recovery-key=yes.");
 
         *remaining_args = option_parser_get_args(&opts);
         return 1;

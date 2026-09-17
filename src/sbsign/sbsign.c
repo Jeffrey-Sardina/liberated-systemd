@@ -49,10 +49,10 @@ STATIC_DESTRUCTOR_REGISTER(arg_signed_data_signature, freep);
 COMMAND(
         "systemd-sbsign\0",
         "Sign PE binaries for EFI Secure Boot.",
-        .man_pages = "systemd-sbsign.1\0",
+        .man_pages = "systemd-sbsign(1)\0",
 );
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-sbsign");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -66,7 +66,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-sbsign");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -365,7 +365,7 @@ static int pkcs7_add_digest_attribute(PKCS7 *p7, BIO *data, PKCS7_SIGNER_INFO *s
         return 0;
 }
 
-VERB(verb_sign, "sign", "EXEFILE", 2, 2, 0,
+VERB(verb_sign, "sign", "EXEFILE\0", 2, 2, 0,
      "Sign the given binary for EFI Secure Boot");
 static int verb_sign(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(openssl_ask_password_ui_freep) OpenSSLAskPasswordUI *ui = NULL;

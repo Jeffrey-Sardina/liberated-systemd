@@ -94,7 +94,7 @@ COMMAND(
         "systemd-cgtop\0",
         "Show top control groups by their resource usage.",
         .argspec = "[CGROUP]\0",
-        .man_pages = "systemd-cgtop.1\0",
+        .man_pages = "systemd-cgtop(1)\0",
 );
 
 static const char *order_table[_ORDER_MAX] = {
@@ -703,7 +703,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-cgtop");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

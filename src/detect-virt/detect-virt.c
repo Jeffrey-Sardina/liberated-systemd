@@ -24,7 +24,7 @@ static enum {
 COMMAND(
         "systemd-detect-virt\0",
         "Detect execution in a virtualized environment.",
-        .man_pages = "systemd-detect-virt.1\0",
+        .man_pages = "systemd-detect-virt(1)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -36,7 +36,7 @@ static int parse_argv(int argc, char *argv[]) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-detect-virt");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

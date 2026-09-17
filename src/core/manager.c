@@ -1670,10 +1670,35 @@ static unsigned manager_dispatch_stop_notify_queue(Manager *m) {
         return n;
 }
 
+static void manager_clear_unit_dependencies(Manager *m) {
+        Unit *u;
+        const char *name;
+
+        assert(m);
+
+        HASHMAP_FOREACH_KEY(u, name, m->units) {
+
+                /* ignore aliases */
+                if (u->id != name)
+                        continue;
+
+                for (Hashmap *dependencies; (dependencies = hashmap_steal_first(u->dependencies));)
+                        hashmap_free(dependencies);
+
+                u->dependencies = hashmap_free(u->dependencies);
+                u->dependency_generation++;
+        }
+}
+
 static void manager_clear_jobs_and_units(Manager *m) {
         Unit *u;
 
         assert(m);
+
+        /* All units are going away, hence discard the full dependency graph in one pass. Otherwise
+         * unit_free() removes every edge from both endpoints separately, which becomes very costly with
+         * large numbers of synthesized mount units. */
+        manager_clear_unit_dependencies(m);
 
         while ((u = hashmap_first(m->units)))
                 unit_free(u);
@@ -2023,6 +2048,7 @@ static bool manager_dbus_is_running(Manager *m, bool deserialized) {
                 return false;
         if (!IN_SET(deserialized ? SERVICE(u)->deserialized_state : SERVICE(u)->state,
                     SERVICE_RUNNING,
+                    SERVICE_RUNNING_REVALIDATING,
                     SERVICE_REFRESH_EXTENSIONS,
                     SERVICE_REFRESH_CREDENTIALS,
                     SERVICE_RELOAD,

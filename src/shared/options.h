@@ -95,13 +95,13 @@ assert_cc(sizeof(Option) % sizeof(void*) == 0);
 #define OPTION_COMMON_VERSION                                           \
         OPTION_LONG("version", NULL, "Show package version")
 
+/* A form used in udev, udevadm, and run0. */
+#define OPTION_COMMON_VERSION_WITH_V                                    \
+        OPTION('V', "version", NULL, "Show package version")
+
 #define OPTION_COMMON_INTROSPECT_CLI                                    \
         /* This option is internal-only for now and not shown in --help */ \
         OPTION_LONG("introspect-cli", NULL, /* help= */ NULL)
-
-/* For programs which do not do option parsing, but check the argv array directly. */
-#define OPTION_COMMON_INTROSPECT_CLI_ENTRY                              \
-        _OPTION_ENTRY(__COUNTER__, /* fl= */ 0, /* sc= */ 0, "introspect-cli", /* mv= */ NULL, /* d= */ 0u, /* h= */ NULL)
 
 #define OPTION_COMMON_NO_PAGER                                          \
         OPTION_LONG("no-pager", NULL, "Do not start a pager")
@@ -181,11 +181,6 @@ assert_cc(sizeof(Option) % sizeof(void*) == 0);
                     "Allows the certificate to be loaded from an OpenSSL provider " \
                     "(file, provider:PROVIDER)")
 
-/* A form used in udev code for compatibility. -V is accepted but not documented. */
-#define OPTION_COMMON_VERSION_WITH_HIDDEN_V                             \
-        OPTION_COMMON_VERSION: {}                                       \
-        OPTION_SHORT('V', NULL, /* help= */ NULL)
-
 #define OPTION_COMMON_RESOLVE_NAMES                                     \
         OPTION('N', "resolve-names", "MODE",                            \
                "When to resolve users and groups (early, late, or never)")
@@ -226,6 +221,8 @@ typedef struct OptionParser {
         char **argv;                  /* The argv array, possibly reordered. */
         OptionParserMode mode;
         const char *namespace;        /* The namespace, may be NULL. */
+        const char *option_groups;    /* Optional nulstr with option groups to look at. When specified,
+                                       * only named option groups found in this list are used. */
         int log_level_shift;          /* The log level difference from the default of LOG_ERR.
                                        * Allowed values are -3..4.
                                        * Use 4 == LOG_DEBUG - LOG_ERR to log at debug level. */
@@ -279,24 +276,10 @@ const Option* options_find_namespace(
                 const Option options_end[],
                 const char *namespace);
 
-int _option_parser_get_help_table_full(
-                const Option options[],
-                const Option options_end[],
-                const char *namespace,
-                const char *group,
-                Table **ret);
-#define option_parser_get_help_table_full(namespace, group, ret)        \
-        _option_parser_get_help_table_full(__start_SYSTEMD_OPTIONS, __stop_SYSTEMD_OPTIONS, namespace, group, ret)
-#define option_parser_get_help_table_ns(ns, ret)                        \
-        option_parser_get_help_table_full(ns, /* group= */ NULL, ret)
-#define option_parser_get_help_table_group(group, ret)                  \
-        option_parser_get_help_table_full(/* namespace= */ NULL, group, ret)
-#define option_parser_get_help_table(ret)                               \
-        option_parser_get_help_table_group(/* group= */ NULL, ret)
-
 int options_get_help_table_group(
                 const Option options[],
                 const Option options_end[],
+                const char *option_groups,
                 Table **ret,
                 const char **ret_group);
 
@@ -306,4 +289,5 @@ int options_build_json(
                 const Option options[],
                 const Option options_end[],
                 const char *namespace,
+                const char *option_groups,
                 sd_json_variant **ret);

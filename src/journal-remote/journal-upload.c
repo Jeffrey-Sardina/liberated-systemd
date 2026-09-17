@@ -81,7 +81,7 @@ COMMAND(
         "systemd-journal-upload\0",
         "Upload journal events to a remote server.",
         .argspec = "[-u URL] [{FILE|-}…]\0",
-        .man_pages = "systemd-journal-upload.service.8\0",
+        .man_pages = "systemd-journal-upload.service(8)\0",
 );
 
 static void close_fd_input(Uploader *u);
@@ -703,7 +703,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-journal-upload");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

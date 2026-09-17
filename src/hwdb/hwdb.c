@@ -17,10 +17,10 @@ static bool arg_strict = false;
 COMMAND(
         "systemd-hwdb\0",
         "Update or query the hardware database.",
-        .man_pages = "systemd-hwdb.8\0",
+        .man_pages = "systemd-hwdb(8)\0",
 );
 
-VERB(verb_query, "query", "MODALIAS", 2, 2, 0,
+VERB(verb_query, "query", "MODALIAS\0", 2, 2, 0,
      "Query database and print result");
 static int verb_query(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return hwdb_query(argv[1], arg_root);
@@ -35,7 +35,7 @@ static int verb_update(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return hwdb_update(arg_root, arg_hwdb_bin_dir, arg_strict, false);
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-hwdb");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -48,7 +48,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-hwdb");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

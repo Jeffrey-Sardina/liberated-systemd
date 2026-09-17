@@ -71,7 +71,7 @@ COMMAND(
         "systemd-delta\0",
         "Find overridden configuration files.",
         .argspec = "[SUFFIX…]\0",
-        .man_pages = "systemd-delta.1\0",
+        .man_pages = "systemd-delta(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -513,7 +513,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-delta");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -424,14 +424,6 @@ bool fstype_is_blockdev_backed(const char *fstype) {
         return !STR_IN_SET(fstype, "9p", "overlay") && !fstype_is_network(fstype) && !fstype_is_api_vfs(fstype);
 }
 
-bool fstype_is_fuse(const char *fstype) {
-        assert(fstype);
-
-        /* Plain 'fuse', 'fuseblk' (e.g. ntfs-3g, exfat-fuse — used for file systems backed by an actual
-         * block device), or any 'fuse.<subtype>' (e.g. sshfs, rclone, gvfs, ...). */
-        return STR_IN_SET(fstype, "fuse", "fuseblk") || startswith(fstype, "fuse.");
-}
-
 bool fstype_is_ro(const char *fstype) {
         /* All Linux file systems that are necessarily read-only */
         return STR_IN_SET(fstype,
@@ -686,8 +678,12 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
         assert(key);
 
         fd = fsopen(fstype, FSOPEN_CLOEXEC);
-        if (fd < 0)
+        if (fd < 0) {
+                if (errno == ENODEV)
+                        return log_debug_errno(errno, "Kernel does not support file system type '%s'.", fstype);
+
                 return log_debug_errno(errno, "Failed to open superblock context for '%s': %m", fstype);
+        }
 
         /* Various file systems support fs context only in recent kernels (e.g. btrfs). For older kernels
          * fsconfig() with FSCONFIG_SET_STRING/FSCONFIG_SET_FLAG never fail. Which sucks, because we want to

@@ -24,7 +24,7 @@ COMMAND(
         "systemd-path\0",
         "Show system and user paths.",
         .argspec = "[NAME…]\0",
-        .man_pages = "systemd-path.1\0",
+        .man_pages = "systemd-path(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -192,7 +192,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-path");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

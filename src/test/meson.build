@@ -316,6 +316,10 @@ executables += [
                 'conditions' : ['HAVE_OPENSSL'],
         },
         test_template + {
+                'sources' : files('test-dbus-name-holder.c'),
+                'type' : 'manual',
+        },
+        test_template + {
                 'sources' : files('test-display-quota.c'),
                 'type' : 'manual',
         },
@@ -394,6 +398,10 @@ executables += [
                         test_hashmap_ordered_c,
                 ],
                 'timeout' : 180,
+        },
+        test_template + {
+                'sources' : files('test-hostname-pick-word.c'),
+                'type' : 'manual',
         },
         test_template + {
                 'sources' : files('test-ipcrm.c'),

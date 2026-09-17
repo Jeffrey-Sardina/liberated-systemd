@@ -300,10 +300,10 @@ static int parse_options(const char *options) {
 COMMAND(
         "systemd-veritysetup\0",
         "Attach or detach a verity-protected block device.",
-        .man_pages = "systemd-veritysetup@.service.8\0",
+        .man_pages = "systemd-veritysetup@.service(8)\0",
 );
 
-VERB(verb_attach, "attach", "VOLUME DATADEVICE HASHDEVICE ROOTHASH [OPTIONS]", 5, 6, 0,
+VERB(verb_attach, "attach", "VOLUME DATADEVICE HASHDEVICE ROOTHASH [OPTIONS]\0", 5, 6, 0,
      "Attach a verity-protected block device");
 static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
@@ -441,7 +441,7 @@ static int verb_attach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
-VERB(verb_detach, "detach", "VOLUME", 2, 2, 0,
+VERB(verb_detach, "detach", "VOLUME\0", 2, 2, 0,
      "Detach a verity-protected block device");
 static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
@@ -471,7 +471,7 @@ static int verb_detach(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return 0;
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-veritysetup");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
@@ -484,7 +484,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-veritysetup");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -19,7 +19,7 @@ static enum {
 COMMAND(
         "systemd-ac-power\0",
         "Report whether we are connected to an external power source.",
-        .man_pages = "systemd-ac-power.1\0",
+        .man_pages = "systemd-ac-power(1)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -32,7 +32,7 @@ static int parse_argv(int argc, char *argv[]) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-ac-power");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

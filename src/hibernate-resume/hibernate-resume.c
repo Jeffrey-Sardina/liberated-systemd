@@ -28,7 +28,7 @@ COMMAND(
         .argspec =
                 "[DEVICE [OFFSET]]\0"
                 "--clear\0",
-        .man_pages = "systemd-hibernate-resume.8\0",
+        .man_pages = "systemd-hibernate-resume(8)\0",
 );
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
@@ -42,7 +42,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-hibernate-resume");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -148,7 +148,7 @@ COMMAND(
         "systemd-run\0",
         "Run the specified command in a transient scope or service.",
         .argspec = "COMMAND [ARGUMENTS…]\0",
-        .man_pages = "systemd-run.1\0",
+        .man_pages = "systemd-run(1)\0",
         .option_namespace = "systemd-run",
         .pager_flags = &arg_pager_flags,
 );
@@ -208,7 +208,7 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_NAMESPACE("systemd-run"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-run");
+                        return command_print_help_name("systemd-run");
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -758,7 +758,7 @@ COMMAND(
         "run0\0",
         "Elevate privileges interactively.",
         .argspec = "COMMAND [ARGUMENTS…]\0",
-        .man_pages = "run0.1\0",
+        .man_pages = "run0(1)\0",
         .option_namespace = "run0",
         .pager_flags = &arg_pager_flags,
 );
@@ -784,9 +784,9 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 OPTION_NAMESPACE("run0"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("run0");
+                        return command_print_help_name("run0");
 
-                OPTION('V', "version", NULL, "Show package version"):
+                OPTION_COMMON_VERSION_WITH_V:
                         return version();
 
                 OPTION_COMMON_NO_ASK_PASSWORD:

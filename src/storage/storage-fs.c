@@ -41,7 +41,7 @@ static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 COMMAND(
         "systemd-storage-fs\0",
         "Expose regular files and directories as storage volumes.",
-        .man_pages = "systemd-storage-fs.8\0",
+        .man_pages = "systemd-storage-fs(8)\0",
 );
 
 /* For now we maintain a simple, compiled-in list of templates. One of those days we might want to move these
@@ -755,7 +755,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-storage-fs");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -40,7 +40,7 @@ COMMAND(
         "systemd-ask-password\0",
         "Query the user for a passphrase, via the TTY or a UI agent.",
         .argspec = "MESSAGE\0",
-        .man_pages = "systemd-ask-password.1\0",
+        .man_pages = "systemd-ask-password(1)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -55,7 +55,7 @@ static int parse_argv(int argc, char *argv[]) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-ask-password");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

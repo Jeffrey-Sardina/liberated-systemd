@@ -40,7 +40,7 @@ static bool arg_full = false;
 COMMAND(
         "localectl\0",
         "Query or change system locale and keyboard settings.",
-        .man_pages = "localectl.1\0",
+        .man_pages = "localectl(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -186,7 +186,7 @@ static int verb_show_status(int argc, char *argv[], uintptr_t _data, void *userd
         return print_status_info(&info);
 }
 
-VERB(verb_set_locale, "set-locale", "LOCALE...", 2, VERB_ANY, 0,
+VERB(verb_set_locale, "set-locale", "LOCALE...\0", 2, VERB_ANY, 0,
      "Set system locale");
 static int verb_set_locale(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
@@ -232,7 +232,7 @@ static int verb_list_locales(int argc, char *argv[], uintptr_t _data, void *user
         return 0;
 }
 
-VERB(verb_set_vconsole_keymap, "set-keymap", "MAP [MAP]", 2, 3, 0,
+VERB(verb_set_vconsole_keymap, "set-keymap", "MAP [MAP]\0", 2, 3, 0,
      "Set console and X11 keyboard mappings");
 static int verb_set_vconsole_keymap(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -275,7 +275,7 @@ static int verb_list_vconsole_keymaps(int argc, char *argv[], uintptr_t _data, v
         return 0;
 }
 
-VERB(verb_set_x11_keymap, "set-x11-keymap", "LAYOUT [MODEL [VARIANT [OPTIONS]]]", 2, 5, 0,
+VERB(verb_set_x11_keymap, "set-x11-keymap", "LAYOUT [MODEL [VARIANT [OPTIONS]]]\0", 2, 5, 0,
      "Set X11 and console keyboard mappings");
 static int verb_set_x11_keymap(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -316,7 +316,7 @@ VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-models",
            "Show known X11 keyboard mapping models");
 VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-layouts",
            "Show known X11 keyboard mapping layouts");
-VERB(verb_list_x11_keymaps, "list-x11-keymap-variants", "[LAYOUT]", VERB_ANY, 2, 0,
+VERB(verb_list_x11_keymaps, "list-x11-keymap-variants", "[LAYOUT]\0", VERB_ANY, 2, 0,
      "Show known X11 keyboard mapping variants");
 VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-options",
            "Show known X11 keyboard mapping options");
@@ -426,7 +426,7 @@ static int verb_list_x11_keymaps(int argc, char *argv[], uintptr_t _data, void *
         return 0;
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("localectl");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
@@ -440,7 +440,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("localectl");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

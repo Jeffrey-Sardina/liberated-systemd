@@ -24,7 +24,7 @@ static bool arg_dry_run = false;
 COMMAND(
         "systemd-oomd\0",
         "Run the userspace out-of-memory (OOM) killer.",
-        .man_pages = "systemd-oomd.8\0",
+        .man_pages = "systemd-oomd(8)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -37,7 +37,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-oomd");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -30,7 +30,7 @@ static bool arg_varlink = false;
 COMMAND(
         "systemd-mute-console\0",
         "Mute status output to the console.",
-        .man_pages = "systemd-mute-console.1\0",
+        .man_pages = "systemd-mute-console(1)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -44,7 +44,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-mute-console");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -235,6 +235,10 @@ static int vl_method_mute(
 
         assert(link);
         assert(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
+
+        /* Refuse multiple requests per connection. */
+        if (sd_varlink_get_userdata(link))
+                return -EBUSY;
 
         _cleanup_free_ Context *nc = new(Context, 1);
         if (!nc)

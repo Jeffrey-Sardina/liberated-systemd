@@ -35,7 +35,7 @@ COMMAND(
         "systemd-validatefs\0",
         "Check file system validation constraints.",
         .argspec = "MOUNTPOINT\0",
-        .man_pages = "systemd-validatefs@.service.8\0",
+        .man_pages = "systemd-validatefs@.service(8)\0",
 );
 
 static int parse_argv(int argc, char *argv[]) {
@@ -49,7 +49,7 @@ static int parse_argv(int argc, char *argv[]) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-validatefs");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

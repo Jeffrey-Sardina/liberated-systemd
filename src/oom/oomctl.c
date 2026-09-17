@@ -17,11 +17,11 @@ static PagerFlags arg_pager_flags = 0;
 COMMAND(
         "oomctl\0",
         "Manage or inspect the userspace OOM killer.",
-        .man_pages = "oomctl.1\0",
+        .man_pages = "oomctl(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
-VERB_COMMON_HELP_AUTO_HIDDEN("oomctl");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 VERB_DEFAULT_NOARG(verb_dump_state, "dump", "Output the current state of systemd-oomd");
 static int verb_dump_state(int argc, char *argv[], uintptr_t _data, void *userdata) {
@@ -54,7 +54,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("oomctl");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

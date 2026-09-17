@@ -58,7 +58,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_extra_headers, strv_freep);
 COMMAND(
         "systemd-report\0",
         "Acquire metrics from local sources.",
-        .man_pages = "systemd-report.1\0",
+        .man_pages = "systemd-report(1)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -650,13 +650,13 @@ static int context_collect_metrics(Context *context) {
         return 1;
 }
 
-VERB_FULL(verb_metrics, "metrics", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_LIST_METRICS,
+VERB_FULL(verb_metrics, "metrics", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_LIST_METRICS,
           "Acquire list of metrics and their values");
-VERB_FULL(verb_metrics, "describe", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_DESCRIBE_METRICS,
+VERB_FULL(verb_metrics, "describe", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_DESCRIBE_METRICS,
           "Describe available metrics");
-VERB_FULL(verb_metrics, "generate", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_GENERATE,
+VERB_FULL(verb_metrics, "generate", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_GENERATE,
           "Build a report with metrics");
-VERB_FULL(verb_metrics, "upload", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_UPLOAD,
+VERB_FULL(verb_metrics, "upload", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_UPLOAD,
           "Upload a report with metrics");
 static int verb_metrics(int argc, char *argv[], uintptr_t data, void *userdata) {
         Action action = data;
@@ -924,7 +924,7 @@ static int vl_server(void) {
         return 0;
 }
 
-VERB_COMMON_HELP_AUTO_HIDDEN("systemd-report");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
@@ -937,7 +937,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-report");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

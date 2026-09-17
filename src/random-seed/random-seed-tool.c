@@ -46,7 +46,7 @@ static SeedAction arg_action = _ACTION_INVALID;
 COMMAND(
         "systemd-random-seed\0",
         "Load and save the system random seed at boot and shutdown.",
-        .man_pages = "systemd-random-seed.8\0",
+        .man_pages = "systemd-random-seed(8)\0",
 );
 
 static CreditEntropy may_credit(int seed_fd) {
@@ -322,7 +322,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-random-seed");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

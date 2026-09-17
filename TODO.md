@@ -127,6 +127,23 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 ## Features
 
+- sysext: condition confext/sysext on machine tags, too
+
+- sysupdate: add health check logic, revert updates if fail
+
+- sysupdate: run things in a loop always, to deal with stepping stones, and
+  adding new transfer files. finish, when stable.
+
+- sysupdate: add flag field for features and components, to require a restart
+  of the update loop once they have been updated.
+
+- confext/sysext: add policy file concept: json files that encode for rleevant
+  confext/sysext ddis rules when to enable them, i.e. version checks. also use
+  it for the garbage collector
+
+- confext/sysext: mark system as refusing refreshes until reboot if
+  confext/sysext says it require a reboot
+
 - cryptsetup: add a new switch which makes it wait for the keyfile to
   appear. use inotify/mount watching for that. usecase: system waits at boot
   for some key to be supplied, possibly delivered via confext or so. This could
@@ -2036,6 +2053,11 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - lock image configured with RootDirectory=/RootImage= using the usual nspawn semantics while the unit is up
   - find a way how we can reload unit file configuration for
     specific units only, without reloading the whole of systemd
+  - figure out why 'systemctl set-property --runtime avahi-daemon.service TimeoutStartSec=150'
+    fails with org.freedesktop.DBus.Error.PropertyReadOnly
+  - report org.freedesktop.DBus.Error.PropertyReadOnly better than
+    "Cannot set property JobTimeoutUSec, or unknown property."
+  - allow 'systemctl start --property=…' ?
 
 - **PidRef conversion work:**
   - cg_pid_get_xyz()

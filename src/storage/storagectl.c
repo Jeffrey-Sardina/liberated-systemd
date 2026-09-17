@@ -48,12 +48,12 @@ static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 COMMAND(
         "storagectl\0",
         "Enumerate storage volumes and providers.",
-        .man_pages = "storagectl.1\0",
+        .man_pages = "storagectl(1)\0",
         .option_namespace = "storagectl",
         .pager_flags = &arg_pager_flags,
 );
 
-VERB_COMMON_HELP_AUTO_HIDDEN("storagectl");
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static const char *ro_color(int ro) {
         if (ro > 0)
@@ -140,7 +140,7 @@ static int on_list_reply(
         return 0;
 }
 
-VERB(verb_list_volumes, "volumes", "GLOB", /* min_args= */ VERB_ANY, /* max_args= */ 2, VERB_DEFAULT, "List storage volumes");
+VERB(verb_list_volumes, "volumes", "GLOB\0", /* min_args= */ VERB_ANY, /* max_args= */ 2, VERB_DEFAULT, "List storage volumes");
 static int verb_list_volumes(int argc, char *argv[], uintptr_t data, void *userdata) {
         int r;
 
@@ -245,7 +245,7 @@ static int on_list_templates_reply(
         return 0;
 }
 
-VERB(verb_templates, "templates", "GLOB", /* min_args= */ VERB_ANY, /* max_args= */ 2, /* flags= */ 0, "List storage volume templates");
+VERB(verb_templates, "templates", "GLOB\0", /* min_args= */ VERB_ANY, /* max_args= */ 2, /* flags= */ 0, "List storage volume templates");
 static int verb_templates(int argc, char *argv[], uintptr_t data, void *userdata) {
         int r;
 
@@ -372,7 +372,7 @@ static int verb_providers(int argc, char *argv[], uintptr_t data, void *userdata
 COMMAND(
         "mount.storage\0",
         "External helper for mount.8 to expose storage volumes.",
-        .man_pages = "storagectl.1\0",
+        .man_pages = "storagectl(1)\0",
         .option_namespace = "mount.storage",
         .pager_flags = &arg_pager_flags,
 );
@@ -391,7 +391,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_NAMESPACE("storagectl"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("storagectl");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

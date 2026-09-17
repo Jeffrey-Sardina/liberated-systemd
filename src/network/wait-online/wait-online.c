@@ -33,7 +33,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_ignore, strv_freep);
 COMMAND(
         "systemd-networkd-wait-online\0",
         "Block until network is configured.",
-        .man_pages = "systemd-networkd-wait-online.service.8\0",
+        .man_pages = "systemd-networkd-wait-online.service(8)\0",
 );
 
 static int parse_interface_with_operstate_range(const char *str) {
@@ -92,7 +92,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-networkd-wait-online");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

@@ -118,7 +118,7 @@ COMMAND(
         "systemd-sysusers\0",
         "Create system user and group accounts.",
         .argspec = "[CONFIGURATION FILE…]\0",
-        .man_pages = "systemd-sysusers.service.8\0",
+        .man_pages = "systemd-sysusers.service(8)\0",
         .pager_flags = &arg_pager_flags,
 );
 
@@ -2124,7 +2124,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-sysusers");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

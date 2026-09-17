@@ -146,7 +146,7 @@ COMMAND(
         "journalctl\0",
         "Query the journal.",
         .argspec = "[MATCH…]\0",
-        .man_pages = "journalctl.1\0",
+        .man_pages = "journalctl(1)\0",
         .option_namespace = "journalctl",
         .pager_flags = &arg_pager_flags,
 );
@@ -793,7 +793,7 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
                 OPTION_GROUP("Commands"): {}
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("journalctl");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -991,11 +991,10 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         if (!arg_follow)
                 arg_journal_additional_open_flags = SD_JOURNAL_ASSUME_IMMUTABLE;
 
-        args = strv_copy(args);
-        if (!args)
+        r = strv_copy_unless_empty(args, remaining_args);
+        if (r < 0)
                 return log_oom();
 
-        *remaining_args = args;
         return 1;
 }
 

@@ -26,7 +26,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 COMMAND(
         "systemd-update-done\0",
         "Mark /etc/ and /var/ as fully updated.",
-        .man_pages = "systemd-update-done.8\0",
+        .man_pages = "systemd-update-done(8)\0",
 );
 
 static int save_timestamp(const char *dir, struct timespec *ts) {
@@ -79,7 +79,7 @@ static int parse_argv(int argc, char *argv[]) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-update-done");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();

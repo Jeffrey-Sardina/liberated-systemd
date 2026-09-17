@@ -29,7 +29,7 @@ COMMAND(
         "systemd-cat\0",
         "Execute process with stdout/stderr connected to the journal.",
         .argspec = "[COMMAND…]\0",
-        .man_pages = "systemd-cat.1\0",
+        .man_pages = "systemd-cat(1)\0",
 );
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
@@ -43,7 +43,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return command_print_help("systemd-cat");
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
