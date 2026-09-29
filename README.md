@@ -38,12 +38,12 @@ Further, Systemd is the first process to run on your computer -- if you corrupt 
 Everyone's local setup is different, and what works for one person might not work for you. I highly recommend test-installing in a VM before running on your actual computer.
 
 ### Install from release (recommended)
-To install Liberated `systemd` from a named release, download the **.tar.gz** file for release of choice instead of cloning Liberated `systemd`. For Liberated `systemd` v261,this is: [systemd-261.tar.gz](https://github.com/Jeffrey-Sardina/liberated-systemd/releases/download/v261/systemd-261.tar.gz). This will download the release's source code as a compressed file. (Note: don't use the auto-generated "source code" links -- use the *.tar.gz file if you want an exact match to Systemd v261).
+To install Liberated `systemd` from a named release, download the **.tar.gz** file for release of choice instead of cloning Liberated `systemd`. For Liberated `systemd` v262,this is: [systemd-262.tar.gz](https://github.com/Jeffrey-Sardina/liberated-systemd/releases/download/v262/systemd-262.tar.gz). This will download the release's source code as a compressed file. (Note: don't use the auto-generated "source code" links -- use the *.tar.gz file if you want an exact match to Systemd v261).
 
 The instructions for installing from the release source code are identical to those below.
 
 ### Install from source
-Here is the set of commands you can use to install Liberated systemd from source. This is how I run Liberated systemd on my Arch and Ubuntu (26.04 / "resolute") systems, although the commands should work on any Linux distro. First, we check the current version of systemd:
+Here is the set of commands you can use to install Liberated systemd from source. This is how I run Liberated systemd on my CachyOS (Arch-based) systems, although the commands should work on any Linux distro. First, we check the current version of systemd:
 
 ```bash
 systemctl --version # output will contain something like "systemd 259 (259.5-0ubuntu2)"
