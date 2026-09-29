@@ -51,8 +51,10 @@ static inline bool TPM2_PCR_MASK_VALID(uint32_t pcr_mask) {
 int dlopen_tpm2(int log_level) _dlopen_loader_;
 
 /* tpm2_unseal() returns a bunch of different errors for various flavours of PCR issues, let's group them.
- * Kept outside the HAVE_TPM2 guard as callers switch on these errnos even in builds without TPM2. */
-#define ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r) IN_SET(r, -EREMCHG, -ENOANO, -EUCLEAN, -EPERM)
+ * Kept outside the HAVE_TPM2 guard as callers switch on these errnos even in builds without TPM2. Note that
+ * -EUCLEAN is not part of this: when returned by tpm2_unseal() it means a PCR was continuously extended
+ * while unsealing, which says nothing about whether the PCR state matches the policy. */
+#define ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r) IN_SET(r, -EREMCHG, -ENOANO, -EPERM)
 
 /* Errors that mean the tried TPM2 token does not match the boot state, be it due to wrong PCR state, a
  * different PCR signing key/policy, a different TPM, or an unusable NV index. The caller should keep trying
@@ -141,7 +143,7 @@ int tpm2_pcr_values_hash_count(const Tpm2PCRValue *pcr_values, size_t n_pcr_valu
 int tpm2_tpml_pcr_selection_from_pcr_values(const Tpm2PCRValue *pcr_values, size_t n_pcr_values, TPML_PCR_SELECTION *ret_selection, TPM2B_DIGEST **ret_values, size_t *ret_n_values);
 
 int tpm2_make_encryption_session(Tpm2Context *c, const Tpm2Handle *primary, const Tpm2Handle *bind_key, Tpm2Handle **ret_session);
-int tpm2_make_exclusive_audit_session(Tpm2Context *c, Tpm2Handle **ret_session);
+int tpm2_make_exclusive_audit_session(Tpm2Context *c, TPMI_ALG_HASH hash, Tpm2Handle **ret_session);
 
 int tpm2_create_primary(Tpm2Context *c, const Tpm2Handle *session, ESYS_TR hierarchy, const TPM2B_PUBLIC *template, const TPM2B_SENSITIVE_CREATE *sensitive, TPM2B_PUBLIC **ret_public, Tpm2Handle **ret_handle);
 int tpm2_create(Tpm2Context *c, const Tpm2Handle *parent, const Tpm2Handle *session, const TPMT_PUBLIC *template, const TPMS_SENSITIVE_CREATE *sensitive, TPM2B_PUBLIC **ret_public, TPM2B_PRIVATE **ret_private);
@@ -338,6 +340,9 @@ int tpm2_make_policy_session(Tpm2Context *c, const Tpm2Handle *primary, const Tp
 int tpm2_policy_auth_value(Tpm2Context *c, const Tpm2Handle *session, TPM2B_DIGEST **ret_policy_digest);
 int tpm2_policy_nv_written(Tpm2Context *c, const Tpm2Handle *session, bool written_set, TPM2B_DIGEST **ret_policy_digest);
 int tpm2_policy_authorize_nv(Tpm2Context *c, const Tpm2Handle *session, const Tpm2Handle *nv_handle, TPM2B_DIGEST **ret_policy_digest);
+/* Note: tpm2_policy_pcr() and tpm2_policy_super_pcr() return -EUCLEAN if the TPM's global PCR update counter
+ * moved while the policy was submitted, i.e. if something extended a PCR in the meantime. That's transient,
+ * callers are supposed to restart the policy session and try again. */
 int tpm2_policy_pcr(Tpm2Context *c, const Tpm2Handle *session, const TPML_PCR_SELECTION *pcr_selection, TPM2B_DIGEST **ret_policy_digest);
 int tpm2_policy_or(Tpm2Context *c, const Tpm2Handle *session, const TPM2B_DIGEST *branches, size_t n_branches, TPM2B_DIGEST **ret_policy_digest);
 int tpm2_policy_super_pcr(Tpm2Context *c, const Tpm2Handle *session, const Tpm2PCRPrediction *prediction, uint16_t algorithm);
@@ -423,6 +428,7 @@ int tpm2_hmac_key_from_pin(Tpm2Context *c, const Tpm2Handle *session, const TPM2
 int tpm2_tpmt_signature_to_pem(const TPMT_SIGNATURE *signature, char **ret);
 int tpm2_tpmt_public_to_pem(const TPMT_PUBLIC *public, char **ret);
 
+const char* tpm2_hash_alg_to_string_tss2(TPMI_ALG_HASH alg);
 int tpm2_tpmt_signature_to_json(const TPMT_SIGNATURE *signature, sd_json_variant **ret);
 int tpm2_attest_info_to_json(const TPMT_SIG_SCHEME *scheme, const TPMS_ATTEST *attest, sd_json_variant **ret);
 int tpm2_tpmt_public_to_json(const TPMT_PUBLIC *public, sd_json_variant **ret);
@@ -622,6 +628,9 @@ int tpm2_parse_pcr_argument(const char *arg, Tpm2PCRValue **ret_pcr_values, size
 int tpm2_parse_pcr_argument_append(const char *arg, Tpm2PCRValue **pcr_values, size_t *n_pcr_values);
 int tpm2_parse_pcr_argument_to_mask(const char *arg, uint32_t *mask);
 
+/* Note: tpm2_load_pcr_signature() returns -ENOENT if there is no such file, and -EBADMSG if there is one but
+ * it cannot be parsed. In particular it does not propagate the JSON parser's -EUCLEAN, which means something
+ * else to the TPM2 callers of this. */
 int tpm2_load_pcr_signature(const char *path, sd_json_variant **ret);
 int tpm2_load_pcr_public_key(const char *path, void **ret_pubkey, size_t *ret_pubkey_size);
 

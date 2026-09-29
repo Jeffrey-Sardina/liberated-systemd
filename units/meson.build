@@ -794,8 +794,18 @@ units = [
         },
         { 'file' : 'systemd-report-cgroup.socket' },
         { 'file' : 'systemd-report-cgroup@.service.in' },
+        {
+          'file' : 'systemd-report-diskspace.socket',
+          'conditions' : ['HAVE_LIBMOUNT'],
+        },
+        {
+          'file' : 'systemd-report-diskspace@.service.in',
+          'conditions' : ['HAVE_LIBMOUNT'],
+        },
         { 'file' : 'systemd-report-files.socket' },
         { 'file' : 'systemd-report-files@.service.in' },
+        { 'file' : 'systemd-report-hwmon.socket' },
+        { 'file' : 'systemd-report-hwmon@.service.in' },
         {
           'file' : 'systemd-report-sign-plain.socket',
           'conditions' : ['HAVE_OPENSSL'],

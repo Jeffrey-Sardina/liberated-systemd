@@ -4,7 +4,7 @@ executables += [
         libexec_template + {
                 'name' : 'systemd-report',
                 'public' : true,
-                'export' : files(
+                'sources' : files(
                         'report.c',
                         'report-generate.c',
                         'report-sign.c',
@@ -17,28 +17,44 @@ executables += [
         libexec_template + {
                 'name' : 'systemd-report-basic',
                 'public' : true,
-                'export' : files(
+                'sources' : files(
                         'report-basic.c',
                         'report-basic-server.c',
                 ),
         },
         libexec_template + {
                 'name' : 'systemd-report-cgroup',
-                'export' : files(
+                'sources' : files(
                         'report-cgroup.c',
                         'report-cgroup-server.c',
                 ),
         },
         libexec_template + {
+                'name' : 'systemd-report-diskspace',
+                'sources' : files(
+                        'report-diskspace.c',
+                        'report-diskspace-server.c',
+                ),
+                'dependencies' : libmount_cflags,
+                'conditions' : ['HAVE_LIBMOUNT'],
+        },
+        libexec_template + {
                 'name' : 'systemd-report-files',
-                'export' : files(
+                'sources' : files(
                         'report-files.c',
                         'report-files-server.c',
                 ),
         },
         libexec_template + {
+                'name' : 'systemd-report-hwmon',
+                'sources' : files(
+                        'report-hwmon.c',
+                        'report-hwmon-server.c',
+                ),
+        },
+        libexec_template + {
                 'name' : 'systemd-report-sign-plain',
-                'export' : files(
+                'sources' : files(
                         'report-sign-plain.c',
                 ),
                 'dependencies' : libopenssl_cflags,
@@ -46,7 +62,7 @@ executables += [
         },
         libexec_template + {
                 'name' : 'systemd-report-sign-tpm2',
-                'export': files(
+                'sources': files(
                         'report-sign-tpm2.c',
                 ),
                 'dependencies' : [
@@ -60,7 +76,7 @@ executables += [
         },
         libexec_template + {
                 'name' : 'systemd-report-sign-tsm',
-                'export' : files(
+                'sources' : files(
                         'report-sign-tsm.c',
                 ),
         },

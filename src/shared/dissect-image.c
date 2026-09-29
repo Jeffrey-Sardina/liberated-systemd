@@ -966,16 +966,31 @@ static int compare_arch(Architecture a, Architecture b) {
         return 0;
 }
 
-static bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const char *label) {
+bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const char *label) {
         assert(d < _PARTITION_DESIGNATOR_MAX);
 
         if (d < 0) /* For unspecified designators we have no filter expression */
                 return true;
 
-        if (!filter || !filter->pattern[d])
+        if (!filter)
                 return true;
 
-        return fnmatch(filter->pattern[d], strempty(label),  FNM_NOESCAPE) == 0;
+        const char *pattern = filter->pattern[d];
+
+        /* If there's no filter for this specific designator but it's a verity partition, fall back to the
+         * filter for the corresponding data partition. This ensures that e.g. image_filter=usr=250 also
+         * constrains which usr verity (and verity sig) partitions are selected. This assumes verity
+         * partitions carry the same label as their corresponding data partition. */
+        if (!pattern) {
+                PartitionDesignator data = partition_verity_to_data(d);
+                if (data >= 0)
+                        pattern = filter->pattern[data];
+        }
+
+        if (!pattern)
+                return true;
+
+        return fnmatch(pattern, strempty(label), FNM_NOESCAPE) == 0;
 }
 
 static int dissect_image_from_unpartitioned(
@@ -1309,7 +1324,7 @@ static int dissect_image(
                 start = sym_blkid_partition_get_start(pp);
                 if (start < 0)
                         return errno_or_else(EIO);
-                if ((uint64_t) start >= UINT64_MAX/512)
+                if ((uint64_t) start > INT64_MAX / 512)
                         return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
                                                "Partition start LBA too large to convert to a byte offset, refusing.");
 
@@ -1317,9 +1332,14 @@ static int dissect_image(
                 size = sym_blkid_partition_get_size(pp);
                 if (size < 0)
                         return errno_or_else(EIO);
-                if ((uint64_t) size >= UINT64_MAX/512)
+                if ((uint64_t) size > INT64_MAX / 512)
                         return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
                                                "Partition size in LBA too large to convert to a byte offset, refusing.");
+
+                /* Ensure the partition's exclusive end LBA can be converted to a byte offset. */
+                if ((uint64_t) start + (uint64_t) size > INT64_MAX / 512)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                               "Partition end LBA too large to convert to a byte offset, refusing.");
 
                 /* While probing we need the non-diskseq device node name to access the thing, hence mask off
                  * DISSECT_IMAGE_DISKSEQ_DEVNODE. */
