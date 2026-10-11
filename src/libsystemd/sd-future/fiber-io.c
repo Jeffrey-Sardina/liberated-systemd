@@ -32,6 +32,10 @@ static ssize_t fiber_io_operation(
         if (!sd_fiber_is_running())
                 return func(fd, args);
 
+        r = sd_fiber_interrupted();
+        if (r < 0)
+                return r;
+
         sd_event *e = sd_fiber_get_event();
         assert(e);
 
@@ -213,6 +217,10 @@ int sd_fiber_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
         if (!sd_fiber_is_running())
                 return RET_NERRNO(connect(sockfd, addr, addrlen));
 
+        r = sd_fiber_interrupted();
+        if (r < 0)
+                return r;
+
         sd_event *e = sd_fiber_get_event();
         assert(e);
 
@@ -381,6 +389,10 @@ int sd_fiber_ppoll(struct pollfd *fds, size_t n_fds, const struct timespec *time
         if (!sd_fiber_is_running())
                 return RET_NERRNO(ppoll(fds, n_fds, timeout, sigmask));
 
+        r = sd_fiber_interrupted();
+        if (r < 0)
+                return r;
+
         /* When on a fiber signals are handled via sd-event hence we should never mess around with the
          * signal mask when running on a fiber. */
         assert_return(!sigmask, -EOPNOTSUPP);
@@ -463,8 +475,15 @@ int sd_fiber_ppoll(struct pollfd *fds, size_t n_fds, const struct timespec *time
          * the same event-loop tick (or the fd can become ready between the timer firing and us being
          * scheduled), and ppoll() semantics give events precedence over the timeout in that case. */
         int n = RET_NERRNO(ppoll(fds, n_fds, &(const struct timespec) {}, /* sigmask= */ NULL));
-        if (n != 0)
+        if (n != 0) {
+                /* sd_fiber_await() returned the expired timeout of an SD_FIBER_TIMEOUT() scope and cleared
+                 * it. Queue it again, so that the next suspension point returns it. Otherwise every later
+                 * wait in the scope runs without a deadline. */
+                if (r == -ETIME)
+                        assert_se(sd_fiber_resume(sd_fiber_get_current(), r) >= 0);
+
                 return n;
+        }
 
         /* No fds ready. The group's result is the winning child's result: 0 means the timer
          * (created with result=0) fired; r > 0 means an IO future fired (revents mask) but the

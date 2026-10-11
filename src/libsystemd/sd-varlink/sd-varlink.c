@@ -1165,7 +1165,11 @@ static int varlink_dispatch_fiber(sd_varlink *v, const char *method, sd_varlink_
         };
 
         _cleanup_(sd_future_cancel_unrefp) sd_future *f = NULL;
-        r = sd_fiber_new(v->server->event, method, varlink_fiber_entry, d, varlink_fiber_data_destroy, &f);
+        r = sd_fiber_new(v->server->event, method, varlink_fiber_entry, d, &f);
+        if (r < 0)
+                return r;
+
+        r = sd_fiber_set_destroy_callback(f, varlink_fiber_data_destroy);
         if (r < 0)
                 return r;
 
@@ -4271,16 +4275,17 @@ _public_ int sd_varlink_error_to_errno(const char *error, sd_json_variant *param
                 const char *error;
                 int value;
         } table[] = {
-                { SD_VARLINK_ERROR_DISCONNECTED,           -ECONNRESET    },
-                { SD_VARLINK_ERROR_TIMEOUT,                -ETIMEDOUT     },
-                { SD_VARLINK_ERROR_PROTOCOL,               -EPROTO        },
-                { SD_VARLINK_ERROR_INTERFACE_NOT_FOUND,    -EADDRNOTAVAIL },
-                { SD_VARLINK_ERROR_METHOD_NOT_FOUND,       -ENXIO         },
-                { SD_VARLINK_ERROR_METHOD_NOT_IMPLEMENTED, -ENOTTY        },
-                { SD_VARLINK_ERROR_INVALID_PARAMETER,      -EINVAL        },
-                { SD_VARLINK_ERROR_PERMISSION_DENIED,      -EACCES        },
-                { SD_VARLINK_ERROR_EXPECTED_MORE,          -EBADE         },
-                { SD_VARLINK_ERROR_EXPECTED_UPGRADE,       -EPROTOTYPE    },
+                { SD_VARLINK_ERROR_DISCONNECTED,            -ECONNRESET    },
+                { SD_VARLINK_ERROR_TIMEOUT,                 -ETIMEDOUT     },
+                { SD_VARLINK_ERROR_PROTOCOL,                -EPROTO        },
+                { SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED, -EOPNOTSUPP    },
+                { SD_VARLINK_ERROR_INTERFACE_NOT_FOUND,     -EADDRNOTAVAIL },
+                { SD_VARLINK_ERROR_METHOD_NOT_FOUND,        -ENXIO         },
+                { SD_VARLINK_ERROR_METHOD_NOT_IMPLEMENTED,  -ENOTTY        },
+                { SD_VARLINK_ERROR_INVALID_PARAMETER,       -EINVAL        },
+                { SD_VARLINK_ERROR_PERMISSION_DENIED,       -EACCES        },
+                { SD_VARLINK_ERROR_EXPECTED_MORE,           -EBADE         },
+                { SD_VARLINK_ERROR_EXPECTED_UPGRADE,        -EPROTOTYPE    },
         };
 
         int r;

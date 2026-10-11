@@ -651,7 +651,7 @@ static int dispatch_unit_method(sd_bus *bus, BusWaitForJobs *w, Set *units, cons
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, job, BUS_WAIT_JOBS_LOG_ERROR, /* extra_args= */ NULL);
+                r = bus_wait_for_jobs_one(w, job, BUS_WAIT_JOBS_LOG_ERROR);
                 if (r < 0)
                         log_warning_errno(r, "Failed to wait for %s job of unit '%s', ignoring: %m", m, unit);
         }
@@ -3030,12 +3030,13 @@ static int vl_method_on_completed_update(sd_varlink *link, sd_json_variant *para
         /* Triggered by systemd-sysupdate after an update completed. We deliberately ignore all parameters
          * (we don't even dispatch them). This method is reached through the sysext socket, but a single
          * notification refreshes both image classes, so freshly downloaded sysexts and confexts are both
-         * picked up, equivalent to "systemd-sysext refresh" plus "systemd-confext refresh". We attempt both
-         * classes and only fail afterwards, so a problem with one does not prevent refreshing the other. */
+         * picked up, equivalent to "systemd-confext refresh" plus "systemd-sysext refresh", in the same order
+         * as at boot. We attempt both classes and only fail afterwards, so a problem with one does not
+         * prevent refreshing the other. */
 
         r = 0;
-        RET_GATHER(r, refresh_class(IMAGE_SYSEXT));
         RET_GATHER(r, refresh_class(IMAGE_CONFEXT));
+        RET_GATHER(r, refresh_class(IMAGE_SYSEXT));
         if (r < 0)
                 return r;
 

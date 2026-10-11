@@ -4,9 +4,10 @@
 #include "sd-future.h"
 
 #include "alloc-util.h"
-#include "errno-util.h"
 #include "event-future.h"
 #include "event-util.h"
+#include "future-internal.h"
+#include "list.h"
 #include "log.h"
 #include "macro.h"
 #include "set.h"
@@ -44,12 +45,15 @@ struct sd_future {
 
         Set *slots;
 
+        LIST_HEAD(FutureWaiter, waiters);
+
         const sd_future_ops *ops;
 
         /* Opaque per-future state owned by the future implementation (the code that called
          * sd_future_new()). The ops callbacks and external code access this state via
-         * sd_future_get_private(). */
-        void *private;
+         * sd_future_get_private(). The element type max_align_t aligns this array for any struct that a
+         * future implementation stores in it. */
+        max_align_t private[];
 };
 
 static int slot_dispatch_handler(sd_event_source *src, void *userdata) {
@@ -78,21 +82,40 @@ static int slot_dispatch_handler(sd_event_source *src, void *userdata) {
         return r;
 }
 
-static int slot_arm(sd_future_slot *s) {
-        int r = 0;
+static void slot_arm(sd_future_slot *s) {
+        assert(s);
+
+        /* In a forked child, the event loop belongs to the parent process and never dispatches the
+         * callback. A finished event loop never dispatches the callback either. Enabling a defer or exit
+         * source does not allocate, so any other failure is a programming error. */
+        if (event_origin_changed(s->future->event) ||
+            sd_event_get_state(s->future->event) == SD_EVENT_FINISHED)
+                return;
 
         /* Exit may be requested after arming but before dispatching the callback. */
-        RET_GATHER(r, sd_event_source_set_enabled(s->defer_source, SD_EVENT_ONESHOT));
-        RET_GATHER(r, sd_event_source_set_enabled(s->exit_source, SD_EVENT_ONESHOT));
-        if (r < 0)
-                return log_debug_errno(r, "Failed to arm future callback: %m");
+        assert_se(sd_event_source_set_enabled(s->defer_source, SD_EVENT_ONESHOT) >= 0);
+        assert_se(sd_event_source_set_enabled(s->exit_source, SD_EVENT_ONESHOT) >= 0);
+}
 
-        return 0;
+void future_add_waiter(sd_future *target, FutureWaiter *waiter) {
+        assert(target);
+        assert(waiter);
+        assert(waiter->fiber);
+        assert(!waiter->target);
+
+        waiter->target = sd_future_ref(target);
+        LIST_PREPEND(waiters, target->waiters, waiter);
+}
+
+sd_future* future_remove_waiter(FutureWaiter *waiter) {
+        assert(waiter);
+
+        sd_future *target = ASSERT_PTR(TAKE_PTR(waiter->target));
+        LIST_REMOVE(waiters, target->waiters, waiter);
+        return target;
 }
 
 int sd_future_resolve(sd_future *f, int result) {
-        int r = 0;
-
         assert_return(f, -EINVAL);
         assert_return(f->state == SD_FUTURE_PENDING, -ESTALE);
 
@@ -104,9 +127,14 @@ int sd_future_resolve(sd_future *f, int result) {
          * and callbacks dropping the future's last ref. */
         sd_future_slot *s;
         SET_FOREACH(s, f->slots)
-                RET_GATHER(r, slot_arm(s));
+                slot_arm(s);
 
-        return r;
+        /* Waiters are only woken up, never run from here: they unlink themselves once they resume, and
+         * the wait reports completion separately from the result. */
+        LIST_FOREACH(waiters, w, f->waiters)
+                assert_se(sd_fiber_resume(w->fiber, 0) >= 0);
+
+        return 0;
 }
 
 static sd_future* sd_future_free(sd_future *f) {
@@ -115,6 +143,7 @@ static sd_future* sd_future_free(sd_future *f) {
          * sd_future_cancel_unref() (non-fiber, synchronous-cancel impls) or
          * sd_future_cancel_wait_unref() (fiber, awaits actual resolution). */
         assert(f->state == SD_FUTURE_RESOLVED);
+        assert(!f->waiters); /* Waiters hold a reference. */
 
         /* Any slot still in f->slots at this point must be floating: non-floating slots own
          * a ref on f, so if any existed we wouldn't have reached free. (Slots can be added
@@ -172,28 +201,18 @@ int sd_future_new(sd_event *e, const sd_future_ops *ops, sd_future **ret) {
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(ops, -EINVAL);
         assert_return(ops->size >= endoffsetof_field(sd_future_ops, set_priority), -EINVAL);
-        assert_return(ops->alloc, -EINVAL);
-        assert_return(ops->free, -EINVAL);
         assert_return(ops->cancel, -EINVAL);
         assert_return(ret, -EINVAL);
 
-        sd_future *f = new(sd_future, 1);
+        sd_future *f = malloc0(offsetof(sd_future, private) + ops->private_size);
         if (!f)
                 return -ENOMEM;
 
-        *f = (sd_future) {
-                .n_ref = 1,
-                .state = SD_FUTURE_PENDING,
-                .ops = ops,
-        };
-
-        f->private = ops->alloc();
-        if (!f->private) {
-                free(f);
-                return -ENOMEM;
-        }
-
+        f->n_ref = 1;
+        f->state = SD_FUTURE_PENDING;
+        f->ops = ops;
         f->event = sd_event_ref(e);
+
         *ret = f;
         return 0;
 }
@@ -216,7 +235,12 @@ int sd_future_result(sd_future *f) {
 
 void* sd_future_get_private(sd_future *f) {
         assert_return(f, NULL);
-        return f->private;
+        return f->ops->private_size > 0 ? f->private : NULL;
+}
+
+sd_future* sd_future_from_private(void *p) {
+        assert_return(p, NULL);
+        return container_of(p, sd_future, private);
 }
 
 const sd_future_ops* sd_future_get_ops(sd_future *f) {
@@ -306,11 +330,8 @@ int sd_future_add_callback(sd_future *f, sd_future_slot **ret_slot, sd_future_fu
         if (r < 0)
                 return r;
 
-        if (f->state == SD_FUTURE_RESOLVED) {
-                r = slot_arm(s);
-                if (r < 0)
-                        return r;
-        }
+        if (f->state == SD_FUTURE_RESOLVED)
+                slot_arm(s);
 
         r = set_ensure_put(&f->slots, &trivial_hash_ops, s);
         if (r < 0)

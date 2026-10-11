@@ -20,7 +20,9 @@
 #include "architecture.h"
 #include "errno-util.h"
 #include "event-future.h"
+#include "event-util.h"
 #include "fiber-ops.h"
+#include "future-internal.h"
 #include "log-context.h"
 #include "log.h"
 #include "memory-util.h"
@@ -67,7 +69,12 @@ typedef struct Fiber {
         bool result_pending;            /* sd_fiber_resume() stashed a value that fiber_swap() hasn't consumed yet */
 
         sd_future *floating;            /* Self-ref held while the fiber is floating; dropped on resolve. */
-        sd_future *awaiting;            /* Target of the wait the fiber is suspended in, if any. */
+        FutureWaiter wait;
+
+        /* The timers of the SD_FIBER_TIMEOUT() scopes the fiber is in, innermost last. The scopes own the
+         * timers. */
+        sd_future **timeouts;
+        size_t n_timeouts;
 
         sd_event_source *defer_event_source;
         sd_event_source *exit_event_source;
@@ -132,7 +139,7 @@ static int fiber_allocate_stack(size_t size, void **ret) {
         if (r == -EINVAL)
                 r = RET_NERRNO(mprotect(guard, page_size(), PROT_NONE));
         if (r < 0) {
-                (void) munmap(stack, size);
+                munmap_safe(stack, size);
                 return r;
         }
 
@@ -212,6 +219,9 @@ _noreturn_ static void fiber_entry_point(void) {
                 LOG_CONTEXT_PUSH_KEY_VALUE("FIBER=", fiber->name);
 
                 fiber->result = fiber->func(fiber->userdata);
+                /* The function returned, so no suspension point is left to report a queued interruption.
+                 * Drop it. */
+                fiber->result_pending = false;
                 fiber->state = FIBER_STATE_COMPLETED;
         }
 
@@ -321,7 +331,7 @@ static const FiberOps fiber_ops = {
         .read = sd_fiber_read,
         .write = sd_fiber_write,
         .timeout = sd_fiber_timeout,
-        .cancel_wait_unref = sd_future_cancel_wait_unref,
+        .timeout_unref = sd_fiber_timeout_unref,
 };
 
 static void fiber_enter(sd_future *f, sd_future *prev, void **fake_stack_save) {
@@ -484,10 +494,6 @@ static int fiber_on_exit(sd_event_source *s, void *userdata) {
         return fiber_run(f);
 }
 
-static void* fiber_alloc(void) {
-        return new0(Fiber, 1);
-}
-
 static void fiber_free(sd_future *f) {
         Fiber *fiber = fiber_get(f);
 
@@ -504,6 +510,7 @@ static void fiber_free(sd_future *f) {
          * registered cleanups to run. This covers the partial-construction failure path in sd_fiber_new()
          * as well as fibers that are unrefed before the event loop ever dispatches them. */
         assert(IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_COMPLETED));
+        assert(!fiber->wait.target);
 
         if (fiber->destroy)
                 fiber->destroy(fiber->userdata);
@@ -513,14 +520,13 @@ static void fiber_free(sd_future *f) {
                 VALGRIND_STACK_DEREGISTER(fiber->stack_id);
 #endif
 
-        if (fiber->stack.iov_base)
-                (void) munmap(fiber->stack.iov_base, fiber->stack.iov_len);
+        munmap_safe(fiber->stack.iov_base, fiber->stack.iov_len);
 
         sd_event_source_disable_unref(fiber->defer_event_source);
         sd_event_source_disable_unref(fiber->exit_event_source);
 
+        free(fiber->timeouts);
         free(fiber->name);
-        free(fiber);
 }
 
 sd_future* sd_fiber_get_current(void) {
@@ -591,6 +597,20 @@ int sd_fiber_suspend(void) {
         return fiber_swap(FIBER_STATE_SUSPENDED);
 }
 
+int sd_fiber_interrupted(void) {
+        sd_future *f = sd_fiber_get_current();
+
+        assert_return(f, -ESRCH);
+
+        Fiber *fiber = fiber_get(f);
+
+        if (!fiber->result_pending || !IN_SET(fiber->result, -ECANCELED, -ETIME))
+                return 0;
+
+        fiber->result_pending = false;
+        return TAKE_GENERIC(fiber->result, int, 0);
+}
+
 static int fiber_set_priority(sd_future *f, int64_t priority) {
         Fiber *fiber = fiber_get(f);
         int r = 0;
@@ -610,8 +630,6 @@ static int fiber_set_priority(sd_future *f, int64_t priority) {
 static const sd_future_ops fiber_future_ops;
 
 int sd_fiber_resume(sd_future *f, int result) {
-        int r;
-
         assert_return(f, -EINVAL);
         assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
 
@@ -637,16 +655,21 @@ int sd_fiber_resume(sd_future *f, int result) {
 
         assert(IN_SET(fiber->state, FIBER_STATE_READY, FIBER_STATE_SUSPENDED));
 
-        /* READY may need moving from defer source to exit source scheduling. Arm before changing state
-         * so a failure cannot leave a suspended fiber marked READY without a dispatch. */
+        /* In a forked child, the event loop belongs to the parent process and never dispatches the
+         * fiber. A finished event loop never dispatches the fiber either. */
+        if (event_origin_changed(sd_future_get_event(f)) ||
+            sd_event_get_state(sd_future_get_event(f)) == SD_EVENT_FINISHED)
+                return 0;
+
+        /* A READY fiber may have to move from its defer source to its exit source, if the event loop
+         * started exiting since the fiber was scheduled. Enabling or disabling a defer or exit source
+         * does not allocate, so a failure is a programming error. */
         sd_event_source *source = fiber_current_event_source(f);
-        r = sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return r;
+        assert_se(sd_event_source_set_enabled(source, SD_EVENT_ONESHOT) >= 0);
 
         fiber->state = FIBER_STATE_READY;
         if (source == fiber->exit_event_source)
-                return sd_event_source_set_enabled(fiber->defer_event_source, SD_EVENT_OFF);
+                assert_se(sd_event_source_set_enabled(fiber->defer_event_source, SD_EVENT_OFF) >= 0);
 
         return 0;
 }
@@ -655,13 +678,13 @@ int sd_fiber_resume(sd_future *f, int result) {
  * fiber resolves its own future when it finishes running; cancellation only queues an interruption. */
 static const sd_future_ops fiber_future_ops = {
         .size = sizeof(sd_future_ops),
-        .alloc = fiber_alloc,
+        .private_size = sizeof(Fiber),
         .free = fiber_free,
         .cancel = fiber_cancel,
         .set_priority = fiber_set_priority,
 };
 
-int sd_fiber_new(sd_event *e, const char *name, sd_fiber_func_t func, void *userdata, sd_fiber_destroy_t destroy, sd_future **ret) {
+int sd_fiber_new(sd_event *e, const char *name, sd_fiber_func_t func, void *userdata, sd_future **ret) {
         int r;
 
         assert_return(e, -EINVAL);
@@ -696,6 +719,7 @@ int sd_fiber_new(sd_event *e, const char *name, sd_fiber_func_t func, void *user
                 .name = strdup(name),
                 .func = func,
                 .userdata = userdata,
+                .wait.fiber = f,
         };
         if (!fiber->name)
                 return -ENOMEM;
@@ -761,11 +785,26 @@ int sd_fiber_new(sd_event *e, const char *name, sd_fiber_func_t func, void *user
                 f = sd_future_unref(f);
         }
 
-        /* We only take ownership of the given userdata pointer on success so assign the destroy callback
-         * at the very end so we don't clean up the userdata pointer on failure. */
-        fiber->destroy = destroy;
-
         return 0;
+}
+
+int sd_fiber_set_destroy_callback(sd_future *f, sd_fiber_destroy_t callback) {
+        assert_return(f, -EINVAL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
+
+        fiber_get(f)->destroy = callback;
+        return 0;
+}
+
+int sd_fiber_get_destroy_callback(sd_future *f, sd_fiber_destroy_t *ret) {
+        assert_return(f, -EINVAL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
+
+        sd_fiber_destroy_t callback = fiber_get(f)->destroy;
+        if (ret)
+                *ret = callback;
+
+        return !!callback;
 }
 
 int sd_fiber_set_floating(sd_future *f, int b) {
@@ -829,30 +868,11 @@ int sd_fiber_sleep(uint64_t usec) {
         return sd_future_result(timer);
 }
 
-static int fiber_wait_callback(sd_future *target, void *userdata) {
-        /* Completion only wakes the waiter. Passing the future's error here would make it
-         * indistinguishable from an interruption of the waiting fiber. */
-        return sd_fiber_resume(userdata, 0);
-}
-
-static int fiber_suspend_for(sd_future *f, sd_future *target) {
-        Fiber *fiber = fiber_get(f);
-        int r;
-
-        assert(!fiber->awaiting);
-
-        fiber->awaiting = target;
-        r = sd_fiber_suspend();
-        fiber->awaiting = NULL;
-
-        return r;
-}
-
 sd_future* sd_fiber_get_awaiting(sd_future *f) {
         assert_return(f, NULL);
         assert_return(sd_future_get_ops(f) == &fiber_future_ops, NULL);
 
-        return fiber_get(f)->awaiting;
+        return fiber_get(f)->wait.target;
 }
 
 int sd_fiber_await(sd_future *target) {
@@ -868,15 +888,25 @@ int sd_fiber_await(sd_future *target) {
                 return 0;
 
         /* The fiber is executing inside event dispatch, so its loop cannot have finished yet.
-         * Waiting during exit is supported by the slot's exit source. */
+         * Waking up during exit is handled by the fiber's own exit source. */
         assert(sd_event_get_state(sd_future_get_event(f)) != SD_EVENT_FINISHED);
 
-        _cleanup_(sd_future_slot_unrefp) sd_future_slot *slot = NULL;
-        r = sd_future_add_callback(target, &slot, fiber_wait_callback, f);
-        if (r < 0)
-                return r;
+        future_add_waiter(target, &fiber_get(f)->wait);
+        r = sd_fiber_suspend();
 
-        r = fiber_suspend_for(f, target);
+        /* The caller does not have to own a reference to the target. The reference that the wait held
+         * may then be the last one. Release it only after the checks below, or they read freed memory. */
+        _unused_ _cleanup_(sd_future_unrefp) sd_future *ref = future_remove_waiter(&fiber_get(f)->wait);
+
+        /* The target can resolve before a cancellation or timeout wakes us up. The operation has then
+         * already taken effect: a channel receive, for example, took an item out of the channel. If we
+         * reported the interruption, the caller would assume that nothing happened. Freeing the future
+         * would then destroy the received item before anyone saw it. Report the completion, and queue
+         * the interruption again so that the next suspension point returns it. */
+        if (IN_SET(r, -ECANCELED, -ETIME) && sd_future_state(target) == SD_FUTURE_RESOLVED) {
+                assert_se(sd_fiber_resume(f, r) >= 0);
+                return 0;
+        }
         if (r < 0)
                 return r;
 
@@ -898,9 +928,12 @@ sd_future* sd_future_cancel_wait_unref(sd_future *f) {
         if (!self)
                 return sd_future_cancel_unref(f);
 
-        /* Invalid calls still consume their reference. Releasing the last reference to a pending
-         * future remains a programming error, diagnosed by sd_future_free(). */
-        assert_return(f != self, sd_future_unref(f));
+        /* A fiber cannot wait for itself. Invalid calls still consume their reference: releasing the
+         * last reference to a pending future remains a programming error, diagnosed by sd_future_free(). */
+        if (f == self) {
+                log_debug("Refusing to wait for the calling fiber itself, releasing it without cancelling.");
+                return sd_future_unref(f);
+        }
 
         for (;;) {
                 r = sd_future_cancel(f);
@@ -910,20 +943,14 @@ sd_future* sd_future_cancel_wait_unref(sd_future *f) {
                 if (sd_future_state(f) != SD_FUTURE_PENDING)
                         break;
 
-                /* Synchronous cancellation needs no dispatch and works across event loops too. */
-                assert_return(sd_future_get_event(f) == sd_future_get_event(self), sd_future_unref(f));
-
-                /* Unlike sd_fiber_await(), a failure to set up the wait must be told apart from a
-                 * wait that was interrupted or woken spuriously. Retrying the former would spin
-                 * without ever yielding to the event loop, so nothing could resolve the future. */
-                _cleanup_(sd_future_slot_unrefp) sd_future_slot *slot = NULL;
-                r = sd_future_add_callback(f, &slot, fiber_wait_callback, self);
-                if (r < 0) {
-                        log_debug_errno(r, "Failed to wait for future to finish, giving up: %m");
+                /* Synchronous cancellation needs no dispatch and works across event loops too, but
+                 * waiting for an asynchronous one does not. */
+                if (sd_future_get_event(f) != sd_future_get_event(self)) {
+                        log_debug("Cannot wait for a future on another event loop to finish cancelling, giving up.");
                         break;
                 }
 
-                r = fiber_suspend_for(self, f);
+                r = sd_fiber_await(f);
 
                 if (sd_future_state(f) == SD_FUTURE_RESOLVED) {
                         int fr = sd_future_result(f);
@@ -991,5 +1018,39 @@ sd_future* sd_fiber_timeout(uint64_t timeout) {
         if (r < 0)
                 return NULL;
 
+        Fiber *fiber = fiber_get(f);
+        if (!GREEDY_REALLOC(fiber->timeouts, fiber->n_timeouts + 1))
+                return NULL;
+
+        fiber->timeouts[fiber->n_timeouts++] = timer;
         return TAKE_PTR(timer);
+}
+
+static bool fiber_timed_out(Fiber *fiber) {
+        FOREACH_ARRAY(t, fiber->timeouts, fiber->n_timeouts)
+                if (sd_future_state(*t) == SD_FUTURE_RESOLVED && sd_future_result(*t) == -ETIME)
+                        return true;
+
+        return false;
+}
+
+sd_future* sd_fiber_timeout_unref(sd_future *timer) {
+        if (!timer)
+                return NULL;
+
+        Fiber *fiber = fiber_get(ASSERT_PTR(sd_fiber_get_current()));
+
+        assert(fiber->n_timeouts > 0 && fiber->timeouts[fiber->n_timeouts - 1] == timer);
+        fiber->n_timeouts--;
+
+        /* sd_fiber_await() queues -ETIME again if the awaited future resolved first. If no suspension
+         * point in the scope returned that -ETIME, the first suspension point after the scope returns it,
+         * although no deadline applies there. A queued -ETIME does not record which timer queued it. Keep
+         * it if the timer of an enclosing scope expired, because that scope still has to return -ETIME. */
+        if (fiber->result_pending && fiber->result == -ETIME && !fiber_timed_out(fiber)) {
+                fiber->result_pending = false;
+                fiber->result = 0;
+        }
+
+        return sd_future_cancel_wait_unref(timer);
 }

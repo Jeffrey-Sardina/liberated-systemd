@@ -794,7 +794,7 @@ static int process_hostname(int rfd, sd_varlink **mute_console_link) {
         }
 
         if (vl) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+                sd_json_variant *reply = NULL;
                 const char *error_id = NULL;
                 r = sd_varlink_callbo(
                                 vl,
@@ -1707,7 +1707,7 @@ static int reload_vconsole(sd_bus **bus) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = bus_wait_for_jobs_one(w, object, BUS_WAIT_JOBS_LOG_ERROR, NULL);
+        r = bus_wait_for_jobs_one(w, object, BUS_WAIT_JOBS_LOG_ERROR);
         if (r < 0)
                 return log_error_errno(r, "Failed to wait for systemd-vconsole-setup.service/restart: %m");
         return 0;

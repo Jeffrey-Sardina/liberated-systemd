@@ -48,6 +48,7 @@ shared_sources = files(
         'condition.c',
         'conf-parser.c',
         'copy.c',
+        'counters-file.c',
         'coredump-util.c',
         'cpu-set-util.c',
         'creds-util.c',
@@ -212,7 +213,6 @@ shared_sources = files(
         'tomoyo-util.c',
         'tpm2-util.c',
         'tpm2-event-log.c',
-        'tsm-report.c',
         'udev-util.c',
         'unit-file.c',
         'user-record-nss.c',
@@ -307,8 +307,12 @@ if conf.get('HAVE_LIBBPF') == 1
         shared_sources += files('bpf-link.c')
 endif
 
-if conf.get('HAVE_TPM2') == 1
-        shared_sources += files('tpm2-report.c')
+if conf.get('ENABLE_REPORT') == 1
+        shared_sources += files('tsm-report.c')
+
+        if conf.get('HAVE_TPM2') == 1
+                shared_sources += files('tpm2-report.c')
+        endif
 endif
 
 generate_ip_protocol_list = files('generate-ip-protocol-list.sh')
@@ -327,7 +331,7 @@ gperf_file = custom_target(
 target1 = custom_target(
         input : gperf_file,
         output : 'ip-protocol-from-name.inc',
-        command : [gperf,
+        command : [gperf_cmdline,
                    '-L', 'ANSI-C', '-t', '--ignore-case',
                    '-N', 'lookup_ip_protocol',
                    '-H', 'hash_ip_protocol_name',
@@ -381,7 +385,7 @@ gperf_file = custom_target(
 dns_type_from_name_inc = custom_target(
         input : gperf_file,
         output : 'dns_type-from-name.inc',
-        command : [gperf,
+        command : [gperf_cmdline,
                    '-L', 'ANSI-C', '-t', '--ignore-case',
                    '-N', 'lookup_dns_type',
                    '-H', 'hash_dns_type_name',
