@@ -8,6 +8,7 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "time-util.h"
 
 struct acpi_table_header {
@@ -127,7 +128,8 @@ int acpi_get_boot_usec(usec_t *ret_loader_start, usec_t *ret_loader_exit) {
                         break;
                 if (rec->type != ACPI_FPDT_TYPE_BOOT)
                         continue;
-                if (rec->length != sizeof(struct acpi_fpdt_header))
+                if (rec->length != sizeof(struct acpi_fpdt_header) ||
+                    (char *)rec + rec->length > buf + l)
                         continue;
 
                 ptr = rec->ptr;
@@ -138,9 +140,9 @@ int acpi_get_boot_usec(usec_t *ret_loader_start, usec_t *ret_loader_exit) {
                 return -ENODATA;
 
         /* read Firmware Basic Boot Performance Data Record */
-        fd = open("/dev/mem", O_CLOEXEC|O_RDONLY);
+        fd = xopenat(AT_FDCWD, "/dev/mem", O_RDONLY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         ll = pread(fd, &hbrec, sizeof(struct acpi_fpdt_boot_header), ptr);
         if (ll < 0)

@@ -337,6 +337,9 @@ int dhcp_message_append_option_6rd(
         if (32 - ipv4masklen + prefixlen > 128)
                 return -EINVAL;
 
+        if (32 - ipv4masklen + prefixlen == 0)
+                return -EINVAL;
+
         if (n_br_addresses == 0)
                 return -EINVAL;
 
@@ -432,7 +435,7 @@ static int dhcp_message_append_option_fqdn(sd_dhcp_message *message, uint8_t fla
         buf[1] = is_client ? 0 : 255;
         buf[2] = is_client ? 0 : 255;
 
-        r = dns_name_to_wire_format(fqdn, buf + 3, sizeof(buf) - 3, false);
+        r = dns_name_to_wire_format(fqdn, buf + 3, sizeof(buf) - 3, /* canonical= */ false);
         if (r <= 0)
                 return r;
 
@@ -823,6 +826,11 @@ int dhcp_message_get_option_6rd(
          *               (32 - IPv4MaskLen) + 6rdPrefixLen MUST be less than or equal to 128. */
         uint8_t prefixlen = *p++;
         if (32 - ipv4masklen + prefixlen > 128)
+                return -EBADMSG;
+
+        /* The delegated prefix length is (32 - IPv4MaskLen) + 6rdPrefixLen. A zero-length delegated
+         * prefix would cover the whole IPv6 address space, refuse it. */
+        if (32 - ipv4masklen + prefixlen == 0)
                 return -EBADMSG;
 
         /* 6rdPrefix: The service provider's 6rd IPv6 prefix represented as a 16-octet IPv6 address.
@@ -1362,7 +1370,12 @@ static int dhcp_message_verify_header(
         if (header->hlen > sizeof_field(DHCPMessageHeader, chaddr))
                 return -EBADMSG;
 
-        if (hw_addr && memcmp_nn(header->chaddr, header->hlen, hw_addr->bytes, hw_addr->length) != 0)
+        if (arp_type == ARPHRD_INFINIBAND) {
+                /* RFC 4390: hlen must be 0 and chaddr zeroed, the link-layer address is never carried in
+                 * the header. Be a bit more lenient here and only check hlen. */
+                if (header->hlen != 0)
+                        return -EBADMSG;
+        } else if (hw_addr && memcmp_nn(header->chaddr, header->hlen, hw_addr->bytes, hw_addr->length) != 0)
                 return -EBADMSG;
 
         return 0;
@@ -1778,6 +1791,9 @@ int dhcp_message_send_raw(
                 .ll.sll_halen = dst_hw_addr->length,
         };
 
+        /* sll_addr only holds 8 bytes, longer addresses (e.g. the 20 bytes of InfiniBand) overflow into
+         * sockaddr_union's ll_buffer member, which is sized for that. sockaddr_ll_len() takes sll_halen into
+         * account, so the length passed to the kernel covers the whole address. */
         memcpy_safe(sa.ll.sll_addr, dst_hw_addr->bytes, dst_hw_addr->length);
 
         struct msghdr mh = {

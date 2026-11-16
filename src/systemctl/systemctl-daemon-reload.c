@@ -20,7 +20,7 @@ int daemon_reload(enum action action, bool graceful) {
 
         r = acquire_bus(BUS_MANAGER, &bus);
         if (r < 0)
-                return r;
+                return graceful ? 0 : r;
 
         polkit_agent_open_maybe();
 
@@ -43,7 +43,7 @@ int daemon_reload(enum action action, bool graceful) {
                 return bus_log_create_error(r);
 
         /* Reloading the daemon may take long, hence set a longer timeout here */
-        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
+        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, /* ret_reply= */ NULL);
 
         /* On reexecution, we expect a disconnect, not a reply */
         if (IN_SET(r, -ETIMEDOUT, -ECONNRESET) && action == ACTION_REEXEC)
@@ -60,6 +60,15 @@ int daemon_reload(enum action action, bool graceful) {
         }
 
         return 1;
+}
+
+int daemon_reload_after_vendor_install(void) {
+        /* Filesystem changes have already succeeded, so an unavailable manager must not fail the command. */
+
+        if (install_client_side() != INSTALL_CLIENT_SIDE_VENDOR || arg_no_reload)
+                return 0;
+
+        return daemon_reload(ACTION_RELOAD, /* graceful= */ true);
 }
 
 int verb_daemon_reload(int argc, char *argv[], uintptr_t _data, void *userdata) {

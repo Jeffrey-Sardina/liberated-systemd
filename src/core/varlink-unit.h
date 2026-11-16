@@ -8,8 +8,10 @@
 #define VARLINK_ERROR_UNIT_DBUS_SHUTTING_DOWN "io.systemd.Unit.DBusShuttingDown"
 #define VARLINK_ERROR_UNIT_UNIT_EXISTS "io.systemd.Unit.UnitExists"
 #define VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED "io.systemd.Unit.UnitTypeNotSupported"
+#define VARLINK_ERROR_UNIT_PROPERTY_NOT_SUPPORTED "io.systemd.Unit.PropertyNotSupported"
 #define VARLINK_ERROR_UNIT_BAD_SETTING "io.systemd.Unit.BadUnitSetting"
 #define VARLINK_ERROR_UNIT_ALREADY_BEING_WATCHED "io.systemd.Unit.AlreadyBeingWatched"
+#define VARLINK_ERROR_UNIT_PID_UNKNOWN "io.systemd.Unit.ProcessIdUnknown"
 
 int vl_method_list_units(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata);
 
@@ -31,5 +33,12 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
 void varlink_unit_send_change_signal(Unit *u);
 void varlink_job_send_change_signal(Job *j);
 void varlink_job_send_removed_signal(Job *j);
+void varlink_job_detach_client(Job *j);
+int varlink_job_stash_client_full(Manager *m, uint32_t job_id, sd_varlink *link, bool notify_job_changes, bool notify_unit_changes);
+void varlink_job_stash_client(Job *j);
+void varlink_job_unstash_client(Job *j);
+void varlink_job_drop_stashed_client(Manager *m, sd_varlink *link);
+void varlink_job_flush_stashed_clients(Manager *m);
 
 int varlink_error_no_such_unit(sd_varlink *v, const char *name);
+void varlink_error_or_close(sd_varlink *link, int error);

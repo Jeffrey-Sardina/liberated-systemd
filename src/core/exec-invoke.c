@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <grp.h>
+#include <linux/io_uring.h>
 #include <linux/securebits.h>
 #include <poll.h>
 #include <sched.h>
@@ -13,6 +14,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#include "sd-json.h"
 #include "sd-messages.h"
 #include "sd-varlink.h"
 
@@ -48,6 +50,7 @@
 #include "hexdecoct.h"
 #include "hostname-setup.h"
 #include "image-policy.h"
+#include "io-uring-filter.h"
 #include "io-util.h"
 #include "iovec-util.h"
 #include "journal-send.h"
@@ -61,6 +64,7 @@
 #include "namespace-util.h"
 #include "nsflags.h"
 #include "nsresource.h"
+#include "nulstr-util.h"
 #include "open-file.h"
 #include "osc-context.h"
 #include "pam-util.h"
@@ -70,6 +74,7 @@
 #include "proc-cmdline.h"
 #include "process-util.h"
 #include "psi-util.h"
+#include "ptybroker-client.h"
 #include "quota-util.h"
 #include "random-util.h"
 #include "rlimit-util.h"
@@ -125,7 +130,7 @@ static int flag_fds(
                  * since after all we want to pass these fds to our
                  * children */
 
-                r = fd_cloexec(fds[i], false);
+                r = fd_cloexec(fds[i], /* cloexec= */ false);
                 if (r < 0)
                         return r;
         }
@@ -138,11 +143,11 @@ static int open_null_as(int flags, int nfd) {
 
         assert(nfd >= 0);
 
-        fd = open("/dev/null", flags|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, "/dev/null", flags|O_NOCTTY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
-        return move_fd(fd, nfd, false);
+        return move_fd(fd, nfd, /* cloexec= */ false);
 }
 
 static int connect_journal_socket(
@@ -223,7 +228,7 @@ static int connect_logger_as(
         assert(ident);
         assert(nfd >= 0);
 
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         if (fd < 0)
                 return -errno;
 
@@ -253,7 +258,7 @@ static int connect_logger_as(
                     exec_output_forward_to_console(output)) < 0)
                 return -errno;
 
-        return move_fd(TAKE_FD(fd), nfd, false);
+        return move_fd(TAKE_FD(fd), nfd, /* cloexec= */ false);
 }
 
 static int open_terminal_as(const char *path, int flags, int nfd) {
@@ -266,7 +271,7 @@ static int open_terminal_as(const char *path, int flags, int nfd) {
         if (fd < 0)
                 return fd;
 
-        return move_fd(fd, nfd, false);
+        return move_fd(fd, nfd, /* cloexec= */ false);
 }
 
 static int acquire_path(const char *path, int flags, mode_t mode) {
@@ -278,16 +283,16 @@ static int acquire_path(const char *path, int flags, mode_t mode) {
         if (IN_SET(flags & O_ACCMODE_STRICT, O_WRONLY, O_RDWR))
                 flags |= O_CREAT;
 
-        fd = open(path, flags|O_NOCTTY, mode);
+        fd = xopenat_full(AT_FDCWD, path, flags|O_NOCTTY, /* xopen_flags= */ 0, mode);
         if (fd >= 0)
                 return TAKE_FD(fd);
 
-        if (errno != ENXIO) /* ENXIO is returned when we try to open() an AF_UNIX file system socket on Linux */
-                return -errno;
+        if (fd != -ENXIO) /* ENXIO is returned when we try to open() an AF_UNIX file system socket on Linux */
+                return fd;
 
         /* So, it appears the specified path could be an AF_UNIX socket. Let's see if we can connect to it. */
 
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         if (fd < 0)
                 return -errno;
 
@@ -309,6 +314,175 @@ static int acquire_path(const char *path, int flags, mode_t mode) {
                 return -errno;
 
         return TAKE_FD(fd);
+}
+
+static void pick_term_environment(
+                char **env,
+                const char **ret_term,
+                const char **ret_colorterm,
+                const char **ret_no_color) {
+
+        assert(ret_term);
+
+        /* Determines the terminal environment ($TERM/$COLORTERM/$NO_COLOR) to use when there is no physical
+         * terminal to derive it from — i.e. for ptybrokerd-allocated PTYs, and as the fallback in
+         * setup_term_environment(). Honours whatever is explicitly configured in the passed environment block,
+         * otherwise falls back to a franken-vt220 with truecolor support: vt220 is a safe bet (it supports
+         * PageUp/PageDown unlike vt100, and is near-universally available in terminfo/termcap), and while real
+         * DEC vt220 gear never actually supported color, virtually every terminal emulator does nowadays, so
+         * we explicitly claim color support via $COLORTERM=truecolor whenever we resort to this default. */
+
+        const char *term = strv_env_get(env, "TERM");
+        const char *colorterm = strv_env_get(env, "COLORTERM");
+        const char *no_color = strv_env_get(env, "NO_COLOR");
+
+        if (isempty(term)) {
+                term = FALLBACK_TERM;
+                if (isempty(colorterm))
+                        colorterm = "truecolor";
+        }
+
+        *ret_term = term;
+        if (ret_colorterm)
+                *ret_colorterm = empty_to_null(colorterm);
+        if (ret_no_color)
+                *ret_no_color = empty_to_null(no_color);
+}
+
+static int build_pass_environment(const ExecContext *c, char ***ret);
+
+static int acquire_broker_terminal(
+                const ExecContext *context,
+                const ExecParameters *params,
+                int *ret_fd) {
+
+        int r;
+
+        assert(context);
+        assert(params);
+        assert(ret_fd);
+
+        /* Acquires a pseudo TTY from ptybrokerd, for use as stdin/stdout/stderr. This is the service-side
+         * counterpart to "systemd-pty-forward --console=broker": the broker allocates the PTY and keeps its
+         * frontend (i.e. the "master" side) itself — either discarding whatever the service writes ("null")
+         * or forwarding it to the logs ("log") — while handing us the backend (i.e. the "slave" side), which
+         * we install as the service's standard I/O.
+         *
+         * If any of the three standard streams uses the "broker-log" flavour we ask the broker to write the
+         * terminal output to the logs, otherwise we let it discard it. */
+
+        bool log_output =
+                context->std_input == EXEC_INPUT_BROKER_LOG ||
+                context->std_output == EXEC_OUTPUT_BROKER_LOG ||
+                context->std_error == EXEC_OUTPUT_BROKER_LOG;
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        r = pty_broker_connect(params->runtime_scope, &vl);
+        if (r < 0)
+                return r;
+
+        /* We receive the backend file descriptor in the method reply, hence we need to allow fd passing on
+         * input. We never send any fds ourselves, so output fd passing stays off. */
+        r = sd_varlink_set_allow_fd_passing_input(vl, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enable file descriptor passing on ptybrokerd connection: %m");
+
+        /* Figure out the terminal environment for the PTY the same way setup_term_environment() derives it
+         * for the service itself, so that the broker-side view (used e.g. for the logs) matches the $TERM/
+         * $COLORTERM/$NO_COLOR the service will see. For that, merge the same environment sources (and in the
+         * same order) as the accum_env assembly in exec_invoke() does — i.e. the manager-supplied environment,
+         * PassEnvironment=, Environment= and EnvironmentFile=. $NO_COLOR follows no-color.org semantics: any
+         * non-empty value disables color, which the broker expresses as a boolean. */
+        _cleanup_strv_free_ char **pass_env = NULL;
+        r = build_pass_environment(context, &pass_env);
+        if (r < 0)
+                return log_oom();
+
+        _cleanup_strv_free_ char **merged_env = strv_env_merge(
+                        params->environment,
+                        pass_env,
+                        context->environment,
+                        params->files_env);
+        if (!merged_env)
+                return log_oom();
+
+        const char *term, *colorterm, *no_color;
+        pick_term_environment(merged_env, &term, &colorterm, &no_color);
+
+        /* The broker refuses bogus $TERM/$COLORTERM values (such as "unknown"), hence don't fail the whole
+         * service start because of them, but fall back to our defaults */
+        if (!term_env_valid(term))
+                term = FALLBACK_TERM;
+        if (colorterm && !term_env_valid(colorterm))
+                colorterm = NULL;
+
+        /* Also propagate the explicitly configured TTYColumns=/TTYRows= to the allocated PTY. Anything left
+         * unspecified (i.e. UINT_MAX) is omitted, in which case the broker applies its own defaults. */
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ts = NULL;
+        r = sd_json_buildo(
+                        &ts,
+                        SD_JSON_BUILD_PAIR_STRING("envTERM", term),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!colorterm, "envCOLORTERM", SD_JSON_BUILD_STRING(colorterm)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!no_color, "envNO_COLOR", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR_CONDITION(context->tty_cols != UINT_MAX, "columns", SD_JSON_BUILD_UNSIGNED(context->tty_cols)),
+                        SD_JSON_BUILD_PAIR_CONDITION(context->tty_rows != UINT_MAX, "lines", SD_JSON_BUILD_UNSIGNED(context->tty_rows)));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build terminal settings: %m");
+
+        const char *tag = context->syslog_identifier ?: params->unit_id;
+
+        _cleanup_free_ char *name = asprintf_safe(SD_ID128_FORMAT_STR "-" PID_FMT, SD_ID128_FORMAT_VAL(params->invocation_id), getpid_cached());
+        if (!name)
+                return log_oom();
+
+        uint64_t pidfdid;
+        if (pidfd_get_inode_id_self_cached(&pidfdid) >= 0)
+                if (strextendf(&name, "-%" PRIu64, pidfdid) < 0)
+                        return log_oom();
+
+        sd_json_variant *reply = NULL;
+        const char *error_id = NULL;
+        r = sd_varlink_callbo(
+                        vl,
+                        "io.systemd.PTYBroker.AcquirePty",
+                        &reply,
+                        &error_id,
+                        SD_JSON_BUILD_PAIR_STRING("name", name),
+                        SD_JSON_BUILD_PAIR_STRING("frontendType", log_output ? "log" : "null"),
+                        SD_JSON_BUILD_PAIR_STRING("backendType", "take"),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("monitor", false),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!params->unit_id, "description", SD_JSON_BUILD_STRING(params->unit_id)),
+                        SD_JSON_BUILD_PAIR_CONDITION(log_output && !!tag, "tag", SD_JSON_BUILD_STRING(tag)),
+                        SD_JSON_BUILD_PAIR_VARIANT("terminalSettings", ts));
+        if (r < 0)
+                return log_error_errno(r, "Failed to call AcquirePty(): %m");
+        if (error_id)
+                return log_error_errno(sd_varlink_error_to_errno(error_id, reply),
+                                       "Failed to acquire PTY from ptybrokerd: %s", error_id);
+
+        struct {
+                unsigned backend_fd_idx;
+        } p = {
+                .backend_fd_idx = UINT_MAX,
+        };
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "backendFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, voffsetof(p, backend_fd_idx), SD_JSON_MANDATORY },
+                {}
+        };
+
+        r = sd_json_dispatch(reply, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &p);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse AcquirePty() reply: %m");
+
+        int backend_fd = sd_varlink_take_fd(vl, p.backend_fd_idx);
+        if (backend_fd < 0)
+                return log_error_errno(backend_fd, "Failed to take PTY backend file descriptor from ptybrokerd: %m");
+
+        log_debug("Broker PTY acquired: %s", name);
+
+        *ret_fd = backend_fd;
+        return 0;
 }
 
 static int fixup_input(
@@ -334,6 +508,7 @@ static int setup_input(
                 const ExecContext *context,
                 const ExecParameters *params,
                 int socket_fd,
+                int broker_fd,
                 const int named_iofds[static 3]) {
 
         ExecInput i;
@@ -396,6 +571,20 @@ static int setup_input(
                 return r;
         }
 
+        case EXEC_INPUT_BROKER:
+        case EXEC_INPUT_BROKER_LOG:
+                assert(broker_fd >= 0);
+
+                if (dup2(broker_fd, STDIN_FILENO) < 0)
+                        return -errno;
+
+                /* This is a pseudo TTY, so make it our controlling terminal, just like we do for a passed-in
+                 * TTY fd above. */
+                if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0)
+                        log_debug_errno(errno, "Failed to make PTY broker terminal our controlling terminal: %m");
+
+                return STDIN_FILENO;
+
         case EXEC_INPUT_SOCKET:
                 assert(socket_fd >= 0);
 
@@ -404,7 +593,7 @@ static int setup_input(
         case EXEC_INPUT_NAMED_FD:
                 assert(named_iofds[STDIN_FILENO] >= 0);
 
-                (void) fd_nonblock(named_iofds[STDIN_FILENO], false);
+                (void) fd_nonblock(named_iofds[STDIN_FILENO], /* nonblock= */ false);
                 return RET_NERRNO(dup2(named_iofds[STDIN_FILENO], STDIN_FILENO));
 
         case EXEC_INPUT_DATA: {
@@ -414,7 +603,7 @@ static int setup_input(
                 if (fd < 0)
                         return fd;
 
-                return move_fd(fd, STDIN_FILENO, false);
+                return move_fd(fd, STDIN_FILENO, /* cloexec= */ false);
         }
 
         case EXEC_INPUT_FILE: {
@@ -430,7 +619,7 @@ static int setup_input(
                 if (fd < 0)
                         return fd;
 
-                return move_fd(fd, STDIN_FILENO, false);
+                return move_fd(fd, STDIN_FILENO, /* cloexec= */ false);
         }
 
         default:
@@ -465,7 +654,7 @@ static bool can_inherit_stderr_from_stdout(const ExecContext *context) {
         return true;
 }
 
-static int maybe_inherit_stdout_from_stdin(const ExecContext *context, ExecInput i) {
+static int maybe_inherit_stdout_from_stdin(const ExecContext *context, ExecInput i, int broker_fd) {
         int r;
 
         assert(context);
@@ -473,9 +662,20 @@ static int maybe_inherit_stdout_from_stdin(const ExecContext *context, ExecInput
         if (context->std_output != EXEC_OUTPUT_INHERIT)
                 return 0;
 
-        /* If input got downgraded, inherit the original value */
-        if (i == EXEC_INPUT_NULL && exec_input_is_terminal(context->std_input))
-                return open_terminal_as(exec_context_tty_path(context), O_WRONLY, STDOUT_FILENO);
+        /* If input got downgraded, inherit the original value: reopen the configured TTY write-only, or — for
+         * a ptybrokerd PTY, which has no named device we could reopen — connect the acquired backend fd. */
+        if (i == EXEC_INPUT_NULL && exec_input_is_terminal(context->std_input)) {
+                if (exec_input_is_broker(context->std_input)) {
+                        /* If the broker PTY was not acquired (the broker is unreachable and this is a
+                         * command run for stopping, see exec_invoke()), fall through to the fallback below */
+                        if (broker_fd >= 0)
+                                return RET_NERRNO(dup2(broker_fd, STDOUT_FILENO));
+                } else {
+                        const char *tty_path = exec_context_tty_path(context);
+                        if (tty_path)
+                                return open_terminal_as(tty_path, O_WRONLY, STDOUT_FILENO);
+                }
+        }
 
         if (!exec_input_is_inheritable(i))
                 goto fallback;
@@ -485,7 +685,7 @@ static int maybe_inherit_stdout_from_stdin(const ExecContext *context, ExecInput
                 if (r < 0)
                         log_warning_errno(r, "Failed to check if inherited stdin is writable for stdout, using fallback: %m");
                 else
-                        log_warning("Inherited stdin is not writable for stdout, using fallback: %m");
+                        log_warning("Inherited stdin is not writable for stdout, using fallback.");
                 goto fallback;
         }
 
@@ -505,6 +705,7 @@ static int setup_output(
                 const ExecParameters *params,
                 int fileno,
                 int socket_fd,
+                int broker_fd,
                 const int named_iofds[static 3],
                 const char *ident,
                 uid_t uid,
@@ -560,7 +761,7 @@ static int setup_output(
         } else {
                 assert(fileno == STDOUT_FILENO);
 
-                r = maybe_inherit_stdout_from_stdin(context, i);
+                r = maybe_inherit_stdout_from_stdin(context, i, broker_fd);
                 if (r != 0)
                         return r;
 
@@ -621,10 +822,32 @@ static int setup_output(
 
                 return RET_NERRNO(dup2(socket_fd, fileno));
 
+        case EXEC_OUTPUT_BROKER:
+        case EXEC_OUTPUT_BROKER_LOG:
+                /* The backend fd of the ptybrokerd-allocated PTY is shared between stdin/stdout/stderr, just
+                 * install it here too. If input is a terminal we could dup2() from stdin, but the broker fd is
+                 * equally valid regardless of what input is set to, so just use it directly. */
+                if (broker_fd >= 0)
+                        return RET_NERRNO(dup2(broker_fd, fileno));
+
+                /* No broker PTY was acquired: the broker is unreachable and this is a command run for
+                 * stopping (see exec_invoke()). Downgrade to the journal (for the logged flavour) or to
+                 * /dev/null, so that stop commands still work e.g. during late shutdown. */
+                if (o == EXEC_OUTPUT_BROKER_LOG) {
+                        r = connect_logger_as(context, params, EXEC_OUTPUT_JOURNAL, ident, fileno, uid, gid);
+                        if (r >= 0)
+                                return r;
+
+                        log_warning_errno(r, "Failed to connect %s to the journal socket, ignoring: %m",
+                                          fileno == STDOUT_FILENO ? "stdout" : "stderr");
+                }
+
+                return open_null_as(O_WRONLY, fileno);
+
         case EXEC_OUTPUT_NAMED_FD:
                 assert(named_iofds[fileno] >= 0);
 
-                (void) fd_nonblock(named_iofds[fileno], false);
+                (void) fd_nonblock(named_iofds[fileno], /* nonblock= */ false);
                 return RET_NERRNO(dup2(named_iofds[fileno], fileno));
 
         case EXEC_OUTPUT_FILE:
@@ -650,7 +873,7 @@ static int setup_output(
                 if (fd < 0)
                         return fd;
 
-                return move_fd(fd, fileno, 0);
+                return move_fd(fd, fileno, /* cloexec= */ 0);
         }
 
         default:
@@ -746,7 +969,7 @@ static void write_confirm_error(int err, const char *vc, const char *unit_id) {
         assert(vc);
         assert(unit_id);
 
-        fd = open_terminal(vc, O_WRONLY|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal(vc, O_WRONLY|O_NOCTTY);
         if (fd < 0)
                 return;
 
@@ -1027,7 +1250,7 @@ static int enforce_user(
 
                 /* First step: If we need to keep capabilities but drop privileges we need to make sure we
                  * keep our caps, while we drop privileges. Add KEEP_CAPS to the securebits */
-                r = set_securebits(1U << SECURE_KEEP_CAPS, 0);
+                r = set_securebits(1U << SECURE_KEEP_CAPS, /* mask= */ 0);
                 if (r < 0)
                         return r;
         }
@@ -1043,6 +1266,11 @@ static int enforce_user(
 }
 
 #if HAVE_PAM
+
+static int log_oom_return_pam_buf_err(void) {
+        log_oom();
+        return PAM_BUF_ERR;
+}
 
 static void pam_response_done(struct pam_response *response) {
         erase_and_free(ASSERT_PTR(response)->resp);
@@ -1074,7 +1302,7 @@ static int ask_password_conv(
         size_t n = num_msg;
         struct pam_response *responses = new0(struct pam_response, n);
         if (!responses)
-                return PAM_BUF_ERR;
+                return log_oom_return_pam_buf_err();
         CLEANUP_ARRAY(responses, n, pam_response_free_array);
 
         for (size_t i = 0; i < n; i++) {
@@ -1089,12 +1317,20 @@ static int ask_password_conv(
                         if (!set_credential_env_var) {
                                 _cleanup_free_ char *creds_dir = NULL;
                                 r = exec_context_get_credential_directory(data->context, data->params, data->params->unit_id, &creds_dir);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to determine credentials directory: %m");
+                                if (r == -ENOMEM)
+                                        return log_oom_return_pam_buf_err();
+                                if (r < 0) {
+                                        log_error_errno(r, "Failed to determine credentials directory: %m");
+                                        return PAM_CONV_ERR;
+                                }
 
                                 if (creds_dir) {
-                                        if (setenv("CREDENTIALS_DIRECTORY", creds_dir, /* overwrite= */ true) < 0)
-                                                return log_error_errno(errno, "Failed to set $CREDENTIALS_DIRECTORY: %m");
+                                        if (setenv("CREDENTIALS_DIRECTORY", creds_dir, /* overwrite= */ true) < 0) {
+                                                if (errno == ENOMEM)
+                                                        return log_oom_return_pam_buf_err();
+                                                log_error_errno(errno, "Failed to set $CREDENTIALS_DIRECTORY: %m");
+                                                return PAM_CONV_ERR;
+                                        }
                                 } else
                                         (void) unsetenv("CREDENTIALS_DIRECTORY");
 
@@ -1103,7 +1339,7 @@ static int ask_password_conv(
 
                         _cleanup_free_ char *credential_name = strjoin("pam.authtok.", data->context->pam_name);
                         if (!credential_name)
-                                return log_oom();
+                                return log_oom_return_pam_buf_err();
 
                         AskPasswordRequest req = {
                                 .message = mi->msg,
@@ -1126,10 +1362,8 @@ static int ask_password_conv(
                         }
 
                         responses[i].resp = strdup(ASSERT_PTR(acquired[0]));
-                        if (!responses[i].resp) {
-                                log_oom();
-                                return PAM_BUF_ERR;
-                        }
+                        if (!responses[i].resp)
+                                return log_oom_return_pam_buf_err();
                         break;
                 }
 
@@ -1194,7 +1428,7 @@ static int attach_to_subcgroup(
         if (r == 0)
                 return 0;
 
-        r = cg_attach(subgroup, 0);
+        r = cg_attach(subgroup, /* pid= */ 0);
         if (r == -EUCLEAN)
                 return log_error_errno(r,
                                 "Failed to attach process " PID_FMT " to cgroup '%s', "
@@ -1523,20 +1757,6 @@ static void rename_process_from_path(const char *path) {
         (void) rename_process_full(comm, invocation ?: comm);
 }
 
-static bool context_has_address_families(const ExecContext *c) {
-        assert(c);
-
-        return c->address_families_allow_list ||
-                !set_isempty(c->address_families);
-}
-
-static bool context_has_syscall_filters(const ExecContext *c) {
-        assert(c);
-
-        return c->syscall_allow_list ||
-                !hashmap_isempty(c->syscall_filter);
-}
-
 static bool context_has_syscall_logs(const ExecContext *c) {
         assert(c);
 
@@ -1547,7 +1767,7 @@ static bool context_has_syscall_logs(const ExecContext *c) {
 static bool context_has_seccomp(const ExecContext *c) {
         assert(c);
 
-        /* We need NNP if we have any form of seccomp and are unprivileged */
+        /* We need NNP if we have any form of seccomp or io_uring filters and are unprivileged */
         return c->lock_personality ||
                 c->memory_deny_write_execute ||
                 c->private_devices ||
@@ -1556,13 +1776,14 @@ static bool context_has_seccomp(const ExecContext *c) {
                 c->protect_kernel_tunables ||
                 c->protect_kernel_modules ||
                 c->protect_kernel_logs ||
-                context_has_address_families(c) ||
+                exec_context_has_address_families(c) ||
                 exec_context_restrict_namespaces_set(c) ||
                 c->restrict_realtime ||
                 c->restrict_suid_sgid ||
                 !set_isempty(c->syscall_archs) ||
-                context_has_syscall_filters(c) ||
-                context_has_syscall_logs(c);
+                exec_context_has_syscall_filters(c) ||
+                context_has_syscall_logs(c) ||
+                exec_context_io_uring_filter_set(c);
 }
 
 static bool context_has_no_new_privileges(const ExecContext *c) {
@@ -1575,6 +1796,127 @@ static bool context_has_no_new_privileges(const ExecContext *c) {
                 return false;
 
         return context_has_seccomp(c);
+}
+
+#if HAVE_SECCOMP
+static bool syscall_filter_allows(const ExecContext *c, int id) {
+        int e;
+
+        assert(c);
+
+        if (!hashmap_contains(c->syscall_filter, INT_TO_PTR(id + 1)))
+                return !c->syscall_allow_list;
+
+        /* With an error number of 0, the system call does nothing and pretends to succeed. A denied io_uring
+         * request fails with EACCES instead. A service that suppresses fsync() with an error number of 0
+         * would then see its io_uring fsync requests fail. */
+        e = PTR_TO_INT(hashmap_get(c->syscall_filter, INT_TO_PTR(id + 1)));
+        if (e == 0)
+                return true;
+
+        /* An allow list contains the allowed system calls with the value -1. Its other entries come from
+         * assignments like "~uname:EILSEQ" and deny the system call. */
+        return c->syscall_allow_list && e < 0;
+}
+#endif
+
+static bool syscall_filter_denies_io_uring(const ExecContext *c) {
+        assert(c);
+
+#if HAVE_SECCOMP
+        int id;
+
+        if (!exec_context_has_syscall_filters(c) || !is_seccomp_available())
+                return false;
+
+        id = sym_seccomp_syscall_resolve_name("io_uring_setup");
+        return id >= 0 && !syscall_filter_allows(c, id);
+#else
+        return false;
+#endif
+}
+
+static bool check_io_uring_bpf_filters(const ExecContext *c, const ExecParameters *p, const char *setting) {
+        assert(c);
+        assert(p);
+        assert(setting);
+
+        /* If SystemCallFilter= denies io_uring_setup(), the processes of the unit can't create rings, and
+         * io_uring filters have no effect. */
+        if (syscall_filter_denies_io_uring(c)) {
+                log_debug("SystemCallFilter= denies io_uring_setup(), not applying %s to io_uring requests.", setting);
+                return false;
+        }
+
+        if (!p->io_uring_bpf_filter_supported)
+                log_debug("io_uring BPF filters are not supported, not applying %s to io_uring requests.", setting);
+
+        return p->io_uring_bpf_filter_supported;
+}
+
+static int apply_io_uring_address_families(const ExecContext *c, const ExecParameters *p) {
+        assert(c);
+        assert(p);
+
+        if (!exec_context_has_address_families(c))
+                return 0;
+
+        if (!check_io_uring_bpf_filters(c, p, "RestrictAddressFamilies="))
+                return 0;
+
+        return io_uring_restrict_address_families(c->address_families, c->address_families_allow_list);
+}
+
+static int apply_io_uring_suid_sgid(const ExecContext *c, const ExecParameters *p) {
+        assert(c);
+        assert(p);
+
+        if (!c->restrict_suid_sgid)
+                return 0;
+
+        if (!check_io_uring_bpf_filters(c, p, "RestrictSUIDSGID="))
+                return 0;
+
+        return io_uring_restrict_suid_sgid();
+}
+
+static int apply_io_uring_filter(const ExecContext *c, const ExecParameters *p) {
+        assert(c);
+        assert(p);
+
+        if (!exec_context_io_uring_filter_set(c))
+                return 0;
+
+        if (check_io_uring_bpf_filters(c, p, "IOUringFilter="))
+                return io_uring_restrict_ops(c->io_uring_filter, c->io_uring_filter_allow_list);
+
+        if (syscall_filter_denies_io_uring(c))
+                return 0;
+
+#if HAVE_SECCOMP
+        /* The kernel can't filter io_uring operations, so we deny io_uring_setup() to enforce
+         * IOUringFilter=. Programs fall back to regular system calls when io_uring_setup() fails with
+         * ENOSYS. */
+        if (is_seccomp_available()) {
+                _cleanup_hashmap_free_ Hashmap *filter = NULL;
+                int r;
+
+                log_debug("Denying io_uring_setup() to enforce IOUringFilter=.");
+
+                filter = hashmap_new(/* hash_ops= */ NULL);
+                if (!filter)
+                        return -ENOMEM;
+
+                r = seccomp_filter_set_add_by_name(filter, /* add= */ true, "io_uring_setup");
+                if (r < 0)
+                        return r;
+
+                return seccomp_load_syscall_filter_set_raw(SCMP_ACT_ALLOW, filter, SCMP_ACT_ERRNO(ENOSYS), /* log_missing= */ false);
+        }
+#endif
+
+        log_debug("Seccomp is not available, not applying IOUringFilter=.");
+        return 0;
 }
 
 #if HAVE_SECCOMP
@@ -1629,7 +1971,7 @@ static int apply_syscall_filter(const ExecContext *c, const ExecParameters *p) {
         assert(c);
         assert(p);
 
-        if (!context_has_syscall_filters(c))
+        if (!exec_context_has_syscall_filters(c))
                 return 0;
 
         if (skip_seccomp_unavailable("SystemCallFilter="))
@@ -1660,7 +2002,7 @@ static int apply_syscall_filter(const ExecContext *c, const ExecParameters *p) {
                         return r;
         }
 
-        return seccomp_load_syscall_filter_set_raw(default_action, c->syscall_filter, action, false);
+        return seccomp_load_syscall_filter_set_raw(default_action, c->syscall_filter, action, /* log_missing= */ false);
 }
 
 static int apply_syscall_log(const ExecContext *c, const ExecParameters *p) {
@@ -1685,7 +2027,7 @@ static int apply_syscall_log(const ExecContext *c, const ExecParameters *p) {
                 action = SCMP_ACT_ALLOW;
         }
 
-        return seccomp_load_syscall_filter_set_raw(default_action, c->syscall_log, action, false);
+        return seccomp_load_syscall_filter_set_raw(default_action, c->syscall_log, action, /* log_missing= */ false);
 }
 
 static int apply_syscall_archs(const ExecContext *c, const ExecParameters *p) {
@@ -1705,7 +2047,7 @@ static int apply_address_families(const ExecContext *c, const ExecParameters *p)
         assert(c);
         assert(p);
 
-        if (!context_has_address_families(c))
+        if (!exec_context_has_address_families(c))
                 return 0;
 
         if (skip_seccomp_unavailable("RestrictAddressFamilies="))
@@ -1766,6 +2108,64 @@ static int apply_restrict_suid_sgid(const ExecContext *c, const ExecParameters *
         return seccomp_restrict_suid_sgid();
 }
 
+static bool syscall_filter_allows_all(const ExecContext *c, const char *syscalls) {
+        assert(c);
+        assert(syscalls);
+
+        NULSTR_FOREACH(name, syscalls) {
+                int id;
+
+                /* libseccomp returns negative numbers for system calls that the native architecture does
+                 * not have. */
+                id = sym_seccomp_syscall_resolve_name(name);
+                if (id < 0)
+                        continue;
+
+                if (!syscall_filter_allows(c, id))
+                        return false;
+        }
+
+        return true;
+}
+
+static int apply_io_uring_syscall_filter(const ExecContext *c, const ExecParameters *p) {
+        _cleanup_set_free_ Set *denied = NULL;
+        int r;
+
+        assert(c);
+        assert(p);
+
+        if (!exec_context_has_syscall_filters(c))
+                return 0;
+
+        r = dlopen_libseccomp(LOG_DEBUG);
+        if (r < 0) {
+                log_debug_errno(r, "libseccomp is not available, not applying SystemCallFilter= to io_uring requests: %m");
+                return 0;
+        }
+
+        if (!check_io_uring_bpf_filters(c, p, "SystemCallFilter="))
+                return 0;
+
+        /* An io_uring operation can do the work of each of its equivalent system calls, so we deny it if
+         * the filter denies any of them. */
+        for (int op = 0; op < IORING_OP_LAST; op++) {
+                const char *syscalls = io_uring_op_syscalls_to_string(op);
+
+                if (!syscalls || syscall_filter_allows_all(c, syscalls))
+                        continue;
+
+                r = set_ensure_put(&denied, /* hash_ops= */ NULL, INT_TO_PTR(op + 1));
+                if (r < 0)
+                        return r;
+        }
+
+        /* A denied io_uring request fails with EACCES, but the kernel still reports the operation as
+         * supported. Programs therefore can't fall back from an unknown operation that we deny. We only deny
+         * known operations, even for an allow list of system calls. */
+        return io_uring_restrict_ops(denied, /* allow_list= */ false);
+}
+
 static int apply_protect_sysctl(const ExecContext *c, const ExecParameters *p) {
         assert(c);
         assert(p);
@@ -1794,7 +2194,7 @@ static int apply_protect_kernel_modules(const ExecContext *c, const ExecParamete
         if (skip_seccomp_unavailable("ProtectKernelModules="))
                 return 0;
 
-        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_MODULE, SCMP_ACT_ERRNO(EPERM), false);
+        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_MODULE, SCMP_ACT_ERRNO(EPERM), /* log_missing= */ false);
 }
 
 static int apply_protect_kernel_logs(const ExecContext *c, const ExecParameters *p) {
@@ -1820,7 +2220,7 @@ static int apply_protect_clock(const ExecContext *c, const ExecParameters *p) {
         if (skip_seccomp_unavailable("ProtectClock="))
                 return 0;
 
-        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_CLOCK, SCMP_ACT_ERRNO(EPERM), false);
+        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_CLOCK, SCMP_ACT_ERRNO(EPERM), /* log_missing= */ false);
 }
 
 static int apply_private_devices(const ExecContext *c, const ExecParameters *p) {
@@ -1835,7 +2235,7 @@ static int apply_private_devices(const ExecContext *c, const ExecParameters *p) 
         if (skip_seccomp_unavailable("PrivateDevices="))
                 return 0;
 
-        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_RAW_IO, SCMP_ACT_ERRNO(EPERM), false);
+        return seccomp_load_syscall_filter_set(SCMP_ACT_ALLOW, syscall_filter_sets + SYSCALL_FILTER_SET_RAW_IO, SCMP_ACT_ERRNO(EPERM), /* log_missing= */ false);
 }
 
 static int apply_restrict_namespaces(const ExecContext *c, const ExecParameters *p) {
@@ -2071,7 +2471,7 @@ static int build_environment(
         if (!username && !c->dynamic_user && p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
                 assert(!c->user);
 
-                r = get_user_creds("root", USER_CREDS_CLEAN, &_username, NULL, NULL, &_home, &_shell);
+                r = get_user_creds("root", USER_CREDS_CLEAN, &_username, /* ret_uid= */ NULL, /* ret_gid= */ NULL, &_home, &_shell);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to determine credentials for user root: %s",
                                         STRERROR_USER(r));
@@ -2577,7 +2977,7 @@ static int setup_private_users(
         if (n != 0) /* on success we should have read 0 bytes */
                 return -EIO;
 
-        r = pidref_wait_for_terminate_and_check("(sd-userns)", &pidref, 0);
+        r = pidref_wait_for_terminate_and_check("(sd-userns)", &pidref, /* flags= */ 0);
         if (r < 0)
                 return r;
         pidref_done(&pidref);
@@ -2615,7 +3015,7 @@ static int can_mount_proc(void) {
 
                 /* Try mounting /proc on /dev/shm/. No need to clean up the mount since the mount
                  * namespace will be cleaned up once the process exits. */
-                r = mount_follow_verbose(LOG_DEBUG, "proc", "/dev/shm/", "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
+                r = mount_follow_verbose(LOG_DEBUG, "proc", "/dev/shm/", "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, /* options= */ NULL);
                 if (r < 0) {
                         (void) write(errno_pipe[1], &r, sizeof(r));
                         _exit(EXIT_FAILURE);
@@ -2652,9 +3052,9 @@ static int can_mount_proc(void) {
         return 1;
 }
 
-static int setup_private_pids(const ExecContext *c, ExecParameters *p) {
+static int setup_private_pids(const ExecContext *c, ExecParameters *p, int *ret_keep_parent_fd /* may be NULL */) {
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
-        _cleanup_close_pair_ int errno_pipe[2] = EBADF_PAIR;
+        _cleanup_close_pair_ int errno_pipe[2] = EBADF_PAIR, keep_parent_pipe[2] = EBADF_PAIR;
         ssize_t n;
         int r, q;
 
@@ -2672,6 +3072,12 @@ static int setup_private_pids(const ExecContext *c, ExecParameters *p) {
         if (pipe2(errno_pipe, O_CLOEXEC) < 0)
                 return log_debug_errno(errno, "Failed to create pipe for communicating with parent process: %m");
 
+        /* The parent opened connections to mountfsd and nsresourced, so those services will lookup
+         * information through the parent process. So the parent needs to stick around until the child is
+         * done. The parent waits until the child closes the fd returned in ret_keep_parent_fd. */
+        if (ret_keep_parent_fd && pipe2(keep_parent_pipe, O_CLOEXEC) < 0)
+                return log_debug_errno(errno, "Failed to create pipe for waiting for child process: %m");
+
         /* Set FORK_DETACH to immediately re-parent the child process to the invoking manager process. */
         r = pidref_safe_fork("(sd-pidns-child)", FORK_NEW_PIDNS|FORK_DETACH, &pidref);
         if (r < 0)
@@ -2688,14 +3094,27 @@ static int setup_private_pids(const ExecContext *c, ExecParameters *p) {
                                 &IOVEC_MAKE(&pidref.pid, sizeof(pidref.pid)),
                                 /* iovlen= */ 1,
                                 /* flags= */ 0);
-                /* Send error code to child process. */
+                /* Send error code to child process. Close the pipe right away so that the child doesn't
+                 * block in read() if the write failed, as we might wait for the child below. */
                 (void) write(errno_pipe[1], &q, sizeof(q));
+                errno_pipe[1] = safe_close(errno_pipe[1]);
+
+                if (ret_keep_parent_fd) {
+                        keep_parent_pipe[1] = safe_close(keep_parent_pipe[1]);
+                        for (;;) {
+                                r = fd_wait_for_event(keep_parent_pipe[0], POLLHUP, USEC_INFINITY);
+                                if (r != -EINTR)
+                                        break;
+                        }
+                }
+
                 /* Exit here so we only go through the destructors in exec_invoke only once - in the child - as
                  * some destructors have external effects. The main codepaths continue in the child process. */
                 _exit(q < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
         }
 
         errno_pipe[1] = safe_close(errno_pipe[1]);
+        keep_parent_pipe[0] = safe_close(keep_parent_pipe[0]);
         p->pidref_transport_fd = safe_close(p->pidref_transport_fd);
 
         /* Try to read an error code from the parent. Note a child process cannot wait for the parent so we always
@@ -2707,6 +3126,9 @@ static int setup_private_pids(const ExecContext *c, ExecParameters *p) {
                 return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to read enough bytes from pipe with parent process");
         if (r < 0)
                 return log_debug_errno(r, "Failed to send child pidref to manager: %m");
+
+        if (ret_keep_parent_fd)
+                *ret_keep_parent_fd = TAKE_FD(keep_parent_pipe[1]);
 
         /* NOTE! This function returns in the child process only. */
         return r;
@@ -2734,7 +3156,7 @@ static int create_many_symlinks(const char *root, const char *source, char **sym
                 if (r < 0)
                         return r;
 
-                r = symlink_idempotent(src_abs, dst_abs, true);
+                r = symlink_idempotent(src_abs, dst_abs, /* make_relative= */ true);
                 if (r < 0)
                         return r;
         }
@@ -2760,9 +3182,9 @@ static int set_exec_storage_quota(int fd, uint32_t proj_id, const ExecQuotaLimit
                  * used for quotactl_fd(SET) and is passed again for fstatvfs(), the total number of blocks is not
                  * reported accurately (instead, the block limit is reported as total blocks). Thus, use the FD
                  * associated with the parent, so that total blocks is accurate */
-                fd_parent = openat(fd, "..", O_PATH|O_CLOEXEC|O_DIRECTORY);
+                fd_parent = xopenat(fd, "..", O_PATH|O_DIRECTORY);
                 if (fd_parent < 0)
-                        return -errno;
+                        return fd_parent;
 
                 uint32_t xattr_flags = 0;
                 r = read_fs_xattr_fd(fd_parent, &xattr_flags, /* ret_projid= */ NULL);
@@ -2820,7 +3242,7 @@ static int unset_exec_storage_quota(int fd, uint32_t proj_id, bool quota_account
 
         /* Release project ID if no accounting needed */
         if (!quota_accounting) {
-                r = set_proj_id_recursive(fd, 0);
+                r = set_proj_id_recursive(fd, /* proj_id= */ 0);
                 if (r < 0)
                         log_warning_errno(r, "Failed to release project ID %" PRIu32 ", ignoring: %m", proj_id);
         }
@@ -2849,9 +3271,9 @@ static int apply_exec_quotas(
         if (!IN_SET(type, EXEC_DIRECTORY_STATE, EXEC_DIRECTORY_CACHE, EXEC_DIRECTORY_LOGS))
                 return 0;
 
-        fd = open(target_dir, O_PATH|O_CLOEXEC|O_DIRECTORY);
+        fd = xopenat(AT_FDCWD, target_dir, O_PATH|O_DIRECTORY);
         if (fd < 0)
-                return log_debug_errno(errno, "Failed to open %s: %m", target_dir);
+                return log_debug_errno(fd, "Failed to open %s: %m", target_dir);
 
         /* Get the project ID of the current directory */
         uint32_t proj_id;
@@ -2883,7 +3305,7 @@ static int apply_exec_quotas(
         if (*exec_dt_proj_id > 0 && *exec_dt_proj_id != proj_id) {
                 /* Set the existing project ID only if the current directory's ID does not exist or does not match */
                 proj_id = *exec_dt_proj_id;
-                r = quota_proj_id_set_recursive(fd, proj_id, false);
+                r = quota_proj_id_set_recursive(fd, proj_id, /* verify_exclusive= */ false);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to set project ID for %s: %m", target_dir);
         } else if (*exec_dt_proj_id == 0) {
@@ -2917,7 +3339,7 @@ static int apply_exec_quotas(
                         }
 
                         if (!quota_dqblk_is_populated(&req)) {
-                                int proj_id_was_set = quota_proj_id_set_recursive(fd, proj_id, true);
+                                int proj_id_was_set = quota_proj_id_set_recursive(fd, proj_id, /* verify_exclusive= */ true);
                                 if (proj_id_was_set < 0)
                                         return log_debug_errno(proj_id_was_set, "Failed to set project ID for %s: %m", target_dir);
                                 if (proj_id_was_set) {
@@ -3090,7 +3512,7 @@ static int setup_exec_directory(
                         }
 
                         /* First set up private root if it doesn't exist yet, with access mode 0700 and owned by root:root */
-                        r = mkdir_safe_label(pp, 0700, 0, 0, MKDIR_WARN_MODE);
+                        r = mkdir_safe_label(pp, 0700, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
                         if (r < 0)
                                 goto fail;
 
@@ -3104,7 +3526,7 @@ static int setup_exec_directory(
                         if (r < 0)
                                 goto fail;
 
-                        if (is_dir(p, false) > 0 &&
+                        if (is_dir(p, /* follow= */ false) > 0 &&
                             (access_nofollow(pp, F_OK) == -ENOENT)) {
 
                                 /* Hmm, the private directory doesn't exist yet, but the normal one exists? If so, move
@@ -3140,7 +3562,7 @@ static int setup_exec_directory(
                                  *    and, /var/lib/foo is a symlink to /var/lib/private/foo. So, not only
                                  *    we do not need to create the symlink, but we cannot create the symlink.
                                  *    See issue #24783. */
-                                r = symlink_idempotent(pp, p, true);
+                                r = symlink_idempotent(pp, p, /* make_relative= */ true);
                                 if (r < 0)
                                         goto fail;
                         }
@@ -3159,7 +3581,7 @@ static int setup_exec_directory(
                                  * since they all support the private/ symlink logic at least in some
                                  * configurations, see above. */
 
-                                r = chase(target, NULL, 0, &target_resolved, NULL);
+                                r = chase(target, /* root= */ NULL, /* flags= */ 0, &target_resolved, /* ret_fd= */ NULL);
                                 if (r < 0)
                                         goto fail;
 
@@ -3170,7 +3592,7 @@ static int setup_exec_directory(
                                 }
 
                                 /* /var/lib or friends may be symlinks. So, let's chase them also. */
-                                r = chase(q, NULL, CHASE_NONEXISTENT, &q_resolved, NULL);
+                                r = chase(q, /* root= */ NULL, CHASE_NONEXISTENT, &q_resolved, /* ret_fd= */ NULL);
                                 if (r < 0)
                                         goto fail;
 
@@ -3314,7 +3736,7 @@ static int setup_smack(
         assert(executable_fd >= 0);
 
         if (context->smack_process_label) {
-                r = mac_smack_apply_pid(0, context->smack_process_label);
+                r = mac_smack_apply_pid(/* pid= */ 0, context->smack_process_label);
                 if (r < 0)
                         return r;
         } else if (params->fallback_smack_process_label) {
@@ -3324,7 +3746,7 @@ static int setup_smack(
                 if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
                         return r;
 
-                r = mac_smack_apply_pid(0, exec_label ?: params->fallback_smack_process_label);
+                r = mac_smack_apply_pid(/* pid= */ 0, exec_label ?: params->fallback_smack_process_label);
                 if (r < 0)
                         return r;
         }
@@ -3741,6 +4163,7 @@ static int pin_rootfs(
                               context->root_image,
                               pick_filter_image_raw,
                               ELEMENTSOF(pick_filter_image_raw),
+                              /* match_root= */ NULL,
                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                               &result);
                 if (r < 0) {
@@ -3757,9 +4180,9 @@ static int pin_rootfs(
                  * mountfsd will want this later, and it wants a fully opened fd, so that security checks
                  * have been passed */
                 _cleanup_close_ int reopened_fd = -EBADF;
-                reopened_fd = fd_reopen(result.fd, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_RDWR);
+                reopened_fd = fd_reopen(result.fd, O_NONBLOCK|O_NOCTTY|O_RDWR);
                 if (ERRNO_IS_NEG_FS_WRITE_REFUSED(reopened_fd))
-                        reopened_fd = fd_reopen(result.fd, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_RDONLY);
+                        reopened_fd = fd_reopen(result.fd, O_NONBLOCK|O_NOCTTY|O_RDONLY);
                 if (reopened_fd < 0) {
                         *reterr_path = strdup(context->root_image);
                         return log_debug_errno(reopened_fd, "Failed to open image '%s': %m", context->root_image);
@@ -3783,6 +4206,7 @@ static int pin_rootfs(
                               context->root_directory,
                               pick_filter_image_dir,
                               ELEMENTSOF(pick_filter_image_dir),
+                              /* match_root= */ NULL,
                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                               &result);
                 if (r < 0) {
@@ -3813,6 +4237,7 @@ static int pin_rootfs(
                               context->root_mstack,
                               pick_filter_image_mstack,
                               /* n_filters= */ 1,
+                              /* match_root= */ NULL,
                               PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                               &result);
                 if (r < 0) {
@@ -4306,6 +4731,7 @@ static int close_remaining_fds(
                 const ExecParameters *params,
                 const ExecRuntime *runtime,
                 int socket_fd,
+                int broker_fd,
                 const int fds[],
                 size_t n_fds) {
 
@@ -4317,6 +4743,7 @@ static int close_remaining_fds(
         int static_fds[] = {
                 params->stdin_fd, params->stdout_fd, params->stderr_fd,
                 socket_fd,
+                broker_fd,
                 FD_PAIR(runtime->ephemeral_storage_socket),
                 FD_PAIR_CONDITION(runtime->shared, runtime->shared->userns_storage_socket),
                 FD_PAIR_CONDITION(runtime->shared, runtime->shared->netns_storage_socket),
@@ -4519,9 +4946,9 @@ static int get_open_file_fd(const OpenFile *of) {
 
         assert(of);
 
-        ofd = open(of->path, O_PATH | O_CLOEXEC);
+        ofd = xopenat(AT_FDCWD, of->path, O_PATH);
         if (ofd < 0)
-                return log_debug_errno(errno, "Failed to open '%s' as O_PATH: %m", of->path);
+                return log_debug_errno(ofd, "Failed to open '%s' as O_PATH: %m", of->path);
 
         if (fstat(ofd, &st) < 0)
                 return log_debug_errno( errno, "Failed to stat '%s': %m", of->path);
@@ -4542,7 +4969,7 @@ static int get_open_file_fd(const OpenFile *of) {
                 else if (FLAGS_SET(of->flags, OPENFILE_TRUNCATE))
                         flags |= O_TRUNC;
 
-                fd = fd_reopen(ofd, flags|O_NOCTTY|O_CLOEXEC);
+                fd = fd_reopen(ofd, flags|O_NOCTTY);
                 if (fd < 0)
                         return log_debug_errno(fd, "Failed to reopen file '%s': %m", of->path);
 
@@ -4715,6 +5142,7 @@ static int setup_delegated_namespaces(
                 int bpffs_socket_fd,
                 int bpffs_errno_pipe,
                 sd_varlink *mountfsd_link, /* may be NULL */
+                int *keep_parent_fd,
                 int *reterr_exit_status) {
 
         int r;
@@ -4733,6 +5161,7 @@ static int setup_delegated_namespaces(
         assert(pressure_path);
         assert(command);
         assert(bpffs_pidref);
+        assert(keep_parent_fd);
         assert(reterr_exit_status);
 
         if (exec_needs_network_namespace(context) &&
@@ -4818,7 +5247,7 @@ static int setup_delegated_namespaces(
                         }
                 }
 
-                r = setup_private_pids(context, params);
+                r = setup_private_pids(context, params, mountfsd_link ? keep_parent_fd : NULL);
                 if (r < 0) {
                         *reterr_exit_status = EXIT_NAMESPACE;
                         return log_error_errno(r, "Failed to set up pid namespace: %m");
@@ -5047,6 +5476,13 @@ static void prepare_terminal(
         assert(context);
         assert(p);
 
+        /* PTYs acquired from ptybrokerd are freshly allocated and get their dimensions applied by the broker
+         * at allocation time, hence they never need a reset. Moreover, the ANSI DSR size query issued by
+         * exec_context_apply_tty_size() below would just time out: the broker's frontend does not answer
+         * it. */
+        if (exec_context_has_broker(context))
+                return;
+
         /* We only try to reset things if we there's the chance our stdout points to a TTY */
         if (!(context->std_output == EXEC_OUTPUT_TTY ||
               (context->std_output == EXEC_OUTPUT_INHERIT && exec_input_is_terminal(context->std_input)) ||
@@ -5089,10 +5525,13 @@ static int setup_term_environment(const ExecContext *context, char ***env) {
                 return 0;
 
         /* Do we need $TERM at all? */
-        if (!exec_context_has_tty(context))
+        if (!exec_context_has_tty(context) && !exec_context_has_broker(context))
                 return 0;
 
-        const char *tty_path = exec_context_tty_path(context);
+        /* PTYs allocated via ptybrokerd have no physical terminal we could query, so skip straight to the
+         * fallback defaults below, matching the terminal environment we hand to the broker in
+         * acquire_broker_terminal(). */
+        const char *tty_path = exec_context_has_broker(context) ? NULL : exec_context_tty_path(context);
         if (tty_path) {
                 /* If we are forked off PID 1 and we are supposed to operate on /dev/console, then let's try
                  * to inherit the $TERM set for PID 1. This is useful for containers so that the $TERM the
@@ -5145,24 +5584,25 @@ static int setup_term_environment(const ExecContext *context, char ***env) {
                 }
         }
 
-        /* If $TERM is not known and we pick a fallback default, then let's also set
-         * $COLORTERM=truecolor. That's because our fallback default is vt220, which is
-         * generally a safe bet (as it supports PageUp/PageDown unlike vt100, and is quite
-         * universally available in terminfo/termcap), except for the fact that real DEC
-         * vt220 gear never actually supported color. Most tools these days generate color on
-         * vt220 anyway, ignoring the physical capabilities of the real hardware, but some
-         * tools actually believe in the historical truth. Which is unfortunate since *we*
-         * *don't* care about the historical truth, we just want sane defaults if nothing
-         * better is explicitly configured. It's 2025 after all, at the time of writing,
-         * pretty much all terminal emulators actually *do* support color, hence if we don't
-         * know any better let's explicitly claim color support via $COLORTERM. Or in other
-         * words: we now explicitly claim to be connected to a franken-vt220 with true color
-         * support. */
-        r = strv_env_replace_strdup(env, "COLORTERM=truecolor");
-        if (r < 0)
-                return r;
+        /* Nothing better known — fall back to our defaults (a franken-vt220 with truecolor support). This is
+         * derived the same way as for ptybrokerd-allocated PTYs; see pick_term_environment() for the
+         * rationale behind the vt220+truecolor choice. */
+        const char *term, *colorterm, *no_color;
+        pick_term_environment(*env, &term, &colorterm, &no_color);
 
-        return strv_env_replace_strdup(env, "TERM=" FALLBACK_TERM);
+        if (colorterm) {
+                r = strv_env_assign(env, "COLORTERM", colorterm);
+                if (r < 0)
+                        return r;
+        }
+
+        if (no_color) {
+                r = strv_env_assign(env, "NO_COLOR", no_color);
+                if (r < 0)
+                        return r;
+        }
+
+        return strv_env_assign(env, "TERM", term);
 }
 
 static inline void free_pressure_paths(char *(*p)[_PRESSURE_RESOURCE_MAX]) {
@@ -5207,11 +5647,11 @@ int exec_invoke(
          * but seen from the outside (covers userns mappings) */
         uid_t uid = UID_INVALID, saved_uid = getuid(), outside_uid = UID_INVALID;
         gid_t gid = GID_INVALID, saved_gid = getgid(), outside_gid = GID_INVALID;
-        int secure_bits;
+        int secure_bits, inherited_secure_bits;
         _cleanup_free_ gid_t *gids = NULL, *gids_after_pam = NULL;
         int ngids = 0, ngids_after_pam = 0;
         int named_iofds[3] = EBADF_TRIPLET;
-        _cleanup_close_ int socket_fd = -EBADF, bpffs_socket_fd = -EBADF, bpffs_errno_pipe = -EBADF;
+        _cleanup_close_ int socket_fd = -EBADF, broker_fd = -EBADF, bpffs_socket_fd = -EBADF, bpffs_errno_pipe = -EBADF;
         _cleanup_(pidref_done_sigkill_wait) PidRef bpffs_pidref = PIDREF_NULL;
 
         assert(command);
@@ -5220,6 +5660,10 @@ int exec_invoke(
         assert(runtime);
         assert(cgroup_context);
         assert(exit_status);
+
+        /* Creating or joining a user namespace resets the secure bits, so take what the service manager passed
+         * down before that happens. */
+        inherited_secure_bits = prctl_safe(PR_GET_SECUREBITS, 0, 0, 0, 0);
 
         LOG_CONTEXT_PUSH_EXEC(context, params);
 
@@ -5235,9 +5679,11 @@ int exec_invoke(
             context->std_output == EXEC_OUTPUT_SOCKET ||
             context->std_error == EXEC_OUTPUT_SOCKET) {
 
-                if (params->n_socket_fds != 1)
+                if (params->n_socket_fds != 1) {
+                        *exit_status = EXIT_FDS;
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expected exactly one socket, got %zu.",
                                                params->n_socket_fds);
+                }
 
                 socket_fd = TAKE_FD(params->fds[0]);
                 free(params->fd_names[0]);
@@ -5252,6 +5698,38 @@ int exec_invoke(
         if (r < 0) {
                 *exit_status = EXIT_FDS;
                 return log_error_errno(r, "Failed to load a named file descriptor: %m");
+        }
+
+        /* If any of the standard streams is connected to a ptybrokerd-allocated PTY, acquire it now, before
+         * we enter any namespaces or drop privileges — at this point the ptybrokerd runtime socket is still
+         * reachable, and the acquired backend fd survives all later namespace transitions. The single backend
+         * fd is shared by stdin/stdout/stderr, matching how a physical TTY would be. Note that stdin might
+         * have been downgraded to /dev/null (e.g. for ExecStop= and friends, which run without
+         * EXEC_APPLY_TTY_STDIN): if the PTY would not actually be connected to any of the streams don't
+         * acquire it — otherwise we'd pointlessly allocate a PTY for every stop command, and worse, fail the
+         * command if the broker is not reachable anymore, for example during late shutdown. */
+        ExecInput fixed_input = fixup_input(context, FLAGS_SET(params->flags, EXEC_APPLY_TTY_STDIN));
+        if (exec_input_is_broker(fixed_input) ||
+            exec_output_is_broker(context->std_output) ||
+            exec_output_is_broker(context->std_error) ||
+            /* stdout inheriting from a downgraded broker stdin still connects to the broker PTY, see
+             * maybe_inherit_stdout_from_stdin() */
+            (exec_input_is_broker(context->std_input) && context->std_output == EXEC_OUTPUT_INHERIT)) {
+                r = acquire_broker_terminal(context, params, &broker_fd);
+                if (r < 0) {
+                        /* The function already logged about this */
+
+                        if (FLAGS_SET(params->flags, EXEC_APPLY_TTY_STDIN)) {
+                                *exit_status = EXIT_STDIN;
+                                return r;
+                        }
+
+                        /* For commands running without EXEC_APPLY_TTY_STDIN (i.e. ExecStop= and friends)
+                         * don't fail if the broker is not reachable anymore (e.g. during late shutdown), but
+                         * downgrade the streams instead — just like stdin is downgraded — so that stop
+                         * commands still work, see setup_output(). */
+                        log_warning_errno(r, "Failed to acquire PTY from ptybrokerd, downgrading standard output/error: %m");
+                }
         }
 
         /* We reset exactly these signals, since they are the only ones we set to SIG_IGN in the main
@@ -5323,7 +5801,7 @@ int exec_invoke(
                 return log_error_errno(r, "Failed to collect shifted fd: %m");
         }
 
-        r = close_remaining_fds(params, runtime, socket_fd, keep_fds, n_keep_fds);
+        r = close_remaining_fds(params, runtime, socket_fd, broker_fd, keep_fds, n_keep_fds);
         if (r < 0) {
                 *exit_status = EXIT_FDS;
                 return log_error_errno(r, "Failed to close unwanted file descriptors: %m");
@@ -5489,7 +5967,7 @@ int exec_invoke(
 
         /* If a socket is connected to STDIN/STDOUT/STDERR, we must drop O_NONBLOCK */
         if (socket_fd >= 0)
-                (void) fd_nonblock(socket_fd, false);
+                (void) fd_nonblock(socket_fd, /* nonblock= */ false);
 
         /* We need sandboxing if the caller asked us to apply it and the command isn't explicitly excepted
          * from it. */
@@ -5508,8 +5986,10 @@ int exec_invoke(
                 if (r > 0) {
                         /* If there is a subcgroup required, let's make sure to create it now. */
                         r = cg_create(subcgroup);
-                        if (r < 0)
+                        if (r < 0) {
+                                *exit_status = EXIT_CGROUP;
                                 return log_error_errno(r, "Failed to create subcgroup '%s': %m", subcgroup);
+                        }
                 }
 
                 /* If we need a cgroup namespace, we cannot yet move the service to its configured subgroup,
@@ -5522,7 +6002,7 @@ int exec_invoke(
                                                            !exec_params_needs_control_subcgroup(params)
                                                            ? params->cgroup_path : subcgroup;
 
-                r = cg_attach(cgtarget, 0);
+                r = cg_attach(cgtarget, /* pid= */ 0);
                 if (r == -EUCLEAN) {
                         *exit_status = EXIT_CGROUP;
                         return log_error_errno(r,
@@ -5560,7 +6040,7 @@ int exec_invoke(
                 }
         }
 
-        r = setup_input(context, params, socket_fd, named_iofds);
+        r = setup_input(context, params, socket_fd, broker_fd, named_iofds);
         if (r < 0) {
                 *exit_status = EXIT_STDIN;
                 return log_error_errno(r, "Failed to set up standard input: %m");
@@ -5573,13 +6053,13 @@ int exec_invoke(
                 return log_error_errno(r, "Failed to extract filename from path %s: %m", command->path);
         }
 
-        r = setup_output(context, params, STDOUT_FILENO, socket_fd, named_iofds, fname, uid, gid, &journal_stream_dev, &journal_stream_ino);
+        r = setup_output(context, params, STDOUT_FILENO, socket_fd, broker_fd, named_iofds, fname, uid, gid, &journal_stream_dev, &journal_stream_ino);
         if (r < 0) {
                 *exit_status = EXIT_STDOUT;
                 return log_error_errno(r, "Failed to set up standard output: %m");
         }
 
-        r = setup_output(context, params, STDERR_FILENO, socket_fd, named_iofds, fname, uid, gid, &journal_stream_dev, &journal_stream_ino);
+        r = setup_output(context, params, STDERR_FILENO, socket_fd, broker_fd, named_iofds, fname, uid, gid, &journal_stream_dev, &journal_stream_ino);
         if (r < 0) {
                 *exit_status = EXIT_STDERR;
                 return log_error_errno(r, "Failed to set up standard error output: %m");
@@ -5622,6 +6102,14 @@ int exec_invoke(
                 };
 
                 r = RET_NERRNO(sched_setattr(/* pid= */ 0, &attr, /* flags= */ 0));
+                if (r == -EPERM && !context->cpu_sched_reset_on_fork) {
+                        /* RestrictRealtime= refuses sched_setattr() altogether (possibly in an outer
+                         * manager), hence fall back to sched_setscheduler(), which it filters per policy.
+                         * We cannot do that with SCHED_RESET_ON_FORK, which the filter refuses too. */
+                        struct sched_param param = { .sched_priority = context->cpu_sched_priority };
+
+                        r = RET_NERRNO(sched_setscheduler(/* pid= */ 0, context->cpu_sched_policy, &param));
+                }
                 if (r == -EINVAL && !sched_policy_supported(context->cpu_sched_policy)) {
                         _cleanup_free_ char *s = NULL;
                         (void) sched_policy_to_string_alloc(context->cpu_sched_policy, &s);
@@ -5681,7 +6169,7 @@ int exec_invoke(
         }
 
         if (context->ioprio_is_set)
-                if (ioprio_set(IOPRIO_WHO_PROCESS, 0, context->ioprio) < 0) {
+                if (ioprio_set(IOPRIO_WHO_PROCESS, /* who= */ 0, context->ioprio) < 0) {
                         *exit_status = EXIT_IOPRIO;
                         return log_error_errno(errno, "Failed to set up IO scheduling priority: %m");
                 }
@@ -5761,6 +6249,17 @@ int exec_invoke(
                 }
         }
 
+        /* Similar, for a PTY acquired from ptybrokerd: its backend device node is owned by the broker's user
+         * (i.e. typically root) initially, hence hand it over to the user we run the payload as, so that the
+         * payload may reopen its controlling terminal via /dev/tty. */
+        if (uid_is_valid(uid) && broker_fd >= 0) {
+                r = chown_terminal(broker_fd, uid);
+                if (r < 0) {
+                        *exit_status = EXIT_STDIN;
+                        return log_error_errno(r, "Failed to change ownership of ptybrokerd terminal: %m");
+                }
+        }
+
         if (params->cgroup_path) {
                 /* If delegation is enabled we'll pass ownership of the cgroup to the user of the new process. On cgroup v1
                  * this is only about systemd's own hierarchy, i.e. not the controller hierarchies, simply because that's not
@@ -5835,6 +6334,7 @@ int exec_invoke(
         }
 
         _cleanup_(sd_varlink_unrefp) sd_varlink *mountfsd_link = NULL, *nsresource_link = NULL;
+        _cleanup_close_ int keep_parent_fd = -EBADF;
         if (needs_sandboxing &&
             exec_context_get_effective_private_users(context, params) == PRIVATE_USERS_MANAGED) {
 
@@ -5844,12 +6344,16 @@ int exec_invoke(
                  * of time. */
 
                 r = mountfsd_connect(&mountfsd_link);
-                if (r < 0)
+                if (r < 0) {
+                        *exit_status = EXIT_NAMESPACE;
                         return log_error_errno(r, "Failed to connect to mountfsd: %m");
+                }
 
                 r = nsresource_connect(&nsresource_link);
-                if (r < 0)
+                if (r < 0) {
+                        *exit_status = EXIT_USER;
                         return log_error_errno(r, "Failed to connect to nsresourced: %m");
+                }
         }
 
         needs_mount_namespace = exec_needs_mount_namespace(context, params);
@@ -6107,6 +6611,7 @@ int exec_invoke(
                         bpffs_socket_fd,
                         bpffs_errno_pipe,
                         mountfsd_link,
+                        &keep_parent_fd,
                         exit_status);
         if (r < 0)
                 return r;
@@ -6208,6 +6713,7 @@ int exec_invoke(
                         bpffs_socket_fd,
                         bpffs_errno_pipe,
                         mountfsd_link,
+                        &keep_parent_fd,
                         exit_status);
         if (r < 0)
                 return r;
@@ -6215,6 +6721,8 @@ int exec_invoke(
         /* We are done now with the nsresourced/mountfsd shenanigans, let's close the connections */
         nsresource_link = sd_varlink_unref(nsresource_link);
         mountfsd_link = sd_varlink_unref(mountfsd_link);
+        /* With PrivatePIDs=, this releases the parent process that set up the connections */
+        keep_parent_fd = safe_close(keep_parent_fd);
 
         /* We don't need the pinned rootfs anymore at this point. Close the fds now, so that they are
          * definitely gone before we do our fd rearrangements below. */
@@ -6252,7 +6760,7 @@ int exec_invoke(
 
         _cleanup_free_ char *executable = NULL;
         _cleanup_close_ int executable_fd = -EBADF;
-        r = find_executable_full(path, /* root= */ NULL, context->exec_search_path, false, &executable, &executable_fd);
+        r = find_executable_full(path, /* root= */ NULL, context->exec_search_path, /* use_path_envvar= */ false, &executable, &executable_fd);
         if (r < 0) {
                 *exit_status = EXIT_EXEC;
                 log_struct_errno(LOG_NOTICE, r,
@@ -6468,7 +6976,7 @@ int exec_invoke(
                         char *exec_context = mac_selinux_context_net ?: context->selinux_context;
 
                         if (exec_context) {
-                                r = sym_setexeccon_raw(exec_context);
+                                r = RET_NERRNO(sym_setexeccon_raw(exec_context));
                                 if (r < 0) {
                                         if (!context->selinux_context_ignore) {
                                                 *exit_status = EXIT_SELINUX_CONTEXT;
@@ -6494,6 +7002,10 @@ int exec_invoke(
                 /* PR_GET_SECUREBITS is not privileged, while PR_SET_SECUREBITS is. So to suppress potential
                  * EPERMs we'll try not to call PR_SET_SECUREBITS unless necessary. Setting securebits
                  * requires CAP_SETPCAP. */
+                /* The service manager's bits are inherited by everything it starts, units only add to them. */
+                if (inherited_secure_bits > 0)
+                        secure_bits |= inherited_secure_bits;
+
                 r = prctl_safe(PR_GET_SECUREBITS, 0, 0, 0, 0);
                 if (r != secure_bits) {
                         /* CAP_SETPCAP is required to set securebits. This capability is raised into the
@@ -6616,7 +7128,33 @@ int exec_invoke(
                 }
 #endif
 
+                /* The io_uring filters have to be registered before the system call filter, because the
+                 * system call filter can deny io_uring_register(). */
+                r = apply_io_uring_address_families(context, params);
+                if (r < 0) {
+                        *exit_status = EXIT_ADDRESS_FAMILIES;
+                        return log_error_errno(r, "Failed to restrict address families of io_uring sockets: %m");
+                }
+
+                r = apply_io_uring_suid_sgid(context, params);
+                if (r < 0) {
+                        *exit_status = EXIT_SECCOMP;
+                        return log_error_errno(r, "Failed to apply SUID/SGID restrictions to io_uring: %m");
+                }
+
+                r = apply_io_uring_filter(context, params);
+                if (r < 0) {
+                        *exit_status = EXIT_SECCOMP;
+                        return log_error_errno(r, "Failed to apply io_uring filters: %m");
+                }
+
 #if HAVE_SECCOMP
+                r = apply_io_uring_syscall_filter(context, params);
+                if (r < 0) {
+                        *exit_status = EXIT_SECCOMP;
+                        return log_error_errno(r, "Failed to apply system call filters to io_uring: %m");
+                }
+
                 /* This really should remain as close to the execve() as possible, to make sure our own code is affected
                  * by the filter as little as possible. */
                 r = apply_syscall_filter(context, params);

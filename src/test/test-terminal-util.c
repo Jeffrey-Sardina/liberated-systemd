@@ -13,6 +13,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "memfd-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -144,7 +145,7 @@ TEST(get_ctty) {
         dev_t devnr;
         int r;
 
-        r = get_ctty(0, &devnr, &ctty);
+        r = get_ctty(/* pid= */ 0, &devnr, &ctty);
         if (r < 0) {
                 log_notice_errno(r, "Apparently called without a controlling TTY, cutting get_ctty() test short: %m");
                 return;
@@ -224,9 +225,9 @@ TEST(terminal_fix_size_vc) {
         /* On a virtual console terminal_fix_size() must not query the terminal at all: it should report
          * success without touching the dimensions the kernel gave us. */
 
-        _cleanup_close_ int fd = open("/dev/tty1", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, "/dev/tty1", O_RDWR|O_NOCTTY);
         if (fd < 0)
-                return (void) log_notice_errno(errno, "Can't open /dev/tty1, skipping: %m");
+                return (void) log_notice_errno(fd, "Can't open /dev/tty1, skipping: %m");
 
         _cleanup_free_ char *name = NULL;
         r = getttyname_harder(fd, &name);
@@ -270,7 +271,7 @@ TEST(terminal_get_terminfo_by_dcs) {
         int r;
 
         /* We need a non-blocking read-write fd. */
-        _cleanup_close_ int fd = fd_reopen(STDIN_FILENO, O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        _cleanup_close_ int fd = fd_reopen(STDIN_FILENO, O_RDWR|O_NONBLOCK|O_NOCTTY);
         if (fd < 0)
                 return (void) log_info_errno(fd, "Cannot reopen stdin in read-write mode: %m");
 
@@ -319,13 +320,13 @@ TEST(terminal_is_pty_fd) {
         _cleanup_close_ int fd1 = ASSERT_OK(openpt_allocate(O_RDWR, /* ret_peer_path= */ NULL));
         ASSERT_OK_POSITIVE(terminal_is_pty_fd(fd1));
 
-        _cleanup_close_ int fd2 = ASSERT_OK(pty_open_peer(fd1, O_RDWR|O_CLOEXEC|O_NOCTTY));
+        _cleanup_close_ int fd2 = ASSERT_OK(pty_open_peer(fd1, O_RDWR|O_NOCTTY));
         ASSERT_OK_POSITIVE(terminal_is_pty_fd(fd2));
 
         fd1 = safe_close(fd1);
         fd2 = safe_close(fd2);
 
-        fd1 = ASSERT_OK_ERRNO(open("/dev/null", O_RDONLY|O_CLOEXEC));
+        fd1 = ASSERT_OK(xopenat(AT_FDCWD, "/dev/null", O_RDONLY));
         ASSERT_OK_ZERO(terminal_is_pty_fd(fd1));
 
         /* In container managers real tty devices might be weird, avoid them. */
@@ -336,7 +337,7 @@ TEST(terminal_is_pty_fd) {
         FOREACH_STRING(p, "/dev/ttyS0", "/dev/tty1") {
                 _cleanup_close_ int tfd = -EBADF;
 
-                tfd = open_terminal(p, O_CLOEXEC|O_NOCTTY|O_RDONLY|O_NONBLOCK);
+                tfd = open_terminal(p, O_NOCTTY|O_RDONLY|O_NONBLOCK);
                 if (tfd == -ENOENT)
                         continue;
                 if (tfd < 0)  {
@@ -407,10 +408,14 @@ TEST(terminal_reset_defensive) {
 TEST(pty_open_peer) {
         _cleanup_free_ char *pty_path = NULL;
 
-        _cleanup_close_ int pty_fd = ASSERT_OK(openpt_allocate(O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK, &pty_path));
+        _cleanup_close_ int pty_fd = ASSERT_OK(openpt_allocate(O_RDWR|O_NOCTTY|O_NONBLOCK, &pty_path));
         ASSERT_NOT_NULL(pty_path);
 
-        _cleanup_close_ int peer_fd = ASSERT_OK(pty_open_peer(pty_fd, O_RDWR|O_NOCTTY|O_CLOEXEC));
+        _cleanup_close_ int peer_fd = ASSERT_OK(pty_open_peer(pty_fd, O_RDWR|O_NOCTTY));
+
+        /* O_CLOEXEC is implied, whether requested or not */
+        int fl = ASSERT_OK_ERRNO(fcntl(peer_fd, F_GETFD));
+        ASSERT_TRUE(FLAGS_SET(fl, FD_CLOEXEC));
 
         static const char x[] = { 'x', '\n' };
         ASSERT_OK_EQ_ERRNO(write(pty_fd, x, sizeof(x)), (ssize_t) sizeof(x));
@@ -424,29 +429,29 @@ TEST(pty_open_peer) {
 TEST(terminal_new_session) {
         int r;
 
-        _cleanup_close_ int pty_fd = ASSERT_OK(openpt_allocate(O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK, NULL));
-        _cleanup_close_ int peer_fd = ASSERT_OK(pty_open_peer(pty_fd, O_RDWR|O_NOCTTY|O_CLOEXEC));
+        _cleanup_close_ int pty_fd = ASSERT_OK(openpt_allocate(O_RDWR|O_NOCTTY|O_NONBLOCK, /* ret_peer_path= */ NULL));
+        _cleanup_close_ int peer_fd = ASSERT_OK(pty_open_peer(pty_fd, O_RDWR|O_NOCTTY));
 
         r = pidref_safe_fork_full(
                         "test-term-session",
                         (int[]) { peer_fd, peer_fd, peer_fd },
-                        NULL, 0,
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_DEATHSIG_SIGKILL|FORK_LOG|FORK_WAIT|FORK_REARRANGE_STDIO,
-                        NULL);
+                        /* ret= */ NULL);
         ASSERT_OK(r);
         if (r == 0) {
                 ASSERT_OK(terminal_new_session());
-                ASSERT_OK(get_ctty_devnr(0, NULL));
+                ASSERT_OK(get_ctty_devnr(/* pid= */ 0, /* ret= */ NULL));
 
                 terminal_detach_session();
-                ASSERT_ERROR(get_ctty_devnr(0, NULL), ENXIO);
+                ASSERT_ERROR(get_ctty_devnr(/* pid= */ 0, /* ret= */ NULL), ENXIO);
 
                 ASSERT_OK(terminal_new_session());
-                ASSERT_OK(get_ctty_devnr(0, NULL));
+                ASSERT_OK(get_ctty_devnr(/* pid= */ 0, /* ret= */ NULL));
 
                 terminal_detach_session();
                 ASSERT_OK(rearrange_stdio(-EBADF, STDOUT_FILENO, STDERR_FILENO));
-                ASSERT_ERROR(get_ctty_devnr(0, NULL), ENXIO);
+                ASSERT_ERROR(get_ctty_devnr(/* pid= */ 0, /* ret= */ NULL), ENXIO);
                 ASSERT_ERROR(terminal_new_session(), ENXIO);
 
                 _exit(EXIT_SUCCESS);
@@ -604,6 +609,19 @@ TEST(show_menu) {
                              "   1) net.foo                3) other               \n"
                              "   2) net.bar                4) net.baz             \n");
         }
+}
+
+TEST(open_terminal_cloexec) {
+        _cleanup_free_ char *peer = NULL;
+        _cleanup_close_ int pty_fd = -EBADF, fd = -EBADF;
+        int fl;
+
+        ASSERT_OK(pty_fd = openpt_allocate(O_RDWR|O_NOCTTY, &peer));
+
+        /* O_CLOEXEC is implied, whether requested or not */
+        ASSERT_OK(fd = open_terminal(peer, O_RDWR|O_NOCTTY));
+        ASSERT_OK_ERRNO(fl = fcntl(fd, F_GETFD));
+        ASSERT_TRUE(FLAGS_SET(fl, FD_CLOEXEC));
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

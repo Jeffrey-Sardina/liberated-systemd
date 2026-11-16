@@ -6,7 +6,6 @@
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
-#include "build.h"
 #include "dirent-util.h"
 #include "dlopen-note.h"
 #include "fd-util.h"
@@ -15,8 +14,7 @@
 #include "iovec-util.h"
 #include "json-util.h"
 #include "log.h"
-#include "main-func.h"
-#include "options.h"
+#include "report-server.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -24,8 +22,6 @@
 #include "tpm2-pcr.h"
 #include "tpm2-report.h"
 #include "tpm2-util.h"
-#include "varlink-io.systemd.Report.Signer.h"
-#include "varlink-util.h"
 #include "verbs.h"
 
 COMMAND(
@@ -33,7 +29,10 @@ COMMAND(
         "Get an attestation report from a Trusted Platform Module (TPM) "
         "that includes the hash of the system report.",
         .man_pages = "systemd-report-sign-tpm2@.service(8)\0",
+        .option_namespace = "common",
 );
+
+const sd_varlink_server_flags_t report_server_flags = SD_VARLINK_SERVER_ROOT_ONLY|SD_VARLINK_SERVER_MYSELF_ONLY;
 
 #define REPORT_SIGN_TPM2_PERSISTENT_DIR "/var/lib/systemd/report.sign.tpm2"
 #define REPORT_SIGN_TPM2_RUNTIME_DIR "/run/systemd/report.sign.tpm2"
@@ -97,9 +96,36 @@ static int make_default_report_options(Tpm2ReportOptions *ret) {
                 (UINT32_C(1) << TPM2_PCR_SHIM_POLICY) |
                 (UINT32_C(1) << TPM2_PCR_SYSTEM_IDENTITY);
 
+        /* Include TPM properties pertaining to hierarchy authorization and
+         * dictionary attack logic configuration. */
+        static const TPM2_PT tpm_props[] = {
+                TPM2_PT_PERMANENT,
+                TPM2_PT_MAX_AUTH_FAIL,
+                TPM2_PT_LOCKOUT_INTERVAL,
+                TPM2_PT_LOCKOUT_RECOVERY,
+        };
+
+        _cleanup_free_ TPM2_PT *props = newdup(TPM2_PT, tpm_props, ELEMENTSOF(tpm_props));
+        if (!props)
+                return log_oom();
+
+        static const TPM2_HANDLE handles[] = {
+                TPM2_RH_OWNER,
+                TPM2_RH_LOCKOUT,
+                TPM2_RH_ENDORSEMENT,
+        };
+
+        _cleanup_free_ TPM2_HANDLE *policies = newdup(TPM2_HANDLE, handles, ELEMENTSOF(handles));
+        if (!policies)
+                return log_oom();
+
         *ret = (Tpm2ReportOptions) {
                 .pcr_mask = pcr_mask,
                 .nv_pcrs = TAKE_PTR(nv_pcrs),
+                .tpm_props = TAKE_PTR(props),
+                .n_tpm_props = ELEMENTSOF(tpm_props),
+                .auth_policies = TAKE_PTR(policies),
+                .n_auth_policies = ELEMENTSOF(handles),
         };
         return 0;
 }
@@ -380,7 +406,7 @@ static int load_signing_keys(Tpm2Context *c, SigningKey **ret_keys, size_t *ret_
         _cleanup_close_ int dir_fd = xopenat_lock_full(
                         AT_FDCWD,
                         REPORT_SIGN_TPM2_PERSISTENT_DIR,
-                        O_CLOEXEC|O_DIRECTORY|O_CREAT,
+                        O_DIRECTORY|O_CREAT,
                         /* xopen_flags= */ 0,
                         /* mode= */ 0700,
                         LOCK_BSD,
@@ -392,7 +418,7 @@ static int load_signing_keys(Tpm2Context *c, SigningKey **ret_keys, size_t *ret_
         size_t n_keys = 0;
         CLEANUP_ARRAY(keys, n_keys, signing_key_array_free);
 
-        _cleanup_closedir_ DIR *d = xopendirat(dir_fd, "", O_CLOEXEC);
+        _cleanup_closedir_ DIR *d = xopendirat(dir_fd, "", /* flags= */ 0);
         if (!d)
                 return log_error_errno(errno, "Failed to open directory '%s': %m", REPORT_SIGN_TPM2_PERSISTENT_DIR);
 
@@ -729,8 +755,13 @@ static int build_report(sd_json_variant **v, const Tpm2Report *report, const str
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *cv = NULL;
         FOREACH_ARRAY(c, report->components, report->n_components) {
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *pcr_values = NULL;
-                if (c->type == TPM2_REPORT_TYPE_PCR)
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *pcr_values = NULL, *nv_public = NULL, *tpm_prop = NULL,
+                        *auth_policy = NULL, *key_public = NULL;
+                const char *session_audit_hash_alg = NULL;
+
+                switch (c->type) {
+
+                case TPM2_REPORT_TYPE_PCR:
                         FOREACH_ARRAY(p, c->pcr_values, c->n_pcr_values) {
                                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *value = NULL;
                                 r = tpm2_pcr_value_to_json(p, &value);
@@ -741,57 +772,91 @@ static int build_report(sd_json_variant **v, const Tpm2Report *report, const str
                                 if (r < 0)
                                         return log_error_errno(r, "Cannot add PCR value to array: %m");
                         }
+                        break;
 
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *nv_public = NULL;
-                if (c->type == TPM2_REPORT_TYPE_NVPCR) {
-                        r = tpm2_tpms_nv_public_to_json(c->nv_public, &nv_public);
-                        if (r < 0)
-                                return log_error_errno(r, "Cannot convert NvPCR public area to JSON: %m");
-                }
-
-                const char *session_audit_hash_alg = NULL;
-                if (c->type == TPM2_REPORT_TYPE_SESSION_AUDIT) {
+                case TPM2_REPORT_TYPE_SESSION_AUDIT:
                         session_audit_hash_alg = tpm2_hash_alg_to_string_tss2(c->session_audit_hash_alg);
                         if (!session_audit_hash_alg)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                                        "Unsupported session audit hash algorithm 0x%" PRIx16, c->session_audit_hash_alg);
+                        break;
+
+                case TPM2_REPORT_TYPE_NVPCR:
+                        r = tpm2_tpms_nv_public_to_json(c->nv_public, &nv_public);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert NvPCR public area to JSON: %m");
+                        break;
+
+                case TPM2_REPORT_TYPE_KEY_CERTIFICATION:
+                        /* The public area of a certified key is encoded like the signing key's, as TSS2
+                         * JSON. It carries everything a verifier needs to recompute the certified name and
+                         * to judge the key's attributes, and marshalled into a TPM2B_PUBLIC it is what
+                         * systemd-cryptenroll and systemd-repart consume via --tpm2-device-key=. */
+                        r = tpm2_tpmt_public_to_json(c->key_public, &key_public);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert certified key public area to JSON: %m");
+                        break;
+
+                case TPM2_REPORT_TYPE_CAPABILITY_TPM_PROPERTY:
+                        r = tpm2_tpms_tagged_property_to_json(c->property, &tpm_prop);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert tagged TPM property to JSON: %m");
+                        break;
+
+                case TPM2_REPORT_TYPE_CAPABILITY_AUTH_POLICY:
+                        r = tpm2_tpms_tagged_policy_to_json(c->auth_policy, &auth_policy);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert tagged auth policy to JSON: %m");
+                        break;
+
+                default:
+                        assert_not_reached();
                 }
 
-                TPMT_SIG_SCHEME scheme = {
-                        .scheme = c->signature->sigAlg,
-                };
-                if (IN_SET(scheme.scheme, TPM2_ALG_RSASSA, TPM2_ALG_RSAPSS, TPM2_ALG_ECDSA))
-                        scheme.details.any = c->signature->signature.any;
-                else if (scheme.scheme != TPM2_ALG_NULL)
-                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                               "Unsupported signature scheme 0x%" PRIx16, scheme.scheme);
-
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *attest_info = NULL;
-                r = tpm2_attest_info_to_json(&scheme, c->attestation, &attest_info);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot convert attestation info to JSON: %m");
-
-                _cleanup_(sd_json_variant_unrefp) sd_json_variant *sig = NULL;
-                r = tpm2_tpmt_signature_to_json(c->signature, &sig);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot convert signature to JSON: %m");
-
+                /* Capability components aren't individually signed - they are covered by the session audit
+                 * digest in the final component instead. */
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *attest_info = NULL, *sig = NULL;
                 _cleanup_free_ char *sig_pem = NULL;
-                r = tpm2_tpmt_signature_to_pem(c->signature, &sig_pem);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot convert signature to PEM: %m");
+                if (c->signature) {
+                        TPMT_SIG_SCHEME scheme = {
+                                .scheme = c->signature->sigAlg,
+                        };
+                        if (IN_SET(scheme.scheme, TPM2_ALG_RSASSA, TPM2_ALG_RSAPSS, TPM2_ALG_ECDSA))
+                                scheme.details.any = c->signature->signature.any;
+                        else if (scheme.scheme != TPM2_ALG_NULL)
+                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                                       "Unsupported signature scheme 0x%" PRIx16, scheme.scheme);
+
+                        r = tpm2_attest_info_to_json(&scheme, c->attestation, &attest_info);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert attestation info to JSON: %m");
+
+                        r = tpm2_tpmt_signature_to_json(c->signature, &sig);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert signature to JSON: %m");
+
+                        r = tpm2_tpmt_signature_to_pem(c->signature, &sig_pem);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot convert signature to PEM: %m");
+                }
 
                 r = sd_json_variant_append_arraybo(
                                 &cv,
                                 SD_JSON_BUILD_PAIR_STRING("type", tpm2_report_component_type_to_string(c->type)),
                                 JSON_BUILD_PAIR_VARIANT_NON_NULL("pcrValues", pcr_values),
-                                SD_JSON_BUILD_PAIR_CONDITION(c->type == TPM2_REPORT_TYPE_NVPCR, "nvpcrName", SD_JSON_BUILD_STRING(c->nv_pcr_name)),
-                                SD_JSON_BUILD_PAIR_CONDITION(c->type == TPM2_REPORT_TYPE_NVPCR, "nvPublic", SD_JSON_BUILD_VARIANT(nv_public)),
-                                SD_JSON_BUILD_PAIR_CONDITION(c->type != TPM2_REPORT_TYPE_SESSION_AUDIT && c->authenticated_data, "authenticatedData", SD_JSON_BUILD_STRING(c->authenticated_data)),
+                                JSON_BUILD_PAIR_STRING_NON_EMPTY("nvpcrName", c->nv_pcr_name),
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("nvPublic", nv_public),
+                                JSON_BUILD_PAIR_STRING_NON_EMPTY("authenticatedData", c->authenticated_data),
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("keyPublic", key_public),
+                                JSON_BUILD_PAIR_CONDITION_BOOLEAN(
+                                                IN_SET(c->type, TPM2_REPORT_TYPE_CAPABILITY_TPM_PROPERTY, TPM2_REPORT_TYPE_CAPABILITY_AUTH_POLICY),
+                                                "capabilityMoreData", c->more_caps),
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("tpmProperty", tpm_prop),
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("authPolicy", auth_policy),
                                 JSON_BUILD_PAIR_STRING_NON_EMPTY("sessionAuditHashAlg", session_audit_hash_alg),
-                                SD_JSON_BUILD_PAIR_VARIANT("attestInfo", attest_info),
-                                SD_JSON_BUILD_PAIR_VARIANT("signature", sig),
-                                SD_JSON_BUILD_PAIR_STRING("signaturePEM", sig_pem));
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("attestInfo", attest_info),
+                                JSON_BUILD_PAIR_VARIANT_NON_NULL("signature", sig),
+                                JSON_BUILD_PAIR_STRING_NON_EMPTY("signaturePEM", sig_pem));
                 if (r < 0)
                         return log_error_errno(r, "Cannot add component to report array: %m");
         }
@@ -803,6 +868,45 @@ static int build_report(sd_json_variant **v, const Tpm2Report *report, const str
                         SD_JSON_BUILD_PAIR_STRING("publicKeyPEM", pubkey_pem),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(voucher), "voucher", JSON_BUILD_IOVEC_BASE64(voucher)),
                         SD_JSON_BUILD_PAIR_VARIANT("components", cv));
+}
+
+static bool srk_usable_for_certification(const TPM2B_PUBLIC *public) {
+        int r;
+
+        assert(public);
+
+        /* Whatever object sits at the SRK handle gets certified. Judging its attributes is up to the
+         * verifier of the report, and whether it can be authorized with a password session is left to
+         * TPM2_Certify, the report generator leaves the component out if not. What we need to be sure of
+         * up front is that we can calculate the key's name and encode its public area, so that a
+         * pre-existing SRK we cannot handle (e.g. with a nameAlg other than SHA256, or an unusual symmetric
+         * algorithm) doesn't fail the whole report. */
+
+        /* The one attribute we do insist on is noDA: TPM2_Certify authorizes the object with its auth
+         * value, and if that isn't empty each attempt against an object without noDA counts towards the
+         * TPM's dictionary attack lockout. Reports are requested over and over again, hence stay away from
+         * such an object rather than lock the TPM up for everyone. SRKs created by us (or tpm2-tools) carry
+         * noDA. */
+        if (!FLAGS_SET(public->publicArea.objectAttributes, TPMA_OBJECT_NODA)) {
+                log_notice("SRK is subject to dictionary attack protection, not certifying it in the report.");
+                return false;
+        }
+
+        TPM2B_NAME name;
+        r = tpm2_calculate_pubkey_name(&public->publicArea, &name);
+        if (r < 0) {
+                log_notice_errno(r, "Cannot calculate name of SRK, not certifying it in the report: %m");
+                return false;
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        r = tpm2_tpmt_public_to_json(&public->publicArea, &v);
+        if (r < 0) {
+                log_notice_errno(r, "Cannot encode SRK public area as JSON, not certifying it in the report: %m");
+                return false;
+        }
+
+        return true;
 }
 
 static int vl_method_sign(
@@ -858,7 +962,7 @@ static int vl_method_sign(
         _cleanup_close_ int runtime_dir_fd = xopenat_lock_full(
                         AT_FDCWD,
                         REPORT_SIGN_TPM2_RUNTIME_DIR,
-                        O_CLOEXEC|O_DIRECTORY|O_CREAT,
+                        O_DIRECTORY|O_CREAT,
                         /* xopen_flags = */ 0,
                         /* mode= */ 0700,
                         LOCK_BSD,
@@ -875,6 +979,39 @@ static int vl_method_sign(
         if (r < 0)
                 return log_error_errno(r, "Failed to load any signing keys: %m");
 
+        /* Also certify the SRK with each signing key, and include its public area in the report. Secrets
+         * sealed to a certified SRK (e.g. via the --tpm2-device-key= switch of systemd-cryptenroll or
+         * systemd-repart) can only be unsealed by this TPM, hence a verifier of the report can use it to
+         * encrypt data for this system specifically. As TPM2_Clear replaces the SRK, the certification is
+         * also evidence that the TPM has not been cleared since the report was generated, as long as the
+         * SRK stays the same. If there is no SRK yet we create one, like systemd-cryptenroll does, which
+         * requires the owner hierarchy authorization to be empty. The report remains useful without the
+         * certification, hence failure to acquire an SRK we can handle is not fatal, and as we serve a
+         * single request per process it is not worth more than a notice either. */
+        _cleanup_(tpm2_handle_freep) Tpm2Handle *srk_handle = NULL;
+        _cleanup_(Esys_Freep) TPM2B_PUBLIC *srk_public = NULL;
+        r = tpm2_get_or_create_srk(
+                        c,
+                        /* session= */ NULL,
+                        &srk_public,
+                        /* ret_name= */ NULL,
+                        /* ret_qname= */ NULL,
+                        &srk_handle);
+        if (r < 0)
+                log_notice_errno(r, "Failed to acquire SRK, not certifying it in the report: %m");
+        else {
+                if (r > 0)
+                        log_debug("Created and persisted a new SRK.");
+
+                if (srk_usable_for_certification(srk_public)) {
+                        opts.certify_key_public = newdup(TPMT_PUBLIC, &srk_public->publicArea, 1);
+                        if (!opts.certify_key_public)
+                                return log_oom();
+
+                        opts.certify_key = TAKE_PTR(srk_handle);
+                }
+        }
+
         /* Generate a signed TPM report for each signing key. */
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *dv = NULL;
         FOREACH_ARRAY(key, keys, n_keys) {
@@ -884,7 +1021,12 @@ static int vl_method_sign(
                         return log_error_errno(r, "Failed to acquire a signing key handle for key '%s': %m", key->name);
 
                 _cleanup_(tpm2_report_freep) Tpm2Report *report = NULL;
-                r = tpm2_generate_report(c, &opts, key_handle, &external_data, &report);
+                r = tpm2_generate_report(
+                                c,
+                                &opts,
+                                key_handle,
+                                &external_data,
+                                &report);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate TPM report with key '%s': %m", key->name);
 
@@ -896,76 +1038,9 @@ static int vl_method_sign(
         return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_VARIANT("data", dv));
 }
 
-static int vl_server(void) {
-        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *vs = NULL;
-        int r;
-
-        r = varlink_server_new(&vs, SD_VARLINK_SERVER_ROOT_ONLY|SD_VARLINK_SERVER_MYSELF_ONLY, /* userdata= */ NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to allocate Varlink server: %m");
-
-        r = sd_varlink_server_add_interface(vs, &vl_interface_io_systemd_Report_Signer);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add Varlink interface: %m");
-
-        r = sd_varlink_server_bind_method(vs, "io.systemd.Report.Signer.Sign", vl_method_sign);
-        if (r < 0)
-                return log_error_errno(r, "Failed to bind Varlink methods: %m");
-
-        r = sd_varlink_server_loop_auto(vs);
-        if (r < 0)
-                return log_error_errno(r, "Failed to run Varlink event loop: %m");
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        int r;
-
-        assert(argc >= 0);
-        assert(argv);
-
-        OptionParser opts = { argc, argv };
-
-        FOREACH_OPTION_OR_RETURN(c, &opts)
-                switch (c) {
-                OPTION_COMMON_HELP:
-                        return command_print_help();
-
-                OPTION_COMMON_VERSION:
-                        return version();
-
-                OPTION_COMMON_INTROSPECT_CLI:
-                        return introspect_cli(SD_JSON_FORMAT_OFF);
-                }
-
-        if (option_parser_get_n_args(&opts) > 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This program takes no arguments.");
-
-        r = sd_varlink_invocation(SD_VARLINK_ALLOW_ACCEPT);
-        if (r < 0)
-                return log_error_errno(r, "Failed to check if invoked in Varlink mode: %m");
-        if (r == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This program can only run as a Varlink service.");
-
-        return 1;
-}
-
-static int run(int argc, char *argv[]) {
-        int r;
-
+int report_server_setup(sd_varlink_server *server) {
         TPM2_NOTE(suggested);
         LIBCRYPTO_NOTE(suggested);
 
-        log_setup();
-
-        r = parse_argv(argc, argv);
-        if (r <= 0)
-                return r;
-
-        return vl_server();
+        return report_server_add_signer_interface(server, vl_method_sign);
 }
-
-DEFINE_MAIN_FUNCTION(run);

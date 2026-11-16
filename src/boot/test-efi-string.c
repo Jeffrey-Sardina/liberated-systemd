@@ -70,11 +70,11 @@ TEST(strtolower8) {
         ASSERT_NULL(strtolower8(NULL));
 
         ASSERT_PTR_EQ(strtolower8(s), s);
-        ASSERT_EQ(memcmp(s, "\0001234abcDEF!\0zZ", sizeof(s)), 0);
+        ASSERT_MEMEQ(s, "\0001234abcDEF!\0zZ", sizeof(s));
 
         s[0] = '#';
         ASSERT_PTR_EQ(strtolower8(s), s);
-        ASSERT_EQ(memcmp(s, "#1234abcdef!\0zZ", sizeof(s)), 0);
+        ASSERT_MEMEQ(s, "#1234abcdef!\0zZ", sizeof(s));
 }
 
 TEST(strtolower16) {
@@ -83,18 +83,18 @@ TEST(strtolower16) {
         ASSERT_NULL(strtolower16(NULL));
 
         ASSERT_PTR_EQ(strtolower16(s), s);
-        ASSERT_EQ(memcmp(s, u"\0001234abcDEF!\0zZ", sizeof(s)), 0);
+        ASSERT_MEMEQ(s, u"\0001234abcDEF!\0zZ", sizeof(s));
 
         s[0] = '#';
         ASSERT_PTR_EQ(strtolower16(s), s);
-        ASSERT_EQ(memcmp(s, u"#1234abcdef!\0zZ", sizeof(s)), 0);
+        ASSERT_MEMEQ(s, u"#1234abcdef!\0zZ", sizeof(s));
 }
 
 TEST(strncmp8) {
-        ASSERT_LT(strncmp8(NULL, "", 10), 0);
-        ASSERT_GT(strncmp8("", NULL, 10), 0);
-        ASSERT_EQ(strncmp8(NULL, NULL, 0), 0);
-        ASSERT_EQ(strncmp8(NULL, NULL, 10), 0);
+        ASSERT_LT(strncmp8(/* s1= */ NULL, "", 10), 0);
+        ASSERT_GT(strncmp8("", /* s2= */ NULL, 10), 0);
+        ASSERT_EQ(strncmp8(/* s1= */ NULL, /* s2= */ NULL, 0), 0);
+        ASSERT_EQ(strncmp8(/* s1= */ NULL, /* s2= */ NULL, 10), 0);
         ASSERT_EQ(strncmp8("", "", 10), 0);
         ASSERT_EQ(strncmp8("abc", "abc", 2), 0);
         ASSERT_EQ(strncmp8("aBc", "aBc", 3), 0);
@@ -118,10 +118,10 @@ TEST(strncmp8) {
 }
 
 TEST(strncmp16) {
-        ASSERT_LT(strncmp16(NULL, u"", 10), 0);
-        ASSERT_GT(strncmp16(u"", NULL, 10), 0);
-        ASSERT_EQ(strncmp16(NULL, NULL, 0), 0);
-        ASSERT_EQ(strncmp16(NULL, NULL, 10), 0);
+        ASSERT_LT(strncmp16(/* s1= */ NULL, u"", 10), 0);
+        ASSERT_GT(strncmp16(u"", /* s2= */ NULL, 10), 0);
+        ASSERT_EQ(strncmp16(/* s1= */ NULL, /* s2= */ NULL, 0), 0);
+        ASSERT_EQ(strncmp16(/* s1= */ NULL, /* s2= */ NULL, 10), 0);
         ASSERT_EQ(strncmp16(u"", u"", 0), 0);
         ASSERT_EQ(strncmp16(u"", u"", 10), 0);
         ASSERT_EQ(strncmp16(u"abc", u"abc", 2), 0);
@@ -145,10 +145,10 @@ TEST(strncmp16) {
 }
 
 TEST(strncasecmp8) {
-        ASSERT_LT(strncasecmp8(NULL, "", 10), 0);
-        ASSERT_GT(strncasecmp8("", NULL, 10), 0);
-        ASSERT_EQ(strncasecmp8(NULL, NULL, 0), 0);
-        ASSERT_EQ(strncasecmp8(NULL, NULL, 10), 0);
+        ASSERT_LT(strncasecmp8(/* s1= */ NULL, "", 10), 0);
+        ASSERT_GT(strncasecmp8("", /* s2= */ NULL, 10), 0);
+        ASSERT_EQ(strncasecmp8(/* s1= */ NULL, /* s2= */ NULL, 0), 0);
+        ASSERT_EQ(strncasecmp8(/* s1= */ NULL, /* s2= */ NULL, 10), 0);
         ASSERT_EQ(strncasecmp8("", "", 10), 0);
         ASSERT_EQ(strncasecmp8("abc", "abc", 2), 0);
         ASSERT_EQ(strncasecmp8("aBc", "AbC", 3), 0);
@@ -172,10 +172,10 @@ TEST(strncasecmp8) {
 }
 
 TEST(strncasecmp16) {
-        ASSERT_LT(strncasecmp16(NULL, u"", 10), 0);
-        ASSERT_GT(strncasecmp16(u"", NULL, 10), 0);
-        ASSERT_EQ(strncasecmp16(NULL, NULL, 0), 0);
-        ASSERT_EQ(strncasecmp16(NULL, NULL, 10), 0);
+        ASSERT_LT(strncasecmp16(/* s1= */ NULL, u"", 10), 0);
+        ASSERT_GT(strncasecmp16(u"", /* s2= */ NULL, 10), 0);
+        ASSERT_EQ(strncasecmp16(/* s1= */ NULL, /* s2= */ NULL, 0), 0);
+        ASSERT_EQ(strncasecmp16(/* s1= */ NULL, /* s2= */ NULL, 10), 0);
         ASSERT_EQ(strncasecmp16(u"", u"", 10), 0);
         ASSERT_EQ(strncasecmp16(u"abc", u"abc", 2), 0);
         ASSERT_EQ(strncasecmp16(u"aBc", u"AbC", 3), 0);
@@ -206,7 +206,7 @@ TEST(strcpy8) {
         ASSERT_TRUE(streq8(buf, ""));
         ASSERT_PTR_EQ(strcpy8(buf, "A"), buf);
         ASSERT_TRUE(streq8(buf, "A"));
-        ASSERT_PTR_EQ(strcpy8(buf, NULL), buf);
+        ASSERT_PTR_EQ(strcpy8(buf, /* src= */ NULL), buf);
         ASSERT_TRUE(streq8(buf, ""));
 }
 
@@ -219,7 +219,7 @@ TEST(strcpy16) {
         ASSERT_TRUE(streq16(buf, u""));
         ASSERT_PTR_EQ(strcpy16(buf, u"A"), buf);
         ASSERT_TRUE(streq16(buf, u"A"));
-        ASSERT_PTR_EQ(strcpy16(buf, NULL), buf);
+        ASSERT_PTR_EQ(strcpy16(buf, /* src= */ NULL), buf);
         ASSERT_TRUE(streq16(buf, u""));
 }
 
@@ -247,6 +247,37 @@ TEST(strchr16) {
         ASSERT_PTR_EQ(strchr16(str, 'B'), &str[4]);
 
         ASSERT_PTR_EQ(strchr16(str, 0), str + strlen16(str));
+}
+
+TEST(path_filename16) {
+        ASSERT_TRUE(streq16(path_filename16(u""), u""));
+        ASSERT_TRUE(streq16(path_filename16(u"foo.addon.efi"), u"foo.addon.efi"));
+        ASSERT_TRUE(streq16(path_filename16(u"\\foo.addon.efi"), u"foo.addon.efi"));
+        ASSERT_TRUE(streq16(path_filename16(u"\\a\\b\\foo.addon.efi"), u"foo.addon.efi"));
+        ASSERT_TRUE(streq16(path_filename16(u"a\\foo.addon.efi"), u"foo.addon.efi"));
+        ASSERT_TRUE(streq16(path_filename16(u"\\a\\"), u""));
+}
+
+TEST(strstr16) {
+        ASSERT_NULL(strstr16(/* haystack= */ NULL, u"a"));
+        ASSERT_NULL(strstr16(u"a", /* needle= */ NULL));
+        ASSERT_NULL(strstr16(u"", u"a"));
+        ASSERT_NULL(strstr16(u"abc", u"abcd"));
+        ASSERT_NULL(strstr16(u"abc", u"d"));
+
+        const char16_t str[] = u"abcabd";
+        ASSERT_PTR_EQ(strstr16(str, u""), &str[0]);
+        ASSERT_PTR_EQ(strstr16(str, u"abc"), &str[0]);
+        ASSERT_PTR_EQ(strstr16(str, u"abd"), &str[3]);
+        ASSERT_PTR_EQ(strstr16(str, u"d"), &str[5]);
+        ASSERT_PTR_EQ(strstr16(str, u"abcabd"), &str[0]);
+}
+
+TEST(strstr8) {
+        ASSERT_NULL(strstr8(/* haystack= */ NULL, "a"));
+        ASSERT_NULL(strstr8("hello", "lo!"));
+        ASSERT_TRUE(streq8(strstr8("hello world", "o w"), "o world"));
+        ASSERT_TRUE(streq8(strstr8("hello", ""), "hello"));
 }
 
 TEST(xstrndup8) {
@@ -334,7 +365,7 @@ TEST(xstrdup16) {
 TEST(xstrn8_to_16) {
         char16_t *s = NULL;
 
-        ASSERT_NOT_NULL(s = xstrn8_to_16(NULL, 0));
+        ASSERT_NOT_NULL(s = xstrn8_to_16(/* str8= */ NULL, 0));
         ASSERT_TRUE(streq16(s, u""));
         free(s);
 
@@ -370,7 +401,7 @@ TEST(xstrn8_to_16) {
 TEST(xstrn16_to_ascii) {
         char *s;
 
-        ASSERT_NOT_NULL(s = xstrn16_to_ascii(NULL, 0));
+        ASSERT_NOT_NULL(s = xstrn16_to_ascii(/* str16= */ NULL, 0));
         ASSERT_TRUE(streq8(s, ""));
         free(s);
 
@@ -497,20 +528,20 @@ TEST(parse_number8) {
         uint64_t u;
         const char *tail;
 
-        ASSERT_FALSE(parse_number8(NULL, &u, NULL));
-        ASSERT_FALSE(parse_number8("", &u, NULL));
-        ASSERT_FALSE(parse_number8("a1", &u, NULL));
-        ASSERT_FALSE(parse_number8("1a", &u, NULL));
-        ASSERT_FALSE(parse_number8("-42", &u, NULL));
-        ASSERT_FALSE(parse_number8("18446744073709551616", &u, NULL));
+        ASSERT_FALSE(parse_number8(NULL, &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number8("", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number8("a1", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number8("1a", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number8("-42", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number8("18446744073709551616", &u, /* ret_tail= */ NULL));
 
-        ASSERT_TRUE(parse_number8("0", &u, NULL));
+        ASSERT_TRUE(parse_number8("0", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 0u);
-        ASSERT_TRUE(parse_number8("1", &u, NULL));
+        ASSERT_TRUE(parse_number8("1", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 1u);
-        ASSERT_TRUE(parse_number8("999", &u, NULL));
+        ASSERT_TRUE(parse_number8("999", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 999u);
-        ASSERT_TRUE(parse_number8("18446744073709551615", &u, NULL));
+        ASSERT_TRUE(parse_number8("18446744073709551615", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, UINT64_MAX);
         ASSERT_TRUE(parse_number8("42", &u, &tail));
         ASSERT_EQ(u, 42u);
@@ -524,20 +555,20 @@ TEST(parse_number16) {
         uint64_t u;
         const char16_t *tail;
 
-        ASSERT_FALSE(parse_number16(NULL, &u, NULL));
-        ASSERT_FALSE(parse_number16(u"", &u, NULL));
-        ASSERT_FALSE(parse_number16(u"a1", &u, NULL));
-        ASSERT_FALSE(parse_number16(u"1a", &u, NULL));
-        ASSERT_FALSE(parse_number16(u"-42", &u, NULL));
-        ASSERT_FALSE(parse_number16(u"18446744073709551616", &u, NULL));
+        ASSERT_FALSE(parse_number16(NULL, &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number16(u"", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number16(u"a1", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number16(u"1a", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number16(u"-42", &u, /* ret_tail= */ NULL));
+        ASSERT_FALSE(parse_number16(u"18446744073709551616", &u, /* ret_tail= */ NULL));
 
-        ASSERT_TRUE(parse_number16(u"0", &u, NULL));
+        ASSERT_TRUE(parse_number16(u"0", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 0u);
-        ASSERT_TRUE(parse_number16(u"1", &u, NULL));
+        ASSERT_TRUE(parse_number16(u"1", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 1u);
-        ASSERT_TRUE(parse_number16(u"999", &u, NULL));
+        ASSERT_TRUE(parse_number16(u"999", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, 999u);
-        ASSERT_TRUE(parse_number16(u"18446744073709551615", &u, NULL));
+        ASSERT_TRUE(parse_number16(u"18446744073709551615", &u, /* ret_tail= */ NULL));
         ASSERT_EQ(u, UINT64_MAX);
         ASSERT_TRUE(parse_number16(u"42", &u, &tail));
         ASSERT_EQ(u, 42u);
@@ -634,7 +665,7 @@ TEST(line_get_key_value) {
 
         /* Let's make sure we don't fail on real os-release data. */
         _cleanup_free_ char *osrel = NULL;
-        if (read_full_file("/usr/lib/os-release", &osrel, NULL) >= 0) {
+        if (read_full_file("/usr/lib/os-release", &osrel, /* ret_size= */ NULL) >= 0) {
                 pos = 0;
                 while (line_get_key_value(osrel, "=", &pos, &key, &value)) {
                         ASSERT_NOT_NULL(key);
@@ -644,22 +675,22 @@ TEST(line_get_key_value) {
         }
 }
 
-TEST(hexdump) {
+TEST(hexdump16) {
         char16_t *hex;
 
-        ASSERT_NOT_NULL(hex = hexdump(NULL, 0));
+        ASSERT_NOT_NULL(hex = hexdump16(/* data= */ NULL, /* size= */ 0));
         ASSERT_TRUE(streq16(hex, u""));
         free(hex);
 
-        ASSERT_NOT_NULL(hex = hexdump("1", 2));
+        ASSERT_NOT_NULL(hex = hexdump16("1", 2));
         ASSERT_TRUE(streq16(hex, u"3100"));
         free(hex);
 
-        ASSERT_NOT_NULL(hex = hexdump("abc", 4));
+        ASSERT_NOT_NULL(hex = hexdump16("abc", 4));
         ASSERT_TRUE(streq16(hex, u"61626300"));
         free(hex);
 
-        ASSERT_NOT_NULL(hex = hexdump((uint8_t[]){ 0x0, 0x42, 0xFF, 0xF1, 0x1F }, 5));
+        ASSERT_NOT_NULL(hex = hexdump16((uint8_t[]){ 0x0, 0x42, 0xFF, 0xF1, 0x1F }, 5));
         ASSERT_TRUE(streq16(hex, u"0042fff11f"));
         free(hex);
 }
@@ -676,7 +707,7 @@ _printf_(1, 2) static void test_printf_one(const char *format, ...) {
         log_info("/* %s(%s) -> \"%.100s\" */", __func__, format, buf);
 
         _cleanup_free_ char16_t *buf_efi = NULL;
-        ASSERT_NOT_NULL(buf_efi = xvasprintf_status(0, format, ap_efi));
+        ASSERT_NOT_NULL(buf_efi = xvasprintf_status(/* status= */ 0, format, ap_efi));
 
         bool eq = true;
         for (size_t i = 0; i <= (size_t) r; i++) {
@@ -793,7 +824,7 @@ TEST(xvasprintf_status) {
         /* Non printf-compatible behavior tests below. */
         char16_t *s;
 
-        ASSERT_NOT_NULL(s = xasprintf_status(0, "\n \r \r\n"));
+        ASSERT_NOT_NULL(s = xasprintf_status(/* status= */ 0, "\n \r \r\n"));
         ASSERT_TRUE(streq16(s, u"\r\n \r \r\r\n"));
         s = mfree(s);
 
@@ -817,10 +848,10 @@ TEST(xvasprintf_status) {
 TEST(efi_memchr) {
         ASSERT_TRUE(streq8(efi_memchr("abcde", 'c', 5), "cde"));
         ASSERT_TRUE(streq8(efi_memchr("abcde", 'c', 3), "cde"));
-        ASSERT_TRUE(streq8(efi_memchr("abcde", 'c', 2), NULL));
+        ASSERT_TRUE(streq8(efi_memchr("abcde", 'c', 2), /* s2= */ NULL));
         ASSERT_TRUE(streq8(efi_memchr("abcde", 'c', 7), "cde"));
-        ASSERT_TRUE(streq8(efi_memchr("abcde", 'q', 5), NULL));
-        ASSERT_TRUE(streq8(efi_memchr("abcde", 'q', 0), NULL));
+        ASSERT_TRUE(streq8(efi_memchr("abcde", 'q', 5), /* s2= */ NULL));
+        ASSERT_TRUE(streq8(efi_memchr("abcde", 'q', 0), /* s2= */ NULL));
         /* Test that the character is interpreted as unsigned char. */
         ASSERT_TRUE(streq8(efi_memchr("abcde", 'a', 6), efi_memchr("abcde", 'a' + 0x100, 6)));
         ASSERT_TRUE(streq8(efi_memchr("abcde", 0, 6), ""));
@@ -828,10 +859,10 @@ TEST(efi_memchr) {
 }
 
 TEST(efi_memcmp) {
-        ASSERT_EQ(efi_memcmp(NULL, NULL, 0), 0);
-        ASSERT_EQ(efi_memcmp(NULL, NULL, 1), 0);
-        ASSERT_LT(efi_memcmp(NULL, "", 1), 0);
-        ASSERT_GT(efi_memcmp("", NULL, 1), 0);
+        ASSERT_EQ(efi_memcmp(/* p1= */ NULL, /* p2= */ NULL, 0), 0);
+        ASSERT_EQ(efi_memcmp(/* p1= */ NULL, /* p2= */ NULL, 1), 0);
+        ASSERT_LT(efi_memcmp(/* p1= */ NULL, "", 1), 0);
+        ASSERT_GT(efi_memcmp("", /* p2= */ NULL, 1), 0);
         ASSERT_EQ(efi_memcmp("", "", 0), 0);
         ASSERT_EQ(efi_memcmp("", "", 1), 0);
         ASSERT_EQ(efi_memcmp("1", "1", 1), 0);
@@ -848,20 +879,20 @@ TEST(efi_memcmp) {
 TEST(efi_memcpy) {
         char buf[10];
 
-        ASSERT_NULL(efi_memcpy(NULL, NULL, 0));
-        ASSERT_NULL(efi_memcpy(NULL, "", 1));
-        ASSERT_PTR_EQ(efi_memcpy(buf, NULL, 0), buf);
-        ASSERT_PTR_EQ(efi_memcpy(buf, NULL, 1), buf);
+        ASSERT_NULL(efi_memcpy(/* dest= */ NULL, /* src= */ NULL, 0));
+        ASSERT_NULL(efi_memcpy(/* dest= */ NULL, "", 1));
+        ASSERT_PTR_EQ(efi_memcpy(buf, /* src= */ NULL, 0), buf);
+        ASSERT_PTR_EQ(efi_memcpy(buf, /* src= */ NULL, 1), buf);
         ASSERT_PTR_EQ(efi_memcpy(buf, "a", 0), buf);
 
         ASSERT_PTR_EQ(efi_memcpy(buf, "", 1), buf);
-        ASSERT_EQ(memcmp(buf, "", 1), 0);
+        ASSERT_MEMEQ(buf, "", 1);
         ASSERT_PTR_EQ(efi_memcpy(buf, "1", 1), buf);
-        ASSERT_EQ(memcmp(buf, "1", 1), 0);
+        ASSERT_MEMEQ(buf, "1", 1);
         ASSERT_PTR_EQ(efi_memcpy(buf, "23", 3), buf);
-        ASSERT_EQ(memcmp(buf, "23", 3), 0);
+        ASSERT_MEMEQ(buf, "23", 3);
         ASSERT_PTR_EQ(efi_memcpy(buf, "45\0ab\0\0\0c", 9), buf);
-        ASSERT_EQ(memcmp(buf, "45\0ab\0\0\0c", 9), 0);
+        ASSERT_MEMEQ(buf, "45\0ab\0\0\0c", 9);
 }
 
 TEST(efi_memset) {
@@ -872,11 +903,11 @@ TEST(efi_memset) {
         ASSERT_PTR_EQ(efi_memset(buf, '1', 0), buf);
 
         ASSERT_PTR_EQ(efi_memset(buf, '2', 1), buf);
-        ASSERT_EQ(memcmp(buf, "2", 1), 0);
+        ASSERT_MEMEQ(buf, "2", 1);
         ASSERT_PTR_EQ(efi_memset(buf, '4', 4), buf);
-        ASSERT_EQ(memcmp(buf, "4444", 4), 0);
+        ASSERT_MEMEQ(buf, "4444", 4);
         ASSERT_PTR_EQ(efi_memset(buf, 'a', 10), buf);
-        ASSERT_EQ(memcmp(buf, "aaaaaaaaaa", 10), 0);
+        ASSERT_MEMEQ(buf, "aaaaaaaaaa", 10);
 }
 
 TEST(efi_strspn) {

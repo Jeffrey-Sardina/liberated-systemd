@@ -176,6 +176,30 @@ int state_directory_generic(RuntimeScope scope, const char *suffix, char **ret) 
         }
 }
 
+int state_directory(RuntimeScope scope, const char *fallback_suffix, char **ret) {
+        int r;
+
+        assert(ret);
+
+        /* Accept $STATE_DIRECTORY as authoritative, i.e. only works for our service's own state dir, as
+         * fallback_suffix is ignored if $STATE_DIRECTORY is set.
+         *
+         * If $STATE_DIRECTORY is missing, apply the fallback suffix to /var/lib/, or $XDG_STATE_HOME if we
+         * are in a user runtime scope.
+         *
+         * Return value indicates whether the suffix was applied or not. */
+
+        const char *e = secure_getenv("STATE_DIRECTORY");
+        if (e)
+                return strdup_to(ret, e);
+
+        r = state_directory_generic(scope, fallback_suffix, ret);
+        if (r < 0)
+                return r;
+
+        return 1;
+}
+
 static const char* const user_data_unit_paths[] = {
         "/usr/local/lib/systemd/user",
         "/usr/local/share/systemd/user",
@@ -364,8 +388,6 @@ static int acquire_lookup_dirs(
 }
 
 static int patch_root_prefix(char **p, const char *root_dir) {
-        char *c;
-
         assert(p);
 
         if (!root_dir)
@@ -374,12 +396,11 @@ static int patch_root_prefix(char **p, const char *root_dir) {
         if (!*p)
                 return 0;
 
-        c = path_join(root_dir, *p);
+        char *c = path_join(root_dir, *p);
         if (!c)
                 return -ENOMEM;
 
-        free_and_replace(*p, c);
-        return 0;
+        return free_and_replace(*p, c);
 }
 
 static int patch_root_prefix_strv(char **l, const char *root_dir) {
@@ -486,7 +507,7 @@ static char** user_unit_search_dirs(
         if (strv_extend_strv_consume(&paths, TAKE_PTR(data_dirs), /* filter_duplicates= */ false) < 0)
                 return NULL;
 
-        if (strv_extend_strv(&paths, (char* const*) user_data_unit_paths, false) < 0)
+        if (strv_extend_strv(&paths, (char* const*) user_data_unit_paths, /* filter_duplicates= */ false) < 0)
                 return NULL;
 
         if (strv_extend(&paths, generator_late) < 0)
@@ -512,7 +533,8 @@ int lookup_paths_init(
                 *generator = NULL, *generator_early = NULL, *generator_late = NULL,
                 *transient = NULL,
                 *persistent_control = NULL, *runtime_control = NULL,
-                *persistent_attached = NULL, *runtime_attached = NULL;
+                *persistent_attached = NULL, *runtime_attached = NULL,
+                *vendor_config = NULL;
         _cleanup_strv_free_ char **paths = NULL;
         int r;
 
@@ -525,7 +547,7 @@ int lookup_paths_init(
                 if (scope == RUNTIME_SCOPE_USER)
                         return -EINVAL;
 
-                r = is_dir(root_dir, true);
+                r = is_dir(root_dir, /* follow= */ true);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -694,6 +716,17 @@ int lookup_paths_init(
         if (r < 0)
                 return r;
 
+        if (IN_SET(scope, RUNTIME_SCOPE_SYSTEM, RUNTIME_SCOPE_GLOBAL)) {
+                vendor_config = strdup(scope == RUNTIME_SCOPE_SYSTEM ? SYSTEM_DATA_UNIT_DIR
+                                                                     : USER_DATA_UNIT_DIR);
+                if (!vendor_config)
+                        return -ENOMEM;
+
+                r = patch_root_prefix(&vendor_config, root);
+                if (r < 0)
+                        return r;
+        }
+
         r = patch_root_prefix_strv(paths, root);
         if (r < 0)
                 return -ENOMEM;
@@ -715,6 +748,8 @@ int lookup_paths_init(
 
                 .persistent_attached = TAKE_PTR(persistent_attached),
                 .runtime_attached = TAKE_PTR(runtime_attached),
+
+                .vendor_config = TAKE_PTR(vendor_config),
 
                 .root_dir = TAKE_PTR(root),
                 .temporary_dir = TAKE_PTR(tempdir),
@@ -743,6 +778,8 @@ void lookup_paths_done(LookupPaths *lp) {
 
         lp->persistent_attached = mfree(lp->persistent_attached);
         lp->runtime_attached = mfree(lp->runtime_attached);
+
+        lp->vendor_config = mfree(lp->vendor_config);
 
         lp->generator = mfree(lp->generator);
         lp->generator_early = mfree(lp->generator_early);

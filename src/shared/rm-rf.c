@@ -139,7 +139,7 @@ static int openat_harder(int dfd, const char *path, int open_flags, RemoveFlags 
             !FLAGS_SET(open_flags, O_DIRECTORY) ||
             !FLAGS_SET(remove_flags, REMOVE_CHMOD)) {
 
-                fd = RET_NERRNO(openat(dfd, path, open_flags));
+                fd = xopenat(dfd, path, open_flags);
                 if (fd < 0)
                         return fd;
 
@@ -155,7 +155,7 @@ static int openat_harder(int dfd, const char *path, int open_flags, RemoveFlags 
                 return TAKE_FD(fd);
         }
 
-        pfd = RET_NERRNO(openat(dfd, path, (open_flags & (O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW)) | O_PATH));
+        pfd = xopenat(dfd, path, (open_flags & (O_DIRECTORY|O_NOFOLLOW)) | O_PATH);
         if (pfd < 0)
                 return pfd;
 
@@ -217,7 +217,7 @@ static int rm_rf_inner_child(
                         return 0;
 
                 /* Stop at mount points */
-                r = is_mount_point_at(fd, fname, 0);
+                r = is_mount_point_at(fd, fname, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -246,7 +246,7 @@ static int rm_rf_inner_child(
 
                 mode_t old_mode;
                 int subdir_fd = openat_harder(fd, fname,
-                                              O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME,
+                                              O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_NOFOLLOW|O_NOATIME,
                                               flags, &old_mode);
                 if (subdir_fd < 0)
                         return subdir_fd;
@@ -284,18 +284,22 @@ static void free_todo_entries(TodoEntry **todos) {
 }
 
 int rm_rf_children(
-                int fd,
+                int _fd,
                 RemoveFlags flags,
                 const struct stat *root_dev) {
 
+        _cleanup_close_ int fd = TAKE_FD(_fd); /* always close */
         struct stat st;
 
         assert(fd >= 0);
 
+        if (FLAGS_SET(flags, REMOVE_REWIND) && lseek(fd, 0, SEEK_SET) < 0)
+                return -errno;
+
         if (fstat(fd, &st) < 0)
                 return -errno;
 
-        return rm_rf_children_impl(fd, flags, root_dev, st.st_mode);
+        return rm_rf_children_impl(TAKE_FD(fd), flags, root_dev, st.st_mode);
 }
 
 static int rm_rf_children_impl(
@@ -311,6 +315,8 @@ static int rm_rf_children_impl(
 
         /* Return the first error we run into, but nevertheless try to go on.
          * The passed fd is closed in all cases, including on failure. */
+
+        assert(fd >= 0);
 
         for (;;) {  /* This loop corresponds to the directory nesting level. */
                 _cleanup_closedir_ DIR *d = NULL;
@@ -379,7 +385,7 @@ static int rm_rf_children_impl(
 
                         is_dir = de->d_type == DT_UNKNOWN ? -1 : de->d_type == DT_DIR;
 
-                        r = rm_rf_inner_child(fd, de->d_name, is_dir, flags, root_dev, false);
+                        r = rm_rf_inner_child(fd, de->d_name, is_dir, flags, root_dev, /* allow_recursion= */ false);
                         if (r == -EISDIR) {
                                 /* Push the current working state onto the todo list */
 
@@ -392,7 +398,7 @@ static int rm_rf_children_impl(
 
                                  mode_t mode;
                                  int newfd = openat_harder(fd, de->d_name,
-                                                           O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME,
+                                                           O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_NOFOLLOW|O_NOATIME,
                                                            flags, &mode);
                                  if (newfd >= 0) {
                                          todos[n_todo++] = (TodoEntry) {
@@ -479,10 +485,10 @@ int rm_rf_at(int dir_fd, const char *path, RemoveFlags flags) {
                 if (unlinkat(dir_fd, path, AT_REMOVEDIR) >= 0)
                         return 0;
 
-        fd = openat_harder(dir_fd, path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME, flags, &old_mode);
+        fd = openat_harder(dir_fd, path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_NOFOLLOW|O_NOATIME, flags, &old_mode);
         if (fd >= 0) {
                 /* We have a dir */
-                r = rm_rf_children_impl(fd, flags, NULL, old_mode);
+                r = rm_rf_children_impl(fd, flags, /* root_dev= */ NULL, old_mode);
 
                 if (FLAGS_SET(flags, REMOVE_ROOT))
                         q = RET_NERRNO(unlinkat(dir_fd, path, AT_REMOVEDIR));
@@ -536,7 +542,7 @@ int rm_rf_child(int fd, const char *name, RemoveFlags flags) {
         if (FLAGS_SET(flags, REMOVE_ONLY_DIRECTORIES|REMOVE_SUBVOLUME))
                 return -EINVAL;
 
-        return rm_rf_inner_child(fd, name, -1, flags, NULL, true);
+        return rm_rf_inner_child(fd, name, /* is_dir= */ -1, flags, /* root_dev= */ NULL, /* allow_recursion= */ true);
 }
 
 const char* rm_rf_safe(const char *p) {

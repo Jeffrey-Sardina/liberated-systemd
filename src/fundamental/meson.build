@@ -3,6 +3,7 @@
 fundamental_include = include_directories('.')
 
 fundamental_sources = files(
+        'bmp.c',
         'bootspec.c',
         'chid.c',
         'edid.c',
@@ -12,6 +13,7 @@ fundamental_sources = files(
         'sha1.c',
         'sha256.c',
         'string-util.c',
+        'strv.c',
         'uki.c',
 )
 

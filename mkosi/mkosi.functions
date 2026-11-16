@@ -4,7 +4,14 @@
 # and sets the following variables and one common function:
 # - $MKOSI_CFLAGS
 # - $MKOSI_LDFLAGS
+# - $MKOSI_RUSTFLAGS
 # - $MKOSI_MESON_OPTIONS
+
+# Git refuses to run in a checkout owned by a different user than the one running the build, which breaks
+# the VCS tag in the version string, so explicitly mark the source directory as safe.
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0="$PWD"
 
 MKOSI_CFLAGS="-O0 -g"
 if ((LLVM)); then
@@ -17,7 +24,13 @@ if ((LLVM)) && [[ -n "$SANITIZERS" ]]; then
     MKOSI_LDFLAGS="$MKOSI_LDFLAGS -Wl,-rpath=$(realpath "$(clang --print-runtime-dir)")"
 fi
 
-MKOSI_MESON_OPTIONS="-D mode=developer -D vcs-tag=${VCS_TAG:-true} -D b_sanitize=${SANITIZERS:-none} -Dtime-epoch=1744207869"
+# rustc links through clang as well and has to pick the same shared sanitizer runtime as the C code.
+MKOSI_RUSTFLAGS=""
+if ((LLVM)) && [[ -n "$SANITIZERS" ]]; then
+    MKOSI_RUSTFLAGS="-Clink-arg=-shared-libasan -Clink-arg=-Wl,-rpath=$(realpath "$(clang --print-runtime-dir)")"
+fi
+
+MKOSI_MESON_OPTIONS="-D mode=developer -D vcs-tag=${VCS_TAG:-true} -D b_sanitize=${SANITIZERS:-none} -Dtime-epoch=1744207869 -D varlink-sftp=true"
 if ((WIPE)) && [[ -d "$BUILDDIR/meson-private" ]]; then
     MKOSI_MESON_OPTIONS="$MKOSI_MESON_OPTIONS --wipe"
 fi

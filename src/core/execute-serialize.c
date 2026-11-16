@@ -1121,6 +1121,10 @@ static int exec_parameters_serialize(const ExecParameters *p, const ExecContext 
                         return r;
         }
 
+        r = serialize_bool_elide(f, "exec-parameters-io-uring-bpf-filter-supported", p->io_uring_bpf_filter_supported);
+        if (r < 0)
+                return r;
+
         r = serialize_bool_elide(f, "exec-parameters-selinux-context-net", p->selinux_context_net);
         if (r < 0)
                 return r;
@@ -1336,6 +1340,12 @@ static int exec_parameters_deserialize(ExecParameters *p, FILE *f, FDSet *fds) {
                         if (r < 0)
                                 return r;
                         p->flags = flags;
+                } else if ((val = startswith(l, "exec-parameters-io-uring-bpf-filter-supported="))) {
+                        r = parse_boolean(val);
+                        if (r < 0)
+                                return r;
+
+                        p->io_uring_bpf_filter_supported = r;
                 } else if ((val = startswith(l, "exec-parameters-selinux-context-net="))) {
                         r = parse_boolean(val);
                         if (r < 0)
@@ -1575,7 +1585,7 @@ static int deserialize_mount_options(const char *s, MountOptions **ret_mount_opt
                 PartitionDesignator partition_designator;
                 const char *p;
 
-                r = extract_first_word(&s, &word, NULL, 0);
+                r = extract_first_word(&s, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1872,7 +1882,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 FOREACH_ARRAY(i, c->directories[dt].items, c->directories[dt].n_items) {
                         _cleanup_free_ char *path_escaped = NULL;
 
-                        path_escaped = shell_escape(i->path, ":\"");
+                        path_escaped = xescape(i->path, ":\"");
                         if (!path_escaped)
                                 return log_oom_debug();
 
@@ -1888,7 +1898,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                         STRV_FOREACH(d, i->symlinks) {
                                 _cleanup_free_ char *link_escaped = NULL;
 
-                                link_escaped = shell_escape(*d, ":\"");
+                                link_escaped = xescape(*d, ":\"");
                                 if (!link_escaped)
                                         return log_oom_debug();
 
@@ -2432,6 +2442,17 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
+        void *op;
+        SET_FOREACH(op, c->io_uring_filter) {
+                r = serialize_item_format(f, "exec-context-io-uring-filter", "%d", PTR_TO_INT(op) - 1);
+                if (r < 0)
+                        return r;
+        }
+
+        r = serialize_bool_elide(f, "exec-context-io-uring-filter-allow-list", c->io_uring_filter_allow_list);
+        if (r < 0)
+                return r;
+
         r = serialize_item(f, "exec-context-user-namespace-path", c->user_namespace_path);
         if (r < 0)
                 return r;
@@ -2646,7 +2667,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
                         free_and_replace(c->working_directory, p);
@@ -2654,7 +2675,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
                         free_and_replace(c->root_directory, p);
@@ -2662,7 +2683,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
                         free_and_replace(c->root_image, p);
@@ -2705,7 +2726,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
                         free_and_replace(c->root_mstack, p);
@@ -3026,7 +3047,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         _cleanup_free_ char *limit = NULL;
                         int type;
 
-                        r = extract_first_word(&val, &limit, "=", 0);
+                        r = extract_first_word(&val, &limit, "=", /* flags= */ 0);
                         if (r < 0)
                                 return r;
                         if (r == 0 || !val)
@@ -3144,7 +3165,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
 
@@ -3154,7 +3175,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
 
@@ -3164,7 +3185,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         ssize_t k;
                         char *p;
 
-                        k = cunescape(val, 0, &p);
+                        k = cunescape(val, /* flags= */ 0, &p);
                         if (k < 0)
                                 return k;
 
@@ -3405,7 +3426,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        r = hashmap_ensure_put(&c->syscall_filter, NULL, INT_TO_PTR(id + 1), INT_TO_PTR(errno_num));
+                        r = hashmap_ensure_put(&c->syscall_filter, /* hash_ops= */ NULL, INT_TO_PTR(id + 1), INT_TO_PTR(errno_num));
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-syscall-archs="))) {
@@ -3415,7 +3436,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        r = set_ensure_put(&c->syscall_archs, NULL, UINT_TO_PTR(id + 1));
+                        r = set_ensure_put(&c->syscall_archs, /* hash_ops= */ NULL, UINT_TO_PTR(id + 1));
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-syscall-errno="))) {
@@ -3445,7 +3466,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        r = hashmap_ensure_put(&c->syscall_log, NULL, INT_TO_PTR(id + 1), INT_TO_PTR(errno_num));
+                        r = hashmap_ensure_put(&c->syscall_log, /* hash_ops= */ NULL, INT_TO_PTR(id + 1), INT_TO_PTR(errno_num));
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-syscall-log-allow-list="))) {
@@ -3478,7 +3499,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
 
-                        r = set_ensure_put(&c->address_families, NULL, INT_TO_PTR(af));
+                        r = set_ensure_put(&c->address_families, /* hash_ops= */ NULL, INT_TO_PTR(af));
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-address-families-allow-list="))) {
@@ -3486,6 +3507,23 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                         c->address_families_allow_list = r;
+                } else if ((val = startswith(l, "exec-context-io-uring-filter="))) {
+                        int op;
+
+                        r = safe_atoi(val, &op);
+                        if (r < 0)
+                                return r;
+                        if (op < 0)
+                                return -EINVAL;
+
+                        r = set_ensure_put(&c->io_uring_filter, /* hash_ops= */ NULL, INT_TO_PTR(op + 1));
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-context-io-uring-filter-allow-list="))) {
+                        r = parse_boolean(val);
+                        if (r < 0)
+                                return r;
+                        c->io_uring_filter_allow_list = r;
                 } else if ((val = startswith(l, "exec-context-network-namespace-path="))) {
                         r = free_and_strdup(&c->network_namespace_path, val);
                         if (r < 0)
@@ -3545,7 +3583,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
 
                         r = extract_first_word(&val,
                                                &source,
-                                               NULL,
+                                               /* separators= */ NULL,
                                                EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS);
                         if (r < 0)
                                 return r;

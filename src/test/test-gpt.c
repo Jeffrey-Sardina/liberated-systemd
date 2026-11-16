@@ -7,7 +7,6 @@
 #include "gpt.h"
 #include "log.h"
 #include "memfd-util.h"
-#include "memory-util.h"
 #include "pretty-print.h"
 #include "strv.h"
 #include "tests.h"
@@ -92,7 +91,7 @@ static void test_shorthand_one(const char *shorthand, const char *canonical) {
 
         /* Some partition types, e.g. root-secondary, only exist on some architectures. */
         if (gpt_partition_type_from_string(canonical, &x) < 0) {
-                ASSERT_ERROR(gpt_partition_type_from_string(shorthand, NULL), EINVAL);
+                ASSERT_ERROR(gpt_partition_type_from_string(shorthand, /* ret= */ NULL), EINVAL);
                 return;
         }
 
@@ -124,7 +123,7 @@ TEST(shorthands) {
         FOREACH_STRING(s, "", "2", "-vty", "-vsig", "esp-vty", "esp-vsig", "esp2", "root-sig", "root22",
                        "root-secondary2", "root-x86-64-vty2", "root-verity-vty", "root-vty-vty",
                        "root-verity-sig-vsig", "root-vsig-vsig")
-                ASSERT_ERROR(gpt_partition_type_from_string(s, NULL), EINVAL);
+                ASSERT_ERROR(gpt_partition_type_from_string(s, /* ret= */ NULL), EINVAL);
 
         /* "root-riscv32" ends in "2", but it is not "root-riscv3" for the secondary architecture. */
         GptPartitionType t;
@@ -191,6 +190,26 @@ static void make_gpt(int fd, uint32_t sector_size, const GptPartitionEntry *part
         }
 }
 
+TEST(gpt_label_is_valid) {
+        ASSERT_TRUE(gpt_label_is_valid(""));
+        ASSERT_TRUE(gpt_label_is_valid("root-x86-64"));
+        ASSERT_TRUE(gpt_label_is_valid("with \"quotes\" and \\ and *"));
+        ASSERT_TRUE(gpt_label_is_valid("123456789012345678901234567890123456"));
+        ASSERT_FALSE(gpt_label_is_valid("1234567890123456789012345678901234567"));
+        /* 36 two-byte UTF-8 characters fit, they are one UTF-16 code unit each */
+        ASSERT_TRUE(gpt_label_is_valid("ääääääääääääääääääääääääääääääääääää"));
+        ASSERT_FALSE(gpt_label_is_valid("äääääääääääääääääääääääääääääääääääää"));
+        /* Characters outside of the BMP take two UTF-16 code units */
+        ASSERT_TRUE(gpt_label_is_valid("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"));
+        ASSERT_FALSE(gpt_label_is_valid("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x"));
+        ASSERT_FALSE(gpt_label_is_valid(NULL));
+        ASSERT_FALSE(gpt_label_is_valid("\xff"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\tbar"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\nbar"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\x7f"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\xc2\x85")); /* U+0085, NEL, a C1 control character */
+}
+
 TEST(gpt_probe_empty) {
         _cleanup_close_ int fd = -EBADF;
 
@@ -255,8 +274,8 @@ TEST(gpt_probe_sector_512) {
         ASSERT_NOT_NULL(ret_entries);
 
         GptPartitionEntry *e = ret_entries;
-        ASSERT_EQ(memcmp_nn(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entries[0].unique_partition_guid, sizeof(entries[0].unique_partition_guid)), 0);
-        ASSERT_EQ(memcmp_nn(e[1].unique_partition_guid, sizeof(e[1].unique_partition_guid), entries[1].unique_partition_guid, sizeof(entries[1].unique_partition_guid)), 0);
+        ASSERT_MEMEQ_NN(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entries[0].unique_partition_guid, sizeof(entries[0].unique_partition_guid));
+        ASSERT_MEMEQ_NN(e[1].unique_partition_guid, sizeof(e[1].unique_partition_guid), entries[1].unique_partition_guid, sizeof(entries[1].unique_partition_guid));
         ASSERT_EQ(le64toh(e[0].starting_lba), UINT64_C(100));
         ASSERT_EQ(le64toh(e[1].starting_lba), UINT64_C(300));
 }
@@ -282,7 +301,7 @@ TEST(gpt_probe_sector_4096) {
         ASSERT_EQ(n, 1u);
 
         GptPartitionEntry *e = ret_entries;
-        ASSERT_EQ(memcmp_nn(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entry.unique_partition_guid, sizeof(entry.unique_partition_guid)), 0);
+        ASSERT_MEMEQ_NN(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entry.unique_partition_guid, sizeof(entry.unique_partition_guid));
         ASSERT_EQ(le64toh(e[0].starting_lba), UINT64_C(50));
 }
 

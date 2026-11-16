@@ -11,7 +11,9 @@
 #include "blockdev-util.h"
 #include "device-util.h"
 #include "devnum-util.h"
+#include "dlopen-note.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "hash-funcs.h"
 #include "hashmap.h"
 #include "json-util.h"
@@ -20,9 +22,18 @@
 #include "metrics.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
-#include "report-diskspace.h"
+#include "report-server.h"
 #include "sort-util.h"
 #include "stat-util.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-report-diskspace\0",
+        "Report disk space metrics.",
+        .option_namespace = "common",
+);
+
+const sd_varlink_server_flags_t report_server_flags = SD_VARLINK_SERVER_INHERIT_USERDATA;
 
 /* Reports the size of and the disk space still available on all mounted, writable, block device backed file
  * systems, i.e. roughly what df(1) shows. Pseudo file systems (procfs, sysfs, tmpfs, …), network file
@@ -125,9 +136,9 @@ static int mount_collect(Hashmap **file_systems, struct libmnt_fs *fs) {
 
         /* Mount points below a directory we lack access to (or that have been unmounted since the mount
          * table was read) are simply not considered. */
-        _cleanup_close_ int fd = open(target, O_PATH|O_CLOEXEC);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, target, O_PATH);
         if (fd < 0) {
-                log_debug_errno(errno, "Failed to open mount point '%s', ignoring: %m", target);
+                log_debug_errno(fd, "Failed to open mount point '%s', ignoring: %m", target);
                 return 0;
         }
 
@@ -357,10 +368,16 @@ static const MetricFamily diskspace_metric_family_table[] = {
         {}
 };
 
-int vl_method_describe_metrics(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+static int vl_method_describe_metrics(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return metrics_method_describe(diskspace_metric_family_table, link, parameters, flags, userdata);
 }
 
-int vl_method_list_metrics(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+static int vl_method_list_metrics(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return metrics_method_list(diskspace_metric_family_table, link, parameters, flags, userdata);
+}
+
+int report_server_setup(sd_varlink_server *server) {
+        LIBMOUNT_NOTE(required);
+
+        return report_server_add_metrics_interface(server, vl_method_list_metrics, vl_method_describe_metrics);
 }

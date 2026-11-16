@@ -6,6 +6,8 @@
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "path-util.h"
 #include "pidref.h"
@@ -13,6 +15,7 @@
 #include "set.h"
 #include "socket-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "varlink-internal.h"
 #include "varlink-util.h"
 #include "version.h"
@@ -245,14 +248,15 @@ static int varlink_finish_idle(Set *s) {
 
 #define VARLINK_EXECUTE_SOCKETS_MAX 255
 
-ssize_t varlink_execute_directory(
+ssize_t varlink_execute_directory_full(
                 const char *path,
                 const char *method,
                 sd_json_variant *parameters,
                 bool more,
                 usec_t timeout_usec,
                 sd_varlink_reply_t reply,
-                void *userdata) {
+                void *userdata,
+                char ***ret_offline_sockets) {
 
         int r;
 
@@ -262,14 +266,17 @@ ssize_t varlink_execute_directory(
         /* Invokes the specified method on all Varlink sockets in the specified directory. Any reply
          * will be dispatched to the reply callback. Blocks until the last reply has come in.
          *
-         * Returns how many sockets were contacted.
+         * Returns how many sockets were contacted. If ret_offline_sockets is non-NULL it is set to the
+         * names of the sockets that exist in the directory but could not be contacted (because nobody
+         * listens on them, or because there are too many of them). This allows callers to distinguish
+         * "nobody there" from "somebody there, but not reachable".
          *
          * Usecase for all of this: hook directories, where components can link their sockets into to get
          * notified about certain system events. */
 
-        _cleanup_close_ int fd = open(path, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY);
         if (fd < 0)
-                return log_debug_errno(errno, "Failed to open '%s': %m", path);
+                return log_debug_errno(fd, "Failed to open '%s': %m", path);
 
         _cleanup_free_ DirectoryEntries *dentries = NULL;
         r = readdir_all(fd, RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_MUST_BE_SOCKET|RECURSE_DIR_MUST_BE_SYMLINK, &dentries);
@@ -278,6 +285,7 @@ ssize_t varlink_execute_directory(
 
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(set_freep) Set *links = NULL;
+        _cleanup_strv_free_ char **offline = NULL;
         size_t t = 0;
         FOREACH_ARRAY(dp, dentries->entries, dentries->n_entries) {
                 struct dirent *de = *dp;
@@ -290,6 +298,8 @@ ssize_t varlink_execute_directory(
 
                 if (set_size(links) >= VARLINK_EXECUTE_SOCKETS_MAX) {
                         log_debug("Too many sockets (%zu) in directory, skipping '%s'.", t, j);
+                        if (ret_offline_sockets && strv_extend(&offline, de->d_name) < 0)
+                                return log_oom_debug();
                         continue;
                 }
 
@@ -300,6 +310,8 @@ ssize_t varlink_execute_directory(
                 r = connect_unix_path(socket_fd, fd, de->d_name);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to connect to '%s', ignoring: %m", j);
+                        if (ret_offline_sockets && strv_extend(&offline, de->d_name) < 0)
+                                return log_oom_debug();
                         continue;
                 }
 
@@ -377,5 +389,36 @@ ssize_t varlink_execute_directory(
                         return r;
         }
 
+        if (ret_offline_sockets)
+                *ret_offline_sockets = TAKE_PTR(offline);
+
         return (ssize_t) c;
+}
+
+int varlink_dispatch_fd(sd_varlink *link, const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, int *fd) {
+        unsigned idx;
+        int r;
+
+        assert(link);
+        assert(variant);
+        assert(fd);
+
+        /* For dispatch callbacks that take the index of a file descriptor passed along with a method call:
+         * parses the index and returns a duplicate of the file descriptor. Since callbacks have no access to
+         * the connection, they need to wrap this and pass the connection in themselves. */
+
+        if (sd_json_variant_is_null(variant)) {
+                *fd = safe_close(*fd);
+                return 0;
+        }
+
+        r = sd_json_dispatch_uint(name, variant, flags, &idx);
+        if (r < 0)
+                return r;
+
+        _cleanup_close_ int dup_fd = sd_varlink_peek_dup_fd(link, idx);
+        if (dup_fd < 0)
+                return json_log(variant, flags, dup_fd, "JSON field '%s' does not refer to a file descriptor passed along with the call.", strna(name));
+
+        return close_and_replace(*fd, dup_fd);
 }

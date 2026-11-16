@@ -117,7 +117,7 @@ int config_parse_geneve_vni(
 
         return config_parse_uint32_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        0, GENEVE_VID_MAX, true,
+                        /* min= */ 0, GENEVE_VID_MAX, /* ignoring= */ true,
                         &v->id);
 }
 
@@ -184,10 +184,8 @@ int config_parse_geneve_flow_label(
         int r;
 
         r = safe_atou32(rvalue, &f);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse Geneve flow label '%s'.", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         if (f & ~GENEVE_FLOW_LABEL_MAX_MASK) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
@@ -228,7 +226,7 @@ int config_parse_geneve_ttl(
 
         r = config_parse_uint8_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        0, UINT8_MAX, true,
+                        /* min= */ 0, UINT8_MAX, /* ignoring= */ true,
                         &v->ttl);
         if (r <= 0)
                 return r;

@@ -634,7 +634,7 @@ static int bus_cgroup_set_transient_property(
                         STRV_FOREACH(entry, *filters)
                                 fprintf(f, "%s=%s\n", name, *entry);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -710,7 +710,7 @@ static int bus_cgroup_set_transient_property(
                                                 bpf_cgroup_attach_type_to_string(fp->attach_type),
                                                 fp->bpffs_path);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1253,7 +1253,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &u64)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                                 CGroupIODeviceLimit *a = NULL;
@@ -1315,7 +1315,7 @@ int bus_cgroup_set_property(
                                 if (a->limits[iol_type] != cgroup_io_limit_defaults[iol_type])
                                         fprintf(f, "%s=%s %" PRIu64 "\n", name, a->path, a->limits[iol_type]);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1336,7 +1336,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &weight)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!CGROUP_WEIGHT_IS_OK(weight) || weight == CGROUP_WEIGHT_INVALID)
                                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "IODeviceWeight= value out of range");
@@ -1392,7 +1392,7 @@ int bus_cgroup_set_property(
                         LIST_FOREACH(device_weights, a, c->io_device_weights)
                                 fprintf(f, "IODeviceWeight=%s %" PRIu64 "\n", a->path, a->weight);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1413,7 +1413,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &target)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                                 CGroupIODeviceLatency *a = NULL;
@@ -1467,7 +1467,7 @@ int bus_cgroup_set_property(
                                 fprintf(f, "IODeviceLatencyTargetSec=%s %s\n",
                                         a->path, FORMAT_TIMESPAN(a->target_usec, 1));
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1581,7 +1581,7 @@ int bus_cgroup_set_property(
                         LIST_FOREACH(device_allow, a, c->device_allow)
                                 fprintf(f, "DeviceAllow=%s %s\n", a->path, cgroup_device_permissions_to_string(a->permissions));
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1690,7 +1690,7 @@ int bus_cgroup_set_property(
                                                 IN_ADDR_PREFIX_TO_STRING(p->family, &p->address, p->prefixlen));
                         }
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1908,7 +1908,7 @@ int bus_cgroup_set_property(
                                         fputc('\n', f);
                                 }
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1966,7 +1966,9 @@ int bus_cgroup_set_property(
                                 }
                         }
 
-                        joined = strv_join(l, " ");
+                        /* Quote the names, so that names containing the separators (a comma is a valid character in
+                         * an interface name) or quotes survive being read back from the drop-in. */
+                        joined = unit_concat_strv(l, UNIT_ESCAPE_EXEC_SYNTAX);
                         if (!joined)
                                 return -ENOMEM;
 
@@ -2085,7 +2087,7 @@ int bus_cgroup_set_property(
                        "DefaultMemoryLowScale",
                        "DefaultStartupMemoryLow")) {
 
-                r = sd_bus_message_skip(message, NULL);
+                r = sd_bus_message_skip(message, /* types= */ NULL);
                 if (r < 0)
                         return r;
 

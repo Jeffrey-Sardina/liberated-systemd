@@ -1,8 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "host-properties.h"
+#include "sysupdate-component.h"
 #include "sysupdate-forward.h"
 #include "sysupdate-target.h"
+
+/* The VOA context (see voa-util.h) UAPI.16 manifest certificates are looked up in */
+#define SYSUPDATE_VOA_CONTEXT "sysupdate"
 
 typedef enum SelectMode {
         SELECT_EXPLICIT,       /* Only explicitly specified features/components */
@@ -33,12 +38,7 @@ typedef struct Context {
         LoopDevice *loop_device;
         char *mounted_dir;
 
-        char *component_description;
-        char **component_documentation;
-        bool component_enabled;
-
-        int component_suggest;
-        Condition *component_suggest_on;
+        Component component_info; /* Metadata about the component we operate on, if any */
 
         Transfer **transfers;
         size_t n_transfers;
@@ -48,6 +48,10 @@ typedef struct Context {
 
         Hashmap *features; /* Defined features, keyed by ID */
 
+        Hashmap *provider_components; /* Components offered by component providers (and not defined in the file system), keyed by name */
+        bool provider_components_loaded;
+        char *component_provider; /* If the component we operate on came from a provider, the provider's socket name */
+
         UpdateSet **update_sets;
         size_t n_update_sets;
 
@@ -55,9 +59,17 @@ typedef struct Context {
 
         Hashmap *web_cache; /* Cache for downloaded resources, keyed by URL */
 
+        HostProperties host_properties; /* Loaded lazily, for MatchXAttr= */
+
+        X509 **manifest_certificates; /* Loaded lazily from the VOA hierarchy, for verifying UAPI.16 manifest signatures */
+        size_t n_manifest_certificates;
+        bool manifest_certificates_loaded;
+
         int installdb_fd;
 
         TargetIdentifier target_identifier;
 } Context;
 
 void context_done(Context *c);
+
+bool component_version_is_protected(const Context *c, const char *version);

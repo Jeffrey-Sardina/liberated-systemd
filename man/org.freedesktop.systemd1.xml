@@ -1667,10 +1667,15 @@ node /org/freedesktop/systemd1 {
       <filename>/etc/</filename>). The second one controls whether symlinks pointing to other units shall be
       replaced if necessary. This method returns one boolean and an array of the changes made. The boolean
       signals whether the unit files contained any enablement information (i.e. an [Install] section). The
-      changes array consists of structures with three strings: the type of the change (one of
-      <literal>symlink</literal> or <literal>unlink</literal>), the file name of the symlink and the
-      destination of the symlink. Note that most of the following calls return a changes list in the same
-      format.</para>
+      changes array consists of structures with three strings: the type of the change, the file name of the
+      symlink and the destination of the symlink. The type is one of <literal>symlink</literal>,
+      <literal>unlink</literal>, <literal>mask-dependency</literal> (an entry resolving to
+      <filename>/dev/null</filename>, which the service manager ignores when loading dependencies, was placed
+      over a dependency symlink the vendor installed below <filename>/usr/</filename>, whose path is reported as
+      the destination) or
+      <literal>unmask-dependency</literal> (such a symlink was removed again). Clients should ignore types
+      they do not know, as further ones may be added. Note that most of the following calls return a changes
+      list in the same format.</para>
 
       <para>Similarly, <function>DisableUnitFiles()</function> disables one or more units in the system,
       i.e. removes all symlinks to them in <filename>/etc/</filename> and <filename>/run/</filename>.</para>
@@ -1748,7 +1753,8 @@ node /org/freedesktop/systemd1 {
       directories and clear out the file descriptors store for the unit, as specified in the mask
       parameters. The possible values are <literal>configuration</literal>, <literal>state</literal>,
       <literal>logs</literal>, <literal>cache</literal>, <literal>runtime</literal>,
-      <literal>fdstore</literal>, and <literal>all</literal>.</para>
+      <literal>fdstore</literal>, and <literal>all</literal>. Clearing the file descriptor store also removes
+      copies of its file descriptors propagated to enclosing service managers.</para>
 
       <para><function>RemoveSubgroupFromUnit()</function> removes a subcgroup belonging to a unit's
       cgroup. Takes three arguments: the unit name (if empty defaults to the caller's unit), a cgroup path
@@ -3536,6 +3542,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly (bas) RestrictAddressFamilies = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly (bas) IOUringFilter = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly a(sst) RuntimeDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s RuntimeDirectoryPreserve = '...';
@@ -3573,6 +3581,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       readonly (tus) LogsDirectoryQuota = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as LogsDirectory = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(sst) ConfigurationDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u ConfigurationDirectoryMode = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -4185,6 +4195,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <!--property RestrictAddressFamilies is not documented!-->
 
+    <!--property IOUringFilter is not documented!-->
+
     <!--property RuntimeDirectoryPreserve is not documented!-->
 
     <!--property RuntimeDirectoryMode is not documented!-->
@@ -4208,8 +4220,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <!--property LogsDirectoryQuota is not documented!-->
 
     <!--property ConfigurationDirectoryMode is not documented!-->
-
-    <!--property ConfigurationDirectory is not documented!-->
 
     <!--property TimeoutCleanUSec is not documented!-->
 
@@ -4929,6 +4939,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictAddressFamilies"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="IOUringFilter"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectoryPreserve"/>
@@ -4966,6 +4978,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectoryQuota"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectory"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectoryMode"/>
 
@@ -5202,6 +5216,15 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2eservice {
       <programlisting>
 #define SD_EXEC_DIRECTORY_READ_ONLY            (UINT64_C(1) &lt;&lt; 0)
 </programlisting>
+
+      <para><varname>ConfigurationDirectory</varname> lists the configuration directories of the unit, as
+      configured by the unit file setting of the same name, and
+      <varname>ConfigurationDirectorySymlink</varname> exposes the same <varname>flags</varname> parameter
+      for them. Unlike the other directory types, <varname>ConfigurationDirectory</varname> does not
+      support symlinks, so the destination member of <varname>ConfigurationDirectorySymlink</varname>
+      must be left empty and is always returned as an empty string. The property retains the same
+      tuple signature and naming convention as the other directory types so clients can handle their
+      flags uniformly.</para>
 
       <para><varname>ExtraFileDescriptorNames</varname> contains file descriptor names passed to the service via
       the <varname>ExtraFileDescriptors</varname> property in the <function>StartTransientUnit()</function>
@@ -5846,6 +5869,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly (bas) RestrictAddressFamilies = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly (bas) IOUringFilter = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly a(sst) RuntimeDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s RuntimeDirectoryPreserve = '...';
@@ -5883,6 +5908,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
       readonly (tus) LogsDirectoryQuota = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as LogsDirectory = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(sst) ConfigurationDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u ConfigurationDirectoryMode = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -6507,6 +6534,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <!--property RestrictAddressFamilies is not documented!-->
 
+    <!--property IOUringFilter is not documented!-->
+
     <!--property RuntimeDirectoryPreserve is not documented!-->
 
     <!--property RuntimeDirectoryMode is not documented!-->
@@ -6530,8 +6559,6 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
     <!--property LogsDirectoryQuota is not documented!-->
 
     <!--property ConfigurationDirectoryMode is not documented!-->
-
-    <!--property ConfigurationDirectory is not documented!-->
 
     <!--property TimeoutCleanUSec is not documented!-->
 
@@ -7227,6 +7254,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictAddressFamilies"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="IOUringFilter"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectoryPreserve"/>
@@ -7264,6 +7293,8 @@ node /org/freedesktop/systemd1/unit/avahi_2ddaemon_2esocket {
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectoryQuota"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectory"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectoryMode"/>
 
@@ -7972,6 +8003,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly (bas) RestrictAddressFamilies = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly (bas) IOUringFilter = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly a(sst) RuntimeDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s RuntimeDirectoryPreserve = '...';
@@ -8009,6 +8042,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
       readonly (tus) LogsDirectoryQuota = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as LogsDirectory = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(sst) ConfigurationDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u ConfigurationDirectoryMode = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -8557,6 +8592,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <!--property RestrictAddressFamilies is not documented!-->
 
+    <!--property IOUringFilter is not documented!-->
+
     <!--property RuntimeDirectoryPreserve is not documented!-->
 
     <!--property RuntimeDirectoryMode is not documented!-->
@@ -8580,8 +8617,6 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <!--property LogsDirectoryQuota is not documented!-->
 
     <!--property ConfigurationDirectoryMode is not documented!-->
-
-    <!--property ConfigurationDirectory is not documented!-->
 
     <!--property TimeoutCleanUSec is not documented!-->
 
@@ -9179,6 +9214,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictAddressFamilies"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="IOUringFilter"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectoryPreserve"/>
@@ -9216,6 +9253,8 @@ node /org/freedesktop/systemd1/unit/home_2emount {
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectoryQuota"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectory"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectoryMode"/>
 
@@ -10046,6 +10085,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly (bas) RestrictAddressFamilies = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly (bas) IOUringFilter = ...;
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly a(sst) RuntimeDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly s RuntimeDirectoryPreserve = '...';
@@ -10083,6 +10124,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
       readonly (tus) LogsDirectoryQuota = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly as LogsDirectory = ['...', ...];
+      @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
+      readonly a(sst) ConfigurationDirectorySymlink = [...];
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
       readonly u ConfigurationDirectoryMode = ...;
       @org.freedesktop.DBus.Property.EmitsChangedSignal("const")
@@ -10613,6 +10656,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <!--property RestrictAddressFamilies is not documented!-->
 
+    <!--property IOUringFilter is not documented!-->
+
     <!--property RuntimeDirectoryPreserve is not documented!-->
 
     <!--property RuntimeDirectoryMode is not documented!-->
@@ -10636,8 +10681,6 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
     <!--property LogsDirectoryQuota is not documented!-->
 
     <!--property ConfigurationDirectoryMode is not documented!-->
-
-    <!--property ConfigurationDirectory is not documented!-->
 
     <!--property TimeoutCleanUSec is not documented!-->
 
@@ -11217,6 +11260,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
 
     <variablelist class="dbus-property" generated="True" extra-ref="RestrictAddressFamilies"/>
 
+    <variablelist class="dbus-property" generated="True" extra-ref="IOUringFilter"/>
+
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="RuntimeDirectoryPreserve"/>
@@ -11254,6 +11299,8 @@ node /org/freedesktop/systemd1/unit/dev_2dsda3_2eswap {
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectoryQuota"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="LogsDirectory"/>
+
+    <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectorySymlink"/>
 
     <variablelist class="dbus-property" generated="True" extra-ref="ConfigurationDirectoryMode"/>
 
@@ -13013,6 +13060,8 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>OOMRules</varname> were added in version 261.</para>
       <para><varname>LUOSession</varname> was added in version 262.</para>
       <para><varname>RestartRandomizedDelayUSec</varname> was added in version 262.</para>
+      <para><varname>ConfigurationDirectorySymlink</varname> was added in version 263.</para>
+      <para><varname>IOUringFilter</varname> was added in version 263.</para>
     </refsect2>
     <refsect2>
       <title>Socket Unit Objects</title>
@@ -13092,6 +13141,8 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <para><varname>XAttrEntryPoint</varname>,
       <varname>XAttrListen</varname>, and
       <varname>XAttrAccept</varname> were added in version 262.</para>
+      <para><varname>ConfigurationDirectorySymlink</varname> was added in version 263.</para>
+      <para><varname>IOUringFilter</varname> was added in version 263.</para>
     </refsect2>
     <refsect2>
       <title>Mount Unit Objects</title>
@@ -13163,6 +13214,8 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>IOPressureWatch</varname>,
       <varname>CPUSetPartition</varname>, and
       <varname>OOMRules</varname> were added in version 261.</para>
+      <para><varname>ConfigurationDirectorySymlink</varname> was added in version 263.</para>
+      <para><varname>IOUringFilter</varname> was added in version 263.</para>
     </refsect2>
     <refsect2>
       <title>Swap Unit Objects</title>
@@ -13232,6 +13285,8 @@ $ gdbus introspect --system --dest org.freedesktop.systemd1 \
       <varname>IOPressureWatch</varname>,
       <varname>CPUSetPartition</varname>, and
       <varname>OOMRules</varname> were added in version 261.</para>
+      <para><varname>ConfigurationDirectorySymlink</varname> was added in version 263.</para>
+      <para><varname>IOUringFilter</varname> was added in version 263.</para>
     </refsect2>
     <refsect2>
       <title>Slice Unit Objects</title>

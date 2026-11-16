@@ -8,14 +8,17 @@
 
 #include "alloc-util.h"
 #include "build.h"
+#include "compress.h"
 #include "discover-image.h"
 #include "dlopen-note.h"
 #include "env-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "import-raw.h"
 #include "import-tar.h"
 #include "import-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
@@ -29,10 +32,13 @@
 static char *arg_image_root = NULL;
 static ImportFlags arg_import_flags = IMPORT_BTRFS_SUBVOL | IMPORT_BTRFS_QUOTA | IMPORT_CONVERT_QCOW2 | IMPORT_SYNC;
 static uint64_t arg_offset = UINT64_MAX, arg_size_max = UINT64_MAX;
+static Compression arg_compression = _COMPRESSION_INVALID;
+static struct iovec arg_decoded_checksum = {};
 static ImageClass arg_class = IMAGE_MACHINE;
 static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
 
 STATIC_DESTRUCTOR_REGISTER(arg_image_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_decoded_checksum, iovec_done);
 
 COMMAND(
         "systemd-import\0",
@@ -71,7 +77,7 @@ static int normalize_local(const char *local, char **ret) {
                         local = "imported";
 
                 if (!FLAGS_SET(arg_import_flags, IMPORT_FORCE)) {
-                        r = image_find(arg_runtime_scope, arg_class, local, NULL, NULL);
+                        r = image_find(arg_runtime_scope, arg_class, local, /* root= */ NULL, /* ret= */ NULL);
                         if (r < 0) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
@@ -100,9 +106,9 @@ static int open_source(const char *path, const char *local, int *ret_open_fd) {
         assert(ret_open_fd);
 
         if (path) {
-                open_fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+                open_fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY);
                 if (open_fd < 0)
-                        return log_error_errno(errno, "Failed to open source file '%s': %m", path);
+                        return log_error_errno(open_fd, "Failed to open source file '%s': %m", path);
 
                 retval = open_fd;
 
@@ -166,7 +172,7 @@ static int verb_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
                 r = tar_strip_suffixes(l, &ll);
                 if (r < 0)
-                        return log_oom();
+                        return log_error_errno(r, "Failed to strip suffixes from '%s': %m", l);
 
                 local = ll;
         }
@@ -191,6 +197,8 @@ static int verb_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         import,
                         fd,
                         normalized,
+                        arg_compression,
+                        &arg_decoded_checksum,
                         arg_import_flags & IMPORT_FLAGS_MASK_TAR);
         if (r < 0)
                 return log_error_errno(r, "Failed to import image: %m");
@@ -263,6 +271,8 @@ static int verb_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         normalized,
                         arg_offset,
                         arg_size_max,
+                        arg_compression,
+                        &arg_decoded_checksum,
                         arg_import_flags & IMPORT_FLAGS_MASK_RAW);
         if (r < 0)
                 return log_error_errno(r, "Failed to import image: %m");
@@ -314,7 +324,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
                 OPTION_LONG("btrfs-subvol", "BOOL",
                             "Controls whether to create a btrfs subvolume instead of a directory"):
-                        r = parse_boolean_argument("--btrfs-subvol=", opts.arg, NULL);
+                        r = parse_boolean_argument("--btrfs-subvol=", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_import_flags, IMPORT_BTRFS_SUBVOL, r);
@@ -322,7 +332,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
                 OPTION_LONG("btrfs-quota", "BOOL",
                             "Controls whether to set up quota for btrfs subvolume"):
-                        r = parse_boolean_argument("--btrfs-quota=", opts.arg, NULL);
+                        r = parse_boolean_argument("--btrfs-quota=", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_import_flags, IMPORT_BTRFS_QUOTA, r);
@@ -330,17 +340,24 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
                 OPTION_LONG("convert-qcow2", "BOOL",
                             "Controls whether to convert QCOW2 images to regular disk images"):
-                        r = parse_boolean_argument("--convert-qcow2=", opts.arg, NULL);
+                        r = parse_boolean_argument("--convert-qcow2=", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_import_flags, IMPORT_CONVERT_QCOW2, r);
                         break;
 
                 OPTION_LONG("sync", "BOOL", "Controls whether to sync() before completing"):
-                        r = parse_boolean_argument("--sync=", opts.arg, NULL);
+                        r = parse_boolean_argument("--sync=", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         SET_FLAG(arg_import_flags, IMPORT_SYNC, r);
+                        break;
+
+                OPTION_LONG("zero-fill", "BOOL", "Controls whether to fill up the destination range with zeroes"):
+                        r = parse_boolean_argument("--zero-fill=", opts.arg, /* ret= */ NULL);
+                        if (r < 0)
+                                return r;
+                        SET_FLAG(arg_import_flags, IMPORT_ZERO_FILL, r);
                         break;
 
                 OPTION_LONG("offset", "BYTES", "Offset to seek to in destination"): {
@@ -369,6 +386,20 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
                 }
 
+                OPTION_LONG("compression", "ALGORITHM",
+                            "Compression algorithm of the input, one of: 'auto', 'none', 'gzip', 'xz', 'zstd', 'bzip2', 'lz4'"):
+                        r = import_parse_compression_argument("--compression=", opts.arg, &arg_compression);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("verify-decoded", "SHA256",
+                            "Verify the decoded (i.e. decompressed) input against the specified SHA256 hash"):
+                        r = import_parse_sha256_argument("--verify-decoded=", opts.arg, &arg_decoded_checksum);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 OPTION_LONG("class", "CLASS",
                             "Select image class (machine, sysext, confext, portable)"):
                         arg_class = image_class_from_string(opts.arg);
@@ -396,6 +427,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
         if (arg_offset != UINT64_MAX && !FLAGS_SET(arg_import_flags, IMPORT_DIRECT))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "File offset only supported in --direct mode.");
+
+        if (FLAGS_SET(arg_import_flags, IMPORT_ZERO_FILL) && (arg_offset == UINT64_MAX || arg_size_max == UINT64_MAX))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Zero filling only supported if both --offset= and --size-max= are specified.");
 
         if (!arg_image_root) {
                 r = image_root_pick(arg_runtime_scope < 0 ? RUNTIME_SCOPE_SYSTEM : arg_runtime_scope, arg_class, /* runtime= */ false, &arg_image_root);

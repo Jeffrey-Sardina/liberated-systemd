@@ -16,6 +16,7 @@
 #include "resolved-dns-stream.h"
 #include "resolved-manager.h"
 #include "set.h"
+#include "socket-util.h"
 #include "time-util.h"
 
 #define DNS_STREAMS_MAX 128
@@ -333,9 +334,10 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
         }
 
         if (revents & EPOLLERR) {
-                socklen_t errlen = sizeof(r);
-                if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &r, &errlen) == 0)
-                        return dns_stream_complete(s, r);
+                int error;
+
+                if (getsockopt_int(s->fd, SOL_SOCKET, SO_ERROR, &error) >= 0)
+                        return dns_stream_complete(s, error);
         }
 
         if ((revents & EPOLLOUT) &&
@@ -349,7 +351,7 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
 
                 iovec_inc_many(iov, ELEMENTSOF(iov), s->n_written);
 
-                ssize_t ss = dns_stream_writev(s, iov, ELEMENTSOF(iov), 0);
+                ssize_t ss = dns_stream_writev(s, iov, ELEMENTSOF(iov), /* flags= */ 0);
                 if (ss < 0) {
                         if (!ERRNO_IS_TRANSIENT(ss))
                                 return dns_stream_complete(s, -ss);
@@ -465,7 +467,7 @@ static int on_stream_io(sd_event_source *es, int fd, uint32_t revents, void *use
          * else left to write. */
         if (s->type == DNS_STREAM_LLMNR_SEND && s->packet_received &&
             !FLAGS_SET(s->requested_events, EPOLLOUT))
-                return dns_stream_complete(s, 0);
+                return dns_stream_complete(s, /* error= */ 0);
 
         /* If we did something, let's restart the timeout event source */
         if (progressed && s->timeout_event_source) {
@@ -559,7 +561,7 @@ int dns_stream_new(
                         m->event,
                         &s->timeout_event_source,
                         CLOCK_BOOTTIME,
-                        connect_timeout_usec, 0,
+                        connect_timeout_usec, /* accuracy= */ 0,
                         on_stream_timeout, s);
         if (r < 0)
                 return r;

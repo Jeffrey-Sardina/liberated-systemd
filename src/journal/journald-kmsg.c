@@ -15,6 +15,7 @@
 #include "escape.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "iovec-util.h"
 #include "journal-internal.h"
 #include "journald-counters.h"
@@ -318,7 +319,7 @@ void dev_kmsg_record(Manager *m, char *p, size_t l) {
         if (cunescape_length_with_prefix(p, pl, "MESSAGE=", UNESCAPE_RELAX, &message) >= 0)
                 iovec[n++] = IOVEC_MAKE_STRING(message);
 
-        manager_dispatch_message(m, iovec, n, ELEMENTSOF(iovec), c, NULL, priority, 0);
+        manager_dispatch_message(m, iovec, n, ELEMENTSOF(iovec), c, /* tv= */ NULL, priority, /* object_pid= */ 0);
 
         if (saved_log_max_level != INT_MAX)
                 log_set_max_level(saved_log_max_level);
@@ -368,11 +369,13 @@ int manager_flush_dev_kmsg(Manager *m) {
 
         for (;;) {
                 r = manager_read_dev_kmsg(m);
+                /* Read messages until end or an error */
                 if (r <= 0)
                         return r;
         }
 
-        return 0;
+        /* Function returns in the for loop */
+        assert_not_reached();
 }
 
 static int dispatch_dev_kmsg(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
@@ -398,12 +401,12 @@ int manager_open_dev_kmsg(Manager *m) {
         assert(m->dev_kmsg_fd < 0);
         assert(!m->dev_kmsg_event_source);
 
-        mode_t mode = O_CLOEXEC|O_NONBLOCK|O_NOCTTY|(m->config.read_kmsg ? O_RDWR : O_WRONLY);
+        mode_t mode = O_NONBLOCK|O_NOCTTY|(m->config.read_kmsg ? O_RDWR : O_WRONLY);
 
-        _cleanup_close_ int fd = open("/dev/kmsg", mode);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, "/dev/kmsg", mode);
         if (fd < 0) {
-                log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                               errno, "Failed to open /dev/kmsg for %s access, ignoring: %m", accmode_to_string(mode));
+                log_full_errno(fd == -ENOENT ? LOG_DEBUG : LOG_WARNING,
+                               fd, "Failed to open /dev/kmsg for %s access, ignoring: %m", accmode_to_string(mode));
                 return 0;
         }
 

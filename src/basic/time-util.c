@@ -372,18 +372,6 @@ char* format_timestamp_style(
                 return snprintf_ok(buf, l, "@" USEC_FMT, t / USEC_PER_SEC);  /* round down μs → s */
         }
 
-        utc = IN_SET(style, TIMESTAMP_UTC, TIMESTAMP_US_UTC, TIMESTAMP_DATE);
-        us = IN_SET(style, TIMESTAMP_US, TIMESTAMP_US_UTC);
-
-        if (l < (size_t) (3 +                   /* week day */
-                          1 + 10 +              /* space and date */
-                          style == TIMESTAMP_DATE ? 0 :
-                          (1 + 8 +              /* space and time */
-                           (us ? 1 + 6 : 0) +   /* "." and microsecond part */
-                           1 + (utc ? 3 : 1)) + /* space and shortest possible zone */
-                          1))
-                return NULL; /* Not enough space even for the shortest form. */
-
         /* Let's not format times with years > 9999 */
         if (t > USEC_TIMESTAMP_FORMATTABLE_MAX) {
                 static const char* const xxx[_TIMESTAMP_STYLE_MAX] = {
@@ -394,9 +382,22 @@ char* format_timestamp_style(
                         [TIMESTAMP_DATE]   = "--- XXXX-XX-XX",
                 };
 
-                assert(l >= strlen(xxx[style]) + 1);
+                if (l < strlen(xxx[style]) + 1)
+                        return NULL;
                 return strcpy(buf, xxx[style]);
         }
+
+        utc = IN_SET(style, TIMESTAMP_UTC, TIMESTAMP_US_UTC, TIMESTAMP_DATE);
+        us = IN_SET(style, TIMESTAMP_US, TIMESTAMP_US_UTC);
+
+        if (l < (size_t) (3 +                     /* week day */
+                          1 + 10 +                /* space and date */
+                          (style == TIMESTAMP_DATE ? 0 :
+                           (1 + 8 +               /* space and time */
+                            (us ? 1 + 6 : 0) +    /* "." and microsecond part */
+                            1 + (utc ? 3 : 1))) + /* space and shortest possible zone */
+                          1))
+                return NULL; /* Not enough space even for the shortest form. */
 
         if (localtime_or_gmtime_usec(t, utc, &tm) < 0)
                 return NULL;
@@ -1634,15 +1635,15 @@ int verify_timezone(const char *name, int log_level) {
 
         t = strjoina("/usr/share/zoneinfo/", name);
 
-        fd = open(t, O_RDONLY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, t, O_RDONLY);
         if (fd < 0)
-                return log_full_errno(log_level, errno, "Failed to open timezone file '%s': %m", t);
+                return log_full_errno(log_level, fd, "Failed to open timezone file '%s': %m", t);
 
         r = fd_verify_regular(fd);
         if (r < 0)
                 return log_full_errno(log_level, r, "Timezone file '%s' is not a regular file: %m", t);
 
-        r = loop_read_exact(fd, buf, 4, false);
+        r = loop_read_exact(fd, buf, 4, /* do_poll= */ false);
         if (r < 0)
                 return log_full_errno(log_level, r, "Failed to read from timezone file '%s': %m", t);
 

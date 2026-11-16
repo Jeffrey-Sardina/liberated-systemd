@@ -59,6 +59,7 @@ bool arg_show_transaction = false;
 int arg_force = 0;
 bool arg_ask_password = false;
 bool arg_runtime = false;
+bool arg_vendor = false;
 UnitFilePresetMode arg_preset_mode = UNIT_FILE_PRESET_FULL;
 char **arg_wall = NULL;
 const char *arg_kill_whom = NULL;
@@ -92,6 +93,7 @@ bool arg_marked = false;
 const char *arg_drop_in = NULL;
 ImagePolicy *arg_image_policy = NULL;
 char *arg_kill_subgroup = NULL;
+usec_t arg_wait_timeout_usec = USEC_INFINITY;
 
 STATIC_DESTRUCTOR_REGISTER(arg_types, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_states, strv_freep);
@@ -425,7 +427,7 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
                         arg_all = true;
                         break;
 
-                OPTION('l', "full", NULL, "Don't ellipsize unit names on output"):
+                OPTION_COMMON_FULL:
                         arg_full = true;
                         break;
 
@@ -505,7 +507,7 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
                         }
 
                         /* First, try to parse unsigned, so that we can support the prefixes 0x, 0o, 0b */
-                        r = safe_atou_full(opts.arg, 0, &u);
+                        r = safe_atou_full(opts.arg, /* base= */ 0, &u);
                         if (r < 0)
                                 /* If this didn't work, try as signed integer, without those prefixes */
                                 r = safe_atoi(opts.arg, &arg_kill_value);
@@ -595,7 +597,7 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
                         break;
 
                 OPTION_LONG("legend", "BOOL", "Enable/disable the legend (column headers and hints)"):
-                        r = parse_boolean_argument("--legend", opts.arg, NULL);
+                        r = parse_boolean_argument("--legend", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         arg_legend = r;
@@ -618,6 +620,11 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
                         arg_runtime = true;
                         break;
 
+                OPTION_LONG("vendor", NULL,
+                            "Enable/disable/reenable/preset/preset-all in the vendor unit directory below /usr/"):
+                        arg_vendor = true;
+                        break;
+
                 OPTION('f', "force", NULL,
                        "When enabling unit files, override existing symlinks. "
                        "When shutting down, execute action immediately."):
@@ -637,14 +644,14 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
 
                 OPTION_LONG("root", "PATH",
                             "Edit/enable/disable/mask unit files in the specified root directory"):
-                        r = parse_path_argument(opts.arg, false, &arg_root);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
                 OPTION_LONG("image", "PATH",
                             "Edit/enable/disable/mask unit files in the specified disk image"):
-                        r = parse_path_argument(opts.arg, false, &arg_image);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
                         if (r < 0)
                                 return r;
                         break;
@@ -810,6 +817,12 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
                         arg_stdin = true;
                         break;
 
+                OPTION_LONG("wait-timeout", "SEC", "Maximum time to wait for units"):
+                        r = parse_sec(opts.arg, &arg_wait_timeout_usec);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --wait-timeout= argument '%s': %m", opts.arg);
+                        break;
+
                 /* Compatibility-only options, not shown in --help. */
                 OPTION_LONG("fail", NULL, /* help= */ NULL):
                         _arg_job_mode = "fail";
@@ -877,6 +890,25 @@ static int systemctl_parse_argv(int argc, char *argv[], int log_level_shift, cha
         if (arg_image && arg_root)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Please specify either --root= or --image=, the combination of both is not supported.");
+
+        if (arg_vendor) {
+                if (arg_transport != BUS_TRANSPORT_LOCAL)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--vendor is only supported with the local transport.");
+
+                if (!STRPTR_IN_SET(args[0], "enable", "disable", "reenable", "preset", "preset-all"))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--vendor may only be used with 'enable', 'disable', "
+                                               "'reenable', 'preset' or 'preset-all'.");
+
+                if (arg_runtime)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--vendor may not be combined with --runtime.");
+
+                if (arg_runtime_scope == RUNTIME_SCOPE_USER)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--vendor is not supported for --user, use --global instead.");
+        }
 
         if (remaining_args)
                 *remaining_args = args;
@@ -954,6 +986,8 @@ VERB_SCOPE(, verb_start,             "try-reload-or-restart", "UNIT…\0", 2,   
            "If active, reload one or more units, if supported, otherwise restart");
 VERB_SCOPE(, verb_start,             "isolate",          "UNIT\0",       2,        2,        VERB_ONLINE_ONLY,
            "Start one unit and stop all others");
+VERB_SCOPE(, verb_wait,              "wait",             "UNIT\0",       2,        2,        VERB_ONLINE_ONLY,
+           "Wait for a unit to terminate, i.e. enter inactive or failed state");
 VERB_SCOPE(, verb_kill,              "kill",             "UNIT…\0",      2,        VERB_ANY, VERB_ONLINE_ONLY,
            "Send signal to processes of a unit");
 VERB_SCOPE(, verb_clean_or_freeze,   "clean",            "UNIT…\0",      2,        VERB_ANY, VERB_ONLINE_ONLY,

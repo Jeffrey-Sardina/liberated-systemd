@@ -8,6 +8,7 @@
 #include "env-util.h"
 #include "format-table.h"
 #include "json-util.h"
+#include "locale-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -460,7 +461,7 @@ TEST(json) {
                                  TABLE_HEADER, "asdf",
                                  TABLE_SET_JSON_FIELD_NAME, "asdf-custom"));
         ASSERT_OK(table_set_json_field_name(t, 2, "ZZZ"));
-        ASSERT_OK(table_set_json_field_name(t, 2, NULL));
+        ASSERT_OK(table_set_json_field_name(t, 2, /* name= */ NULL));
         ASSERT_OK(table_set_json_field_name(t, 2, "zzz"));
 
         ASSERT_OK(table_add_many(t,
@@ -676,9 +677,9 @@ TEST(mixed_type_sort) {
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         ASSERT_OK(table_add_many(table, TABLE_UINT, 1U));
-        ASSERT_OK(table_add_cell(table, NULL, TABLE_STRING, "b"));
-        ASSERT_OK(table_add_cell(table, NULL, TABLE_STRING, NULL));
-        ASSERT_OK(table_add_cell(table, NULL, TABLE_STRING, "a"));
+        ASSERT_OK(table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, "b"));
+        ASSERT_OK(table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, /* data= */ NULL));
+        ASSERT_OK(table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, "a"));
         ASSERT_OK(table_set_sort(table, (size_t) 0));
         ASSERT_OK(table_format(table, &formatted));
 
@@ -689,7 +690,7 @@ TEST(mixed_type_sort) {
                      "-\n");
 
         formatted = mfree(formatted);
-        ASSERT_OK(table_set_reverse(table, 0, true));
+        ASSERT_OK(table_set_reverse(table, /* column= */ 0, true));
         ASSERT_OK(table_format(table, &formatted));
 
         ASSERT_STREQ(formatted,
@@ -792,7 +793,7 @@ TEST(signed_integers) {
         _cleanup_free_ char *formatted = NULL;
 
         ASSERT_NOT_NULL((t = table_new("int", "int8", "int16", "int32", "int64")));
-        table_set_width(t, 0);
+        table_set_width(t, /* width= */ 0);
 
         ASSERT_OK(table_add_many(t,
                                  TABLE_INT, -1,
@@ -847,7 +848,7 @@ TEST(signed_integers) {
                                     SD_JSON_BUILD_PAIR_INTEGER("int16", INT16_MIN),
                                     SD_JSON_BUILD_PAIR_INTEGER("int32", INT32_MIN),
                                     SD_JSON_BUILD_PAIR_INTEGER("int64", INT64_MIN)))));
-        sd_json_variant_dump(b, SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        sd_json_variant_dump(b, SD_JSON_FORMAT_NEWLINE, stdout, /* prefix= */ NULL);
 
         ASSERT_TRUE(sd_json_variant_equal(a, b));
 }
@@ -857,7 +858,7 @@ TEST(unsigned_integers) {
         _cleanup_free_ char *formatted = NULL;
 
         ASSERT_NOT_NULL((t = table_new("uint", "uint8", "uint16", "uint32", "uhex32", "uint64", "uhex64")));
-        table_set_width(t, 0);
+        table_set_width(t, /* width= */ 0);
 
         ASSERT_OK(table_add_many(t,
                                  TABLE_UINT, 0,
@@ -907,9 +908,103 @@ TEST(unsigned_integers) {
                                     SD_JSON_BUILD_PAIR_UNSIGNED("uhex32", UINT32_MAX),
                                     SD_JSON_BUILD_PAIR_UNSIGNED("uint64", UINT64_MAX),
                                     SD_JSON_BUILD_PAIR_UNSIGNED("uhex64", UINT64_MAX)))));
-        sd_json_variant_dump(b, SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        sd_json_variant_dump(b, SD_JSON_FORMAT_NEWLINE, stdout, /* prefix= */ NULL);
 
         ASSERT_TRUE(sd_json_variant_equal(a, b));
+}
+
+TEST(doubles) {
+        _cleanup_(table_unrefp) Table *t = NULL;
+        _cleanup_free_ char *formatted = NULL, *sorted = NULL;
+
+        ASSERT_NOT_NULL((t = table_new("name", "value")));
+        table_set_width(t, /* width= */ 0);
+
+        /* Two decimals unless set otherwise. Later rows of a column inherit the setting. */
+        ASSERT_OK(table_add_many(t,
+                                 TABLE_STRING, "a",
+                                 TABLE_DOUBLE, 0.5));
+        ASSERT_OK(table_add_many(t,
+                                 TABLE_STRING, "b",
+                                 TABLE_DOUBLE, 917.974,
+                                 TABLE_SET_DECIMALS, 1U));
+        ASSERT_OK(table_add_many(t,
+                                 TABLE_STRING, "c",
+                                 TABLE_DOUBLE, -3.0));
+        ASSERT_OK(table_add_many(t,
+                                 TABLE_STRING, "d",
+                                 TABLE_DOUBLE, 20534.4,
+                                 TABLE_SET_DECIMALS, 0U));
+
+        ASSERT_OK(table_format(t, &formatted));
+        printf("%s\n", formatted);
+
+        ASSERT_STREQ(formatted,
+                     "NAME VALUE\n"
+                     "a    0.50\n"
+                     "b    918.0\n"
+                     "c    -3.0\n"
+                     "d    20534\n");
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *a = NULL, *b = NULL;
+        ASSERT_OK(table_to_json(t, &a));
+
+        ASSERT_OK(sd_json_build(&b,
+                                SD_JSON_BUILD_ARRAY(
+                                  SD_JSON_BUILD_OBJECT(
+                                    SD_JSON_BUILD_PAIR_STRING("name", "a"),
+                                    SD_JSON_BUILD_PAIR_REAL("value", 0.5)),
+                                  SD_JSON_BUILD_OBJECT(
+                                    SD_JSON_BUILD_PAIR_STRING("name", "b"),
+                                    SD_JSON_BUILD_PAIR_REAL("value", 917.974)),
+                                  SD_JSON_BUILD_OBJECT(
+                                    SD_JSON_BUILD_PAIR_STRING("name", "c"),
+                                    SD_JSON_BUILD_PAIR_REAL("value", -3.0)),
+                                  SD_JSON_BUILD_OBJECT(
+                                    SD_JSON_BUILD_PAIR_STRING("name", "d"),
+                                    SD_JSON_BUILD_PAIR_REAL("value", 20534.4)))));
+
+        ASSERT_TRUE(sd_json_variant_equal(a, b));
+
+        /* Sorting compares the values, not their text */
+        ASSERT_OK(table_set_sort(t, (size_t) 1));
+        ASSERT_OK(table_format(t, &sorted));
+        printf("%s\n", sorted);
+
+        ASSERT_STREQ(sorted,
+                     "NAME VALUE\n"
+                     "c    -3.0\n"
+                     "a    0.50\n"
+                     "b    918.0\n"
+                     "d    20534\n");
+}
+
+TEST(doubles_locale) {
+        _cleanup_(freelocalep) locale_t loc = (locale_t) 0;
+        _cleanup_(table_unrefp) Table *t = NULL;
+        _cleanup_free_ char *formatted = NULL;
+        locale_t old_loc;
+
+        /* The decimal separator must not depend on LC_NUMERIC */
+        loc = newlocale(LC_NUMERIC_MASK, "de_DE.UTF-8", (locale_t) 0);
+        if (loc == (locale_t) 0)
+                return (void) log_tests_skipped("de_DE.UTF-8 locale not available");
+
+        ASSERT_NOT_NULL((t = table_new("name", "value")));
+        table_set_width(t, /* width= */ 0);
+
+        ASSERT_OK(table_add_many(t,
+                                 TABLE_STRING, "a",
+                                 TABLE_DOUBLE, 0.5));
+
+        old_loc = uselocale(loc);
+        ASSERT_OK(table_format(t, &formatted));
+        (void) uselocale(old_loc);
+        printf("%s\n", formatted);
+
+        ASSERT_STREQ(formatted,
+                     "NAME VALUE\n"
+                     "a    0.50\n");
 }
 
 TEST(vertical) {
@@ -925,7 +1020,7 @@ TEST(vertical) {
                                  TABLE_FIELD, "lllllllllllo", TABLE_STRING, "jjjjjjjjjjjjjjjjj"));
 
         ASSERT_OK(table_set_json_field_name(t, 1, "DIMPFELMOSER"));
-        ASSERT_OK(table_set_json_field_name(t, 1, NULL));
+        ASSERT_OK(table_set_json_field_name(t, 1, /* name= */ NULL));
         ASSERT_OK(table_set_json_field_name(t, 1, "dimpfelmoser"));
 
         ASSERT_OK(table_format(t, &formatted));
@@ -998,7 +1093,7 @@ TEST(dup_cell) {
                                  TABLE_PATH_BASENAME, "../"));
 
         for (size_t i = 6; i < table_get_columns(t); i++)
-                ASSERT_OK(table_dup_cell(t, table_get_cell(t, 2, 0)));
+                ASSERT_OK(table_dup_cell(t, table_get_cell(t, 2, /* column= */ 0)));
 
         ASSERT_OK(table_format(t, &formatted));
         printf("%s\n", formatted);

@@ -98,6 +98,14 @@
 
       <listitem><para>The boot manager allows for Secure Boot variables to be enrolled if the UEFI firmware is
       in setup mode. Additionally, variables can be automatically enrolled if configured.</para></listitem>
+
+      <listitem><para>The boot manager can apply UEFI firmware update capsules prepared by
+      <command>fwupd</command> at boot, without a separate EFI updater. Capsule updates require UEFI 2.0 or
+      newer firmware. The boot manager sets the
+      <varname>BootloaderSupportsFwupd</varname> EFI variable to advertise support for the
+      <ulink url="https://github.com/fwupd/fwupd/tree/main/plugins/uefi-capsule#3rd-party-bootloader">fwupd
+      bootloader protocol</ulink>. Only capsules on the disk containing the boot manager are processed,
+      update variables and capsules on other disks are left untouched.</para></listitem>
     </itemizedlist>
 
     <para><citerefentry><refentrytitle>bootctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
@@ -448,6 +456,18 @@
       <citerefentry><refentrytitle>systemd-confext</refentrytitle><manvolnum>8</manvolnum></citerefentry>
       for details on configuration extension images. The generated <command>cpio</command> archive is
       measured into TPM PCR 12 (if a TPM is present).</para></listitem>
+
+      <listitem><para>Files with the <filename>.addon.efi</filename> suffix are not packed into a
+      <command>cpio</command> archive. Instead, each of them is passed to the UKI as a separate
+      <constant>LoadFile2</constant> object, see the
+      <ulink url="https://systemd.io/BOOT_LOADER_INTERFACE">Boot Loader Interface</ulink>. The
+      <command>systemd-stub</command> UEFI stub embedded in the UKI will then load, verify and measure them
+      like any other addon, allowing to pass additional kernel command line parameters,
+      DeviceTree blobs, initrds and microcode updates specific to this entry. This means the same UKI may be
+      shared by multiple entries, each with its own set of addons. See
+      <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+      details on addons. This is only supported for entries using the <literal>uki</literal> key, not for
+      <literal>uki-url</literal>.</para></listitem>
     </itemizedlist>
 
     <para>When the booted kernel is a UKI, the <command>systemd-stub</command> UEFI stub embedded in it will
@@ -466,7 +486,8 @@ machine-id  6a9857a393724b7a981ebb5b8495b9ea
 uki         /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/img.efi
 extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/foo.cred
 extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/bar.sysext.raw
-extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/baz.confext.raw</programlisting>
+extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/baz.confext.raw
+extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/debug.addon.efi</programlisting>
   </refsect1>
 
   <refsect1>
@@ -631,9 +652,9 @@ extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/baz.confext.raw</programlist
         <listitem><para>The PCR register index select SMBIOS structures are measured into — type 1
         (system information, with the volatile "Wake-up Type" field zeroed out), type 2 (baseboard
         information) and type 11 (OEM strings). Formatted as decimal ASCII string (e.g.
-        <literal>1</literal>). Set by the boot loader if a measurement was successfully completed, and remains
-        unset otherwise. (Note that <command>systemd-stub</command> performs the same measurement when booted
-        directly, bypassing the boot loader.)</para>
+        <literal>1</literal>). Set by the boot loader only if all of these structures were measured
+        successfully, and remains unset otherwise. (Note that <command>systemd-stub</command> performs the
+        same measurement when booted directly, bypassing the boot loader.)</para>
 
         <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
@@ -672,6 +693,21 @@ extra       /6a9857a393724b7a981ebb5b8495b9ea/1.2.3/baz.confext.raw</programlist
         to view this data. </para>
 
         <xi:include href="version-info.xml" xpointer="v240"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>LoaderFactoryResetVariables</varname></term>
+
+        <listitem><para>A boolean, formatted as a UTF-16 string (e.g. <literal>1</literal>). If set to true by
+        the OS, the boot loader will
+        erase all EFI variables in the Boot Loader Interface vendor UUID namespace and in systemd's own vendor
+        UUID namespace (except for <varname>FactoryResetRequest</varname>) on the next boot, and then reboot.
+        Before doing so the user is asked for confirmation.
+        This variable is typically set by
+        <citerefentry><refentrytitle>systemd-efivars-clear.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        as part of a factory reset.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
       </varlistentry>
 
       <varlistentry>

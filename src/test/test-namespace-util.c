@@ -8,11 +8,59 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "namespace-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "socket-util.h"
 #include "tests.h"
+
+TEST(fd_is_namespace) {
+        _cleanup_close_ int fd = ASSERT_OK(xopenat(AT_FDCWD, "/dev/null", O_RDONLY));
+
+        ASSERT_OK_ZERO(fd_is_namespace(fd, _NAMESPACE_TYPE_INVALID));
+        ASSERT_OK_ZERO(fd_is_namespace(fd, NAMESPACE_USER));
+
+        for (NamespaceType t = 0; t < _NAMESPACE_TYPE_MAX; t++) {
+                _cleanup_close_ int ns_fd = namespace_open_by_type(t);
+                if (ns_fd == -ENOPKG) {
+                        log_tests_skipped_errno(ns_fd, "Namespace type is not supported");
+                        continue;
+                }
+                ASSERT_OK(ns_fd);
+
+                ASSERT_OK_POSITIVE(fd_is_namespace(ns_fd, _NAMESPACE_TYPE_INVALID));
+                for (NamespaceType other = 0; other < _NAMESPACE_TYPE_MAX; other++)
+                        ASSERT_EQ(fd_is_namespace(ns_fd, other), t == other);
+        }
+}
+
+TEST(is_our_namespace) {
+        _cleanup_close_ int userns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/user", O_RDONLY));
+        _cleanup_close_ int mntns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/mnt", O_RDONLY));
+        _cleanup_close_ int fd = ASSERT_OK(xopenat(AT_FDCWD, "/dev/null", O_RDONLY));
+
+        ASSERT_OK_POSITIVE(is_our_namespace(userns_fd, NAMESPACE_USER));
+        ASSERT_OK_POSITIVE(is_our_namespace(mntns_fd, NAMESPACE_MOUNT));
+        ASSERT_ERROR(is_our_namespace(fd, NAMESPACE_USER), EUCLEAN);
+
+        int invalid_fd = fd;
+        fd = safe_close(fd);
+        ASSERT_ERROR(is_our_namespace(invalid_fd, NAMESPACE_USER), EBADF);
+
+        ASSERT_ERROR(is_our_namespace(userns_fd, NAMESPACE_MOUNT), EUCLEAN);
+        ASSERT_ERROR(is_our_namespace(mntns_fd, NAMESPACE_USER), EUCLEAN);
+
+        _cleanup_close_ int foreign_userns_fd = userns_acquire_empty();
+        if (ERRNO_IS_NEG_PRIVILEGE(foreign_userns_fd) || ERRNO_IS_NEG_NOT_SUPPORTED(foreign_userns_fd))
+                return (void) log_tests_skipped_errno(foreign_userns_fd, "Unable to acquire user namespace");
+        ASSERT_OK(foreign_userns_fd);
+
+        ASSERT_OK_POSITIVE(fd_is_namespace(foreign_userns_fd, NAMESPACE_USER));
+        ASSERT_OK_ZERO(fd_is_namespace(foreign_userns_fd, NAMESPACE_MOUNT));
+        ASSERT_OK_ZERO(is_our_namespace(foreign_userns_fd, NAMESPACE_USER));
+        ASSERT_ERROR(is_our_namespace(foreign_userns_fd, NAMESPACE_MOUNT), EUCLEAN);
+}
 
 TEST(namespace_enter) {
         _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
@@ -28,7 +76,7 @@ TEST(namespace_enter) {
         ASSERT_OK(r);
 
         _cleanup_close_ int mntns_fd = -EBADF, userns_fd = -EBADF, root_fd = -EBADF;
-        ASSERT_OK(pidref_namespace_open(&pidref, NULL, &mntns_fd, NULL, &userns_fd, &root_fd));
+        ASSERT_OK(pidref_namespace_open(&pidref, /* ret_pidns_fd= */ NULL, &mntns_fd, /* ret_netns_fd= */ NULL, &userns_fd, &root_fd));
 
         /* Without any mapping the namespace is still being set up, we can't tell yet if root is mapped. */
         ASSERT_ERROR(userns_has_root_mapping(userns_fd), ENODATA);
@@ -37,7 +85,7 @@ TEST(namespace_enter) {
         r = ASSERT_OK(pidref_safe_fork(
                         "test-ns-enter-2",
                         FORK_LOG|FORK_WAIT|FORK_DEATHSIG_SIGKILL,
-                        NULL));
+                        /* ret= */ NULL));
         if (r == 0) {
                 ASSERT_ERROR(namespace_enter(-EBADF, mntns_fd, -EBADF, userns_fd, root_fd), EINVAL);
                 _exit(EXIT_SUCCESS);
@@ -46,10 +94,36 @@ TEST(namespace_enter) {
         r = ASSERT_OK(pidref_safe_fork(
                         "test-ns-enter-3",
                         FORK_LOG|FORK_WAIT|FORK_DEATHSIG_SIGKILL,
-                        NULL));
+                        /* ret= */ NULL));
         if (r == 0) {
                 ASSERT_OK(drop_capability(CAP_SYS_ADMIN));
                 ASSERT_ERROR(namespace_enter(-EBADF, mntns_fd, -EBADF, userns_fd, root_fd), EINVAL);
+                _exit(EXIT_SUCCESS);
+        }
+}
+
+TEST(namespace_enter_nothing) {
+        int r;
+
+        /* With nothing to join, or only namespaces we're already in, entering must succeed without
+         * CAP_SYS_ADMIN, since no setns() call is necessary. */
+        r = ASSERT_OK(pidref_safe_fork(
+                        "test-ns-enter-nothing",
+                        FORK_LOG|FORK_WAIT|FORK_DEATHSIG_SIGKILL,
+                        /* ret= */ NULL));
+        if (r == 0) {
+                ASSERT_OK(drop_capability(CAP_SYS_ADMIN));
+
+                ASSERT_OK(namespace_enter(-EBADF, -EBADF, -EBADF, -EBADF, -EBADF));
+
+                _cleanup_close_ int userns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/user", O_RDONLY));
+                ASSERT_OK(namespace_enter(-EBADF, -EBADF, -EBADF, userns_fd, -EBADF));
+
+                _cleanup_close_ int mntns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/mnt", O_RDONLY));
+                _cleanup_close_ int pidns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/pid", O_RDONLY));
+                _cleanup_close_ int netns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/net", O_RDONLY));
+                ASSERT_OK(namespace_enter(pidns_fd, mntns_fd, netns_fd, userns_fd, -EBADF));
+
                 _exit(EXIT_SUCCESS);
         }
 }
@@ -151,7 +225,7 @@ TEST(namespace_enter_peercred) {
         }
 
         transport[1] = safe_close(transport[1]);
-        fd = ASSERT_OK(receive_one_fd(transport[0], 0));
+        fd = ASSERT_OK(receive_one_fd(transport[0], /* flags= */ 0));
         ASSERT_OK(getpeercred(fd, &ucred));
         ASSERT_EQ(ucred.uid, uid);
         ASSERT_EQ(ucred.gid, gid);

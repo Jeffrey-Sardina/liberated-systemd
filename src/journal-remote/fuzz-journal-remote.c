@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "sd-journal.h"
@@ -23,7 +24,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
         _cleanup_(unlink_and_freep) char *name = NULL;
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
-        _cleanup_(journal_remote_server_destroy) RemoteServer s = {};
+        _cleanup_(journal_remote_server_destroy) RemoteServer s = {
+                .add_client_certificate_subject = size % 3 != 0,
+        };
         int fdin, r;
 
         if (outside_size_range(size, 3, 65536))
@@ -31,8 +34,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         fuzz_setup_logging();
 
-        assert_se(mkdtemp_malloc("/tmp/fuzz-journal-remote-XXXXXX", &tmp) >= 0);
-        assert_se(name = path_join(tmp, "fuzz-journal-remote.XXXXXX.journal"));
+        ASSERT_OK(mkdtemp_malloc("/tmp/fuzz-journal-remote-XXXXXX", &tmp));
+        name = ASSERT_NOT_NULL(path_join(tmp, "fuzz-journal-remote.XXXXXX.journal"));
 
         fdin = fdin_close = memfd_new_and_seal("fuzz-journal-remote", data, size);
         if (fdin < 0)
@@ -44,26 +47,29 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         /* In */
 
-        r = journal_remote_server_init(&s, name, JOURNAL_WRITE_SPLIT_NONE, 0);
+        r = journal_remote_server_init(&s, name, JOURNAL_WRITE_SPLIT_NONE, /* file_flags= */ 0);
         if (r < 0) {
-                assert_se(IN_SET(r, -ENOMEM, -EMFILE, -ENFILE));
+                ASSERT_TRUE(IN_SET(r, -ENOMEM, -EMFILE, -ENFILE));
                 return r;
         }
 
-        ASSERT_OK_POSITIVE(journal_remote_add_source(&s, fdin, (char*) "fuzz-data", false));
+        ASSERT_OK_POSITIVE(journal_remote_add_source(&s, fdin, (char*) "fuzz-data", /* own_name= */ false));
         TAKE_FD(fdin_close);
 
-        while (s.active)
-                ASSERT_OK(journal_remote_handle_raw_source(NULL, fdin, 0, &s));
+        if (size % 3 == 2)
+                s.sources[fdin]->client_certificate_subject = ASSERT_NOT_NULL(strdup(REMOTE_CERTIFICATE_SUBJECT_FIELD "CN=fuzz"));
 
-        assert_se(close(fdin) < 0 && errno == EBADF); /* Check that the fd is closed already */
+        while (s.active)
+                ASSERT_OK(journal_remote_handle_raw_source(/* event= */ NULL, fdin, /* revents= */ 0, &s));
+
+        ASSERT_ERROR_ERRNO(close(fdin), EBADF); /* Check that the fd is closed already */
 
         /* Out */
 
         r = sd_journal_open_files(&j, (const char**) STRV_MAKE(name), SD_JOURNAL_ASSUME_IMMUTABLE);
         if (r < 0) {
                 log_error_errno(r, "sd_journal_open_files([\"%s\"]) failed: %m", name);
-                assert_se(IN_SET(r, -ENOMEM, -EMFILE, -ENFILE, -ENODATA));
+                ASSERT_TRUE(IN_SET(r, -ENOMEM, -EMFILE, -ENFILE, -ENODATA));
                 return r;
         }
 
@@ -77,7 +83,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         for (OutputMode mode = 0; mode < _OUTPUT_MODE_MAX; mode++) {
                 if (!dev_null)
                         log_info("/* %s */", output_mode_to_string(mode));
-                ASSERT_OK(show_journal(dev_null ?: stdout, j, mode, 0, 0, -1, 0, NULL));
+                ASSERT_OK(show_journal(dev_null ?: stdout, j, mode, /* n_columns= */ 0, /* not_before= */ 0, -1, /* flags= */ 0, /* ellipsized= */ NULL));
                 ASSERT_OK(sd_journal_seek_head(j));
         }
 

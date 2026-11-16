@@ -29,6 +29,7 @@
 #include "json-util.h"
 #include "kernel-image.h"
 #include "log.h"
+#include "memfd-util.h"
 #include "parse-argument.h"
 #include "path-util.h"
 #include "recurse-dir.h"
@@ -49,6 +50,7 @@ typedef struct ExtraFile {
         int source_fd, temp_fd;
         char *filename, *temp_filename;
         struct iovec data; /* Alternative to 'source_fd': literal data */
+        bool auto_discovered; /* Picked up from extras.d/, rather than passed in explicitly */
 } ExtraFile;
 
 #define EXTRA_FILE_NULL                     \
@@ -86,6 +88,7 @@ typedef struct LinkContext {
          * UKIs, but let's keep things somewhat generic to keep options open for the future. */
         char *kernel_filename, *kernel_temp_filename;
         int kernel_fd, kernel_temp_fd;
+        char *kernel_uname;
 
         ExtraFile *extra;
         size_t n_extra;
@@ -192,6 +195,7 @@ static void link_context_done(LinkContext *c) {
         c->kernel_fd = safe_close(c->kernel_fd);
         c->kernel_temp_filename = mfree(c->kernel_temp_filename);
         c->kernel_temp_fd = safe_close(c->kernel_temp_fd);
+        c->kernel_uname = mfree(c->kernel_uname);
 
         c->root = mfree(c->root);
         c->root_fd = safe_close(c->root_fd);
@@ -284,9 +288,9 @@ static int link_context_from_cmdline_common(LinkContext *b) {
                 return log_oom();
 
         if (arg_root) {
-                b->root_fd = open(arg_root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                b->root_fd = xopenat(AT_FDCWD, arg_root, O_DIRECTORY|O_PATH);
                 if (b->root_fd < 0)
-                        return log_error_errno(errno, "Failed to open root directory '%s': %m", arg_root);
+                        return log_error_errno(b->root_fd, "Failed to open root directory '%s': %m", arg_root);
 
                 if (strdup_to(&b->root, arg_root) < 0)
                         return log_oom();
@@ -310,7 +314,7 @@ static int link_context_add_cmdline_extras(LinkContext *b) {
                 if (r == O_DIRECTORY)
                         return log_error_errno(SYNTHETIC_ERRNO(EISDIR), "Extra file path '%s' does not refer to regular file.", *x);
 
-                _cleanup_close_ int fd = xopenat_full(AT_FDCWD, *x, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
+                _cleanup_close_ int fd = xopenat_full(AT_FDCWD, *x, O_RDONLY|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open '%s': %m", *x);
 
@@ -327,19 +331,110 @@ static int link_context_add_cmdline_extras(LinkContext *b) {
         return 0;
 }
 
-static int validate_kernel(int kernel_fd, const char *filename) {
+static int validate_kernel(int kernel_fd, const char *filename, char **ret_uname) {
         int r;
 
         assert(kernel_fd >= 0);
+        assert(ret_uname);
 
         KernelImageType kit = _KERNEL_IMAGE_TYPE_INVALID;
-        r = inspect_kernel(kernel_fd, /* filename= */ NULL, &kit);
+        _cleanup_free_ char *uname = NULL;
+        r = inspect_kernel_full(
+                        kernel_fd,
+                        /* filename= */ NULL,
+                        &kit,
+                        /* ret_cmdline= */ NULL,
+                        &uname,
+                        /* ret_pretty_name= */ NULL);
         if (r == -EBADMSG)
                 return log_error_errno(r, "UKI '%s' is not valid.", filename);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine kernel image type of '%s': %m", filename);
         if (kit != KERNEL_IMAGE_TYPE_UKI)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Image '%s' is not a UKI.", filename);
+
+        *ret_uname = TAKE_PTR(uname);
+        return 0;
+}
+
+static int validate_addon(const ExtraFile *x, char **ret_uname) {
+        int r;
+
+        assert(x);
+        assert(x->filename);
+        assert(ret_uname);
+
+        _cleanup_close_ int data_fd = -EBADF;
+        int fd = x->source_fd;
+        if (fd < 0) {
+                data_fd = memfd_new_and_seal(x->filename, x->data.iov_base, x->data.iov_len);
+                if (data_fd < 0)
+                        return log_error_errno(data_fd, "Failed to allocate memory file for '%s': %m", x->filename);
+
+                fd = data_fd;
+        }
+
+        KernelImageType kit = _KERNEL_IMAGE_TYPE_INVALID;
+        _cleanup_free_ char *addon_uname = NULL;
+        r = inspect_kernel_full(
+                        fd,
+                        /* filename= */ NULL,
+                        &kit,
+                        /* ret_cmdline= */ NULL,
+                        &addon_uname,
+                        /* ret_pretty_name= */ NULL);
+        if (r == -EBADMSG)
+                return log_error_errno(r, "Addon '%s' is not valid.", x->filename);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine image type of '%s': %m", x->filename);
+        if (kit != KERNEL_IMAGE_TYPE_ADDON)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Image '%s' is not an addon.", x->filename);
+
+        *ret_uname = TAKE_PTR(addon_uname);
+        return 0;
+}
+
+/* Addons are loaded by systemd-stub, which ignores anything that is not a valid addon for the UKI. Let's
+ * refuse early rather than generating an entry that silently lacks the requested addon. Returns -EBADMSG if
+ * one of the addons is not valid. Expects c->kernel_uname to be filled in already. */
+static int link_context_validate_extras(LinkContext *c) {
+        int r;
+
+        assert(c);
+
+        for (size_t i = 0; i < c->n_extra;) {
+                ExtraFile *x = c->extra + i;
+
+                if (!endswith_no_case(x->filename, ".addon.efi")) {
+                        i++;
+                        continue;
+                }
+
+                _cleanup_free_ char *addon_uname = NULL;
+                r = validate_addon(x, &addon_uname);
+                if (r < 0)
+                        return r;
+
+                /* Like systemd-stub, only consider it a mismatch if both the UKI and the addon declare a
+                 * .uname. Addons from extras.d/ stay around across kernel updates, so skip those, as
+                 * systemd-stub would, instead of failing for every UKI they are not meant for. */
+                if (c->kernel_uname && addon_uname && !streq(c->kernel_uname, addon_uname)) {
+                        if (!x->auto_discovered)
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                                       "Addon '%s' is for kernel '%s', but the UKI is for kernel '%s'.",
+                                                       x->filename, addon_uname, c->kernel_uname);
+
+                        log_warning("Addon '%s' is for kernel '%s', but the UKI is for kernel '%s', skipping.",
+                                    x->filename, addon_uname, c->kernel_uname);
+
+                        extra_file_done(x);
+                        memmove(x, x + 1, (c->n_extra - i - 1) * sizeof(ExtraFile));
+                        c->n_extra--;
+                        continue;
+                }
+
+                i++;
+        }
 
         return 0;
 }
@@ -360,15 +455,19 @@ static int link_context_from_cmdline(LinkContext *ret, const char *kernel) {
                 return log_error_errno(r, "Failed to extract filename from kernel path '%s': %m", kernel);
         if (!efi_loader_entry_resource_filename_valid(b.kernel_filename))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Kernel '%s' is not suitable for reference in a boot menu entry.", kernel);
-        b.kernel_fd = xopenat_full(AT_FDCWD, kernel, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
+        b.kernel_fd = xopenat_full(AT_FDCWD, kernel, O_RDONLY|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
         if (b.kernel_fd < 0)
                 return log_error_errno(b.kernel_fd, "Failed to open kernel path '%s': %m", kernel);
 
-        r = validate_kernel(b.kernel_fd, kernel);
+        r = validate_kernel(b.kernel_fd, kernel, &b.kernel_uname);
         if (r < 0)
                 return r;
 
         r = link_context_add_cmdline_extras(&b);
+        if (r < 0)
+                return r;
+
+        r = link_context_validate_extras(&b);
         if (r < 0)
                 return r;
 
@@ -446,14 +545,20 @@ static int begin_copy_file(
         }
 
         _cleanup_free_ char *t = NULL;
-        _cleanup_close_ int write_fd = open_tmpfile_linkable_at(target_dir_fd, filename, O_WRONLY|O_CLOEXEC, &t);
+        _cleanup_close_ int write_fd = open_tmpfile_linkable_at(target_dir_fd, filename, O_WRONLY, &t);
         if (write_fd < 0)
                 return log_error_errno(write_fd, "Failed to create '%s': %m", filename);
 
         CLEANUP_TMPFILE_AT(target_dir_fd, t);
 
         if (source_fd >= 0) {
-                r = copy_bytes(source_fd, write_fd, UINT64_MAX, COPY_SEEK0_SOURCE);
+                r = copy_bytes_offset(
+                                source_fd,
+                                /* foffset= */ &(uint64_t) { 0 },
+                                write_fd,
+                                /* toffset= */ NULL,
+                                /* max_bytes= */ UINT64_MAX,
+                                /* copy_flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy data into '%s': %m", filename);
 
@@ -539,7 +644,7 @@ static int begin_write_entry_file(
         log_info("Writing new boot menu entry '%s/loader/entries/%s' for profile %u.", c->dollar_boot_path, filename, profile_nr);
 
         _cleanup_free_ char *t = NULL;
-        _cleanup_close_ int write_fd = open_tmpfile_linkable_at(c->loader_entries_dir_fd, filename, O_WRONLY|O_CLOEXEC, &t);
+        _cleanup_close_ int write_fd = open_tmpfile_linkable_at(c->loader_entries_dir_fd, filename, O_WRONLY, &t);
         if (write_fd < 0)
                 return log_error_errno(write_fd, "Failed to create '%s': %m", filename);
 
@@ -644,7 +749,7 @@ static int link_context_pick_entry_commit(LinkContext *c) {
         if (c->entry_commit != 0)
                 return 0;
 
-        _cleanup_close_ int opened_fd = fd_reopen(c->loader_entries_dir_fd, O_DIRECTORY|O_CLOEXEC);
+        _cleanup_close_ int opened_fd = fd_reopen(c->loader_entries_dir_fd, O_DIRECTORY);
         if (opened_fd < 0)
                 return log_error_errno(opened_fd, "Failed to reopen loader entries dir: %m");
 
@@ -705,7 +810,7 @@ static int clean_temporary_files(int fd) {
          * materialized before they are fully written. However, vfat currently does not support O_TMPFILE,
          * hence we need to clean things up manually. */
 
-        _cleanup_close_ int dfd = fd_reopen(fd, O_CLOEXEC|O_DIRECTORY);
+        _cleanup_close_ int dfd = fd_reopen(fd, O_DIRECTORY);
         if (dfd < 0)
                 return log_error_errno(dfd, "Failed to open directory: %m");
 
@@ -1076,6 +1181,7 @@ static const char* const auto_link_extra_suffixes[] = {
         ".sysext.raw",
         ".confext.raw",
         ".cred",
+        ".addon.efi",
 };
 
 static int link_context_add_extra(LinkContext *c, int dir_fd, const char *path, const char *filename) {
@@ -1087,7 +1193,7 @@ static int link_context_add_extra(LinkContext *c, int dir_fd, const char *path, 
         if (!efi_loader_entry_resource_filename_valid(filename))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Extra file '%s' is not suitable for reference in a boot menu entry, refusing.", filename);
 
-        _cleanup_close_ int fd = xopenat_full(dir_fd, path, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
+        _cleanup_close_ int fd = xopenat_full(dir_fd, path, O_RDONLY|O_NONBLOCK|O_NOCTTY, XO_REGULAR, /* mode= */ MODE_INVALID);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open extra file '%s': %m", path);
 
@@ -1102,6 +1208,7 @@ static int link_context_add_extra(LinkContext *c, int dir_fd, const char *path, 
                 .source_fd = TAKE_FD(fd),
                 .filename = TAKE_PTR(fn),
                 .temp_fd = -EBADF,
+                .auto_discovered = true,
         };
 
         return 0;
@@ -1122,7 +1229,7 @@ static int link_context_add_extras(LinkContext *c, int uki_dir_fd, Set **seen) {
                         uki_dir_fd,
                         "extras.d",
                         /* chase_flags= */ 0,
-                        O_DIRECTORY|O_CLOEXEC,
+                        O_DIRECTORY,
                         /* ret_path= */ NULL);
         if (extras_dir_fd == -ENOENT)
                 return 0;
@@ -1188,6 +1295,7 @@ static int link_context_add_extras(LinkContext *c, int uki_dir_fd, Set **seen) {
                                               de->d_name,
                                               &filter,
                                               /* n_filters= */ 1,
+                                              /* match_root= */ c->root,
                                               /* flags= */ 0,
                                               &pick);
                                 if (r == -ENOENT || r == 0) {
@@ -1232,7 +1340,7 @@ static int link_context_find_kernel(LinkContext *c, int uki_dir_fd) {
         _cleanup_free_ char *filename = NULL;
         _cleanup_close_ int kernel_fd = xopenat_full(
                         uki_dir_fd, "kernel.efi",
-                        O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW,
+                        O_RDONLY|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW,
                         XO_REGULAR,
                         /* mode= */ MODE_INVALID);
         if (kernel_fd == -ENOENT) {
@@ -1243,6 +1351,7 @@ static int link_context_find_kernel(LinkContext *c, int uki_dir_fd) {
                               "kernel.efi.v",
                               &pick_filter_uki,
                               /* n_filters= */ 1,
+                              /* match_root= */ c->root,
                               /* flags= */ 0,
                               &pick);
                 if (r == -ENOENT || r == 0)
@@ -1254,7 +1363,7 @@ static int link_context_find_kernel(LinkContext *c, int uki_dir_fd) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract filename from '%s': %m", pick.path);
 
-                kernel_fd = fd_reopen(pick.fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+                kernel_fd = fd_reopen(pick.fd, O_RDONLY|O_NONBLOCK|O_NOCTTY);
                 if (kernel_fd < 0)
                         return log_error_errno(kernel_fd, "Failed to open UKI '%s': %m", pick.path);
 
@@ -1273,11 +1382,13 @@ static int link_context_find_kernel(LinkContext *c, int uki_dir_fd) {
         if (!efi_loader_entry_resource_filename_valid(filename))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UKI '%s' is not suitable for reference in a boot menu entry.", filename);
 
-        r = validate_kernel(kernel_fd, filename);
+        _cleanup_free_ char *uname = NULL;
+        r = validate_kernel(kernel_fd, filename, &uname);
         if (r < 0)
                 return r;
 
         c->kernel_fd = TAKE_FD(kernel_fd);
+        c->kernel_uname = TAKE_PTR(uname);
         c->kernel_filename = TAKE_PTR(filename);
         return 1;
 }
@@ -1299,7 +1410,7 @@ static int link_context_discover_resources(LinkContext *c) {
                                 /* dir_fd= */ c->root_fd,
                                 *dir,
                                 CHASE_MUST_BE_DIRECTORY,
-                                O_RDONLY|O_DIRECTORY|O_CLOEXEC,
+                                O_RDONLY|O_DIRECTORY,
                                 /* ret_path= */ NULL);
                 if (uki_dir_fd == -ENOENT)
                         continue;
@@ -1346,6 +1457,10 @@ int verb_link_auto(int argc, char *argv[], uintptr_t data, void *userdata) {
 
         /* In addition to the auto-discovered resources, also honour any files passed via --extra=. */
         r = link_context_add_cmdline_extras(&c);
+        if (r < 0)
+                return r;
+
+        r = link_context_validate_extras(&c);
         if (r < 0)
                 return r;
 
@@ -1487,9 +1602,9 @@ static int vl_link_prepare(sd_varlink *link, LinkParameters *p) {
                                 p->context.root = mfree(p->context.root);
                 }
         } else if (p->context.root) {
-                p->context.root_fd = open(p->context.root, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                p->context.root_fd = xopenat(AT_FDCWD, p->context.root, O_RDONLY|O_DIRECTORY);
                 if (p->context.root_fd < 0)
-                        return log_debug_errno(errno, "Failed to open '%s': %m", p->context.root);
+                        return log_debug_errno(p->context.root_fd, "Failed to open '%s': %m", p->context.root);
         } else
                 p->context.root_fd = XAT_FDROOT;
 
@@ -1537,7 +1652,7 @@ static int vl_link_finish(sd_varlink *link, LinkParameters *p, bool with_ids) {
                                 &p->context.dollar_boot_path,
                                 &p->context.dollar_boot_fd);
                 if (r == -ENOKEY)
-                        return sd_varlink_error(link, "io.systemd.BootControl.NoDollarBootFound", NULL);
+                        return sd_varlink_error(link, "io.systemd.BootControl.NoDollarBootFound", /* parameters= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -1547,14 +1662,14 @@ static int vl_link_finish(sd_varlink *link, LinkParameters *p, bool with_ids) {
 
         r = run_link(&p->context);
         if (r == -EUNATCH) /* no boot entry token is set */
-                return sd_varlink_error(link, "io.systemd.BootControl.BootEntryTokenUnavailable", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.BootEntryTokenUnavailable", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
         if (with_ids)
                 return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRV("ids", p->context.linked_ids));
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 int vl_method_link(
@@ -1616,13 +1731,25 @@ int vl_method_link(
 
         /* Refuse non-UKIs for now. */
         KernelImageType kit = _KERNEL_IMAGE_TYPE_INVALID;
-        r = inspect_kernel(p.context.kernel_fd, /* filename= */ NULL, &kit);
+        r = inspect_kernel_full(
+                        p.context.kernel_fd,
+                        /* filename= */ NULL,
+                        &kit,
+                        /* ret_cmdline= */ NULL,
+                        &p.context.kernel_uname,
+                        /* ret_pretty_name= */ NULL);
         if (r == -EBADMSG)
-                return sd_varlink_error(link, "io.systemd.BootControl.InvalidKernelImage", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.InvalidKernelImage", /* parameters= */ NULL);
         if (r < 0)
                 return r;
         if (kit != KERNEL_IMAGE_TYPE_UKI)
-                return sd_varlink_error(link, "io.systemd.BootControl.InvalidKernelImage", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.InvalidKernelImage", /* parameters= */ NULL);
+
+        r = link_context_validate_extras(&p.context);
+        if (r == -EBADMSG)
+                return sd_varlink_error_invalid_parameter_name(link, "extraFiles");
+        if (r < 0)
+                return r;
 
         return vl_link_finish(link, &p, /* with_ids= */ true);
 }
@@ -1676,6 +1803,10 @@ int vl_method_link_auto(
         if (r == 0) /* Nothing staged for linking. */
                 return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRV("ids", STRV_EMPTY));
 
+        r = link_context_validate_extras(&p.context);
+        if (r < 0)
+                return r;
+
         return vl_link_finish(link, &p, /* with_ids= */ true);
 }
 
@@ -1714,7 +1845,11 @@ int vl_method_on_completed_update(
         if (r < 0)
                 return r;
         if (r == 0) /* Nothing staged for linking. */
-                return sd_varlink_reply(link, NULL);
+                return sd_varlink_reply(link, /* parameters= */ NULL);
+
+        r = link_context_validate_extras(&p.context);
+        if (r < 0)
+                return r;
 
         return vl_link_finish(link, &p, /* with_ids= */ false);
 }

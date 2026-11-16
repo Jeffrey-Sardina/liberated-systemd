@@ -6,20 +6,20 @@
 
 #include "alloc-util.h"
 #include "fileio.h"
+#include "json-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "set.h"
 #include "string-util.h"
+#include "strv.h"
 #include "tests.h"
 #include "tmpfile-util.h"
 #include "vmspawn-util.h"
 
-#define _ESCAPE_QEMU_VALUE_CHECK(str, correct, varname) \
-        do {                                            \
-                _cleanup_free_ char* varname = NULL;    \
-                varname = escape_qemu_value(str);       \
-                assert(varname);                        \
-                assert_se(streq(varname, correct));     \
+#define _ESCAPE_QEMU_VALUE_CHECK(str, correct, varname)                                 \
+        do {                                                                            \
+                _cleanup_free_ char* varname = ASSERT_NOT_NULL(escape_qemu_value(str)); \
+                ASSERT_STREQ(varname, correct);                                         \
         } while (0)
 
 #define ESCAPE_QEMU_VALUE_CHECK(str, correct) \
@@ -33,11 +33,12 @@ TEST(escape_qemu_value) {
 }
 
 typedef enum TestMapping {
-        MAPPING_FLASH_SPLIT,     /* pflash executable + NVRAM template */
-        MAPPING_FLASH_STATELESS, /* read-only pflash, no NVRAM */
-        MAPPING_FLASH_COMBINED,  /* read-write pflash with the variable store inside the executable */
-        MAPPING_MEMORY,          /* mapped into memory, loaded via -bios */
-        MAPPING_KERNEL,          /* loaded like a Linux kernel */
+        MAPPING_FLASH_SPLIT,      /* pflash executable + NVRAM template */
+        MAPPING_FLASH_STATELESS,  /* read-only pflash, no NVRAM */
+        MAPPING_FLASH_COMBINED,   /* read-write pflash with the variable store inside the executable */
+        MAPPING_MEMORY,           /* mapped into memory, loaded via -bios */
+        MAPPING_MEMORY_UEFI_VARS, /* mapped into memory, with a template for QEMU's UEFI variable store */
+        MAPPING_KERNEL,           /* loaded like a Linux kernel */
 } TestMapping;
 
 static void write_descriptor(
@@ -45,26 +46,29 @@ static void write_descriptor(
                 const char *name,
                 const char *executable,
                 const char *format,
-                const char *interface_type,
+                char **interface_types,
                 const char *arch,
                 const char *machine,
                 TestMapping mapping,
                 char **features) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
-        _cleanup_free_ char *j = NULL, *p = NULL;
+        _cleanup_free_ char *p = NULL;
 
         if (!arch)
                 ASSERT_OK(native_arch_as_qemu(&arch));
 
         bool flash = IN_SET(mapping, MAPPING_FLASH_SPLIT, MAPPING_FLASH_STATELESS, MAPPING_FLASH_COMBINED);
+        bool memory = IN_SET(mapping, MAPPING_MEMORY, MAPPING_MEMORY_UEFI_VARS);
 
         ASSERT_OK(sd_json_buildo(&v,
                         SD_JSON_BUILD_PAIR_STRING("description", name),
-                        SD_JSON_BUILD_PAIR_STRV("interface-types", STRV_MAKE(interface_type ?: "uefi")),
+                        SD_JSON_BUILD_PAIR_STRV("interface-types", interface_types ?: STRV_MAKE("uefi")),
                         SD_JSON_BUILD_PAIR("mapping", SD_JSON_BUILD_OBJECT(
-                                SD_JSON_BUILD_PAIR_STRING("device", flash ? "flash" : mapping == MAPPING_MEMORY ? "memory" : "kernel"),
+                                SD_JSON_BUILD_PAIR_STRING("device", flash ? "flash" : memory ? "memory" : "kernel"),
                                 SD_JSON_BUILD_PAIR_CONDITION(!flash, "filename", SD_JSON_BUILD_STRING(executable)),
+                                SD_JSON_BUILD_PAIR_CONDITION(mapping == MAPPING_MEMORY_UEFI_VARS, "uefi-vars", SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR_STRING("template", "/test/vars.json"))),
                                 SD_JSON_BUILD_PAIR_CONDITION(mapping == MAPPING_FLASH_STATELESS, "mode", SD_JSON_BUILD_STRING("stateless")),
                                 SD_JSON_BUILD_PAIR_CONDITION(mapping == MAPPING_FLASH_COMBINED, "mode", SD_JSON_BUILD_STRING("combined")),
                                 SD_JSON_BUILD_PAIR_CONDITION(mapping == MAPPING_FLASH_SPLIT, "nvram-template", SD_JSON_BUILD_OBJECT(
@@ -79,139 +83,277 @@ static void write_descriptor(
                         SD_JSON_BUILD_PAIR_STRV("features", features),
                         SD_JSON_BUILD_PAIR_EMPTY_ARRAY("tags")));
 
-        ASSERT_OK(sd_json_variant_format(v, /* flags= */ 0, &j));
         ASSERT_NOT_NULL(p = path_join(dir, name));
-        ASSERT_OK(write_string_file(p, j, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
+        ASSERT_OK(json_variant_write_file_at(AT_FDCWD, p, v, /* format_flags= */ 0, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755));
 }
 
-/* Searches with the given feature sets and flags, and asserts that the firmware with the expected
- * executable path is selected, or -ENOENT if expect_path is NULL. Optionally returns the selected config
- * for further assertions. */
-static void check_find(char **include, char **exclude, FindOvmfConfigFlags flags, const char *expect_path, OvmfConfig **ret) {
-        _cleanup_set_free_ Set *inc = NULL, *exc = NULL;
-        _cleanup_(ovmf_config_freep) OvmfConfig *config = NULL;
-        int r;
+/* Firmware discovery is tested in two steps: all descriptors listed in test_descriptors are installed,
+ * and then each search in test_searches is run against them and must find exactly the descriptors it
+ * expects. To test something new, add the descriptors it needs and add them to the expected results of
+ * every search that should find them, then add the searches it needs.
+ *
+ * All descriptors declare the made-up "vmspawn-test" feature and every search requires it, so
+ * descriptors installed on the host never match. */
 
-        ASSERT_OK(set_put_strdupv(&inc, include));
-        ASSERT_OK(set_put_strdupv(&exc, exclude));
+typedef struct TestDescriptor {
+        const char *name;                     /* installed as <name>.json, executable /test/<name> */
+        TestMapping mapping;
+        const char *format;                   /* executable format of flash mappings, default "raw" */
+        const char * const *interface_types;  /* default "uefi" */
+        const char *arch;                     /* default the native architecture */
+        const char *machine;                  /* default the native machine type */
+        const char * const *features;         /* in addition to "vmspawn-test" */
+} TestDescriptor;
 
-        r = find_ovmf_config(inc, exc, flags, &config, /* ret_firmware_json= */ NULL);
-        if (!expect_path)
-                ASSERT_ERROR(r, ENOENT);
-        else {
-                ASSERT_OK(r);
-                ASSERT_STREQ(config->path, expect_path);
+static const TestDescriptor test_descriptors[] = {
+        /* Found by some of the searches. */
+        { "flash-split",             MAPPING_FLASH_SPLIT                                                        },
+        { "flash-split-qcow2",       MAPPING_FLASH_SPLIT,      .format = "qcow2"                                },
+        { "flash-split-secure-boot", MAPPING_FLASH_SPLIT,      .features = STRV_MAKE_CONST("secure-boot")       },
+        { "flash-stateless",         MAPPING_FLASH_STATELESS                                                    },
+        { "flash-stateless-qcow2",   MAPPING_FLASH_STATELESS,  .format = "qcow2"                                },
+        { "memory",                  MAPPING_MEMORY                                                             },
+        { "memory-secure-boot",      MAPPING_MEMORY,           .features = STRV_MAKE_CONST("secure-boot")       },
+        { "memory-host-uefi-vars",   MAPPING_MEMORY_UEFI_VARS, .features = STRV_MAKE_CONST("host-uefi-vars")    },
+
+        /* Never found. Each differs from one of the above in a single property, which rules it out. */
+        { "bios",                    MAPPING_FLASH_SPLIT,      .interface_types = STRV_MAKE_CONST("bios")       },
+        { "foreign-arch",            MAPPING_FLASH_SPLIT,      .arch = "vmspawn-test-arch"                      },
+        { "foreign-machine",         MAPPING_FLASH_SPLIT,      .machine = "vmspawn-test-machine"                },
+        { "flash-combined",          MAPPING_FLASH_COMBINED                                                     }, /* writable variable store */
+        { "kernel",                  MAPPING_KERNEL                                                             }, /* unsupported device */
+        { "memory-host-uefi-vars-without-template",
+                                     MAPPING_MEMORY,           .features = STRV_MAKE_CONST("host-uefi-vars")    },
+        { "flash-stateless-host-uefi-vars",
+                                     MAPPING_FLASH_STATELESS,  .features = STRV_MAKE_CONST("host-uefi-vars")    },
+};
+
+#define TEST_FLAGS_COCO (FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW) /* as vmspawn searches under --coco= */
+
+typedef struct TestSearch {
+        const char *description;
+        FindOvmfConfigFlags flags;
+        const char * const *include;          /* in addition to "vmspawn-test" */
+        const char * const *exclude;
+        const char * const *expect;           /* names of the descriptors found, in any order */
+        const char * const *expect_uefi_vars; /* found too if QEMU provides a host-side UEFI variable store */
+} TestSearch;
+
+static const TestSearch test_searches[] = {
+        {
+                .description      = "firmware with a variable store",
+                .flags            = 0,
+                .expect           = STRV_MAKE_CONST("flash-split", "flash-split-qcow2", "flash-split-secure-boot"),
+                .expect_uefi_vars = STRV_MAKE_CONST("memory-host-uefi-vars"),
+        },
+        {
+                .description      = "stateless firmware",
+                .flags            = FIND_OVMF_STATELESS,
+                .expect           = STRV_MAKE_CONST("flash-stateless", "flash-stateless-qcow2", "memory", "memory-secure-boot"),
+        },
+        {
+                .description      = "stateless firmware in raw format",
+                .flags            = TEST_FLAGS_COCO,
+                .expect           = STRV_MAKE_CONST("flash-stateless", "memory", "memory-secure-boot"),
+        },
+        {
+                .description      = "stateless firmware in raw format, with Secure Boot",
+                .flags            = TEST_FLAGS_COCO,
+                .include          = STRV_MAKE_CONST("secure-boot"),
+                .expect           = STRV_MAKE_CONST("memory-secure-boot"),
+        },
+        {
+                .description      = "firmware with a variable store and Secure Boot",
+                .flags            = 0,
+                .include          = STRV_MAKE_CONST("secure-boot"),
+                .expect           = STRV_MAKE_CONST("flash-split-secure-boot"),
+        },
+        {
+                .description      = "firmware with a variable store, without Secure Boot",
+                .flags            = 0,
+                .exclude          = STRV_MAKE_CONST("secure-boot"),
+                .expect           = STRV_MAKE_CONST("flash-split", "flash-split-qcow2"),
+                .expect_uefi_vars = STRV_MAKE_CONST("memory-host-uefi-vars"),
+        },
+        {
+                .description      = "a feature both required and excluded, which is required then",
+                .flags            = 0,
+                .include          = STRV_MAKE_CONST("secure-boot"),
+                .exclude          = STRV_MAKE_CONST("secure-boot"),
+                .expect           = STRV_MAKE_CONST("flash-split-secure-boot"),
+        },
+        {
+                .description      = "a feature no firmware has",
+                .flags            = 0,
+                .include          = STRV_MAKE_CONST("vmspawn-test-missing"),
+                .expect           = NULL,
+        },
+};
+
+/* Descriptors that describe stateless firmware, as told by ovmf_config_is_stateless(). */
+static const char * const *test_descriptors_stateless = STRV_MAKE_CONST(
+                "flash-stateless", "flash-stateless-qcow2", "memory", "memory-secure-boot");
+
+static const TestDescriptor* test_descriptor_find(const char *name) {
+        FOREACH_ELEMENT(d, test_descriptors)
+                if (streq(d->name, name))
+                        return d;
+
+        log_error("Unknown test descriptor '%s'", name);
+        return NULL;
+}
+
+static char* test_descriptor_path(const char *dir, const TestDescriptor *d) {
+        return strjoin(dir, "/", d->name, ".json");
+}
+
+/* Appends the descriptor paths of the named test descriptors to l. */
+static void test_descriptor_paths_extend(char ***l, const char *dir, const char * const *names) {
+        assert(l);
+        assert(dir);
+
+        STRV_FOREACH(name, (char**) names) {
+                const TestDescriptor *d;
+
+                ASSERT_NOT_NULL(d = test_descriptor_find(*name));
+                ASSERT_OK(strv_consume(l, test_descriptor_path(dir, d)));
         }
-
-        if (ret)
-                *ret = TAKE_PTR(config);
 }
 
-TEST(find_ovmf_config) {
+static char* test_descriptor_executable(const TestDescriptor *d) {
+        return strjoin("/test/", d->name);
+}
+
+/* Installs test_descriptors as the user's firmware descriptors. */
+static void install_test_descriptors(char **ret_tmp, char **ret_dir) {
         _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
-        _cleanup_(ovmf_config_freep) OvmfConfig *config = NULL;
         _cleanup_free_ char *dir = NULL;
 
-        if (native_arch_as_qemu(/* ret= */ NULL) < 0)
-                return (void) log_tests_skipped("native architecture not supported by qemu");
+        assert(ret_tmp);
+        assert(ret_dir);
 
         ASSERT_OK(mkdtemp_malloc("/tmp/test-vmspawn-firmware-XXXXXX", &tmp));
         ASSERT_OK_ERRNO(setenv("XDG_CONFIG_HOME", tmp, /* overwrite= */ true));
         ASSERT_NOT_NULL(dir = path_join(tmp, "qemu/firmware"));
 
-        /* All fixtures declare made-up features and every search below requires one of them, so
-         * descriptors installed on the host can never match and the test stays hermetic. */
+        FOREACH_ELEMENT(d, test_descriptors) {
+                _cleanup_free_ char *name = NULL, *executable = NULL;
+                _cleanup_strv_free_ char **features = NULL;
 
-        /* Stateful vs. stateless selection, in both sort orders. */
-        write_descriptor(dir, "00-a-stateless.json", "/test/a-stateless.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_STATELESS, STRV_MAKE("vmspawn-test-a"));
-        write_descriptor(dir, "10-a-stateful.json", "/test/a-stateful.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-a"));
-        write_descriptor(dir, "00-b-stateful.json", "/test/b-stateful.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-b"));
-        write_descriptor(dir, "10-b-stateless.json", "/test/b-stateless.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_STATELESS, STRV_MAKE("vmspawn-test-b"));
+                ASSERT_NOT_NULL(name = strjoin(d->name, ".json"));
+                ASSERT_NOT_NULL(executable = test_descriptor_executable(d));
+                ASSERT_NOT_NULL(features = strv_new("vmspawn-test"));
+                ASSERT_OK(strv_extend_strv(&features, (char**) d->features, /* filter_duplicates= */ false));
 
-        /* By default only firmware with an NVRAM template is considered. */
-        check_find(STRV_MAKE("vmspawn-test-a"), /* exclude= */ NULL, /* flags= */ 0, "/test/a-stateful.fd", &config);
-        ASSERT_STREQ(config->vars, "/test/vars.fd");
-        ASSERT_STREQ(config->format, "raw");
-        ASSERT_FALSE(ovmf_config_is_stateless(config));
-        ASSERT_FALSE(ovmf_config_has_feature(config, "secure-boot"));
-        config = ovmf_config_free(config);
+                write_descriptor(dir, name, executable, d->format ?: "raw", (char**) d->interface_types,
+                                 d->arch, d->machine, d->mapping, features);
+        }
 
-        /* With FIND_OVMF_STATELESS only firmware in stateless flash mode is considered. */
-        check_find(STRV_MAKE("vmspawn-test-a"), /* exclude= */ NULL, FIND_OVMF_STATELESS, "/test/a-stateless.fd", &config);
-        ASSERT_NULL(config->vars);
-        ASSERT_TRUE(ovmf_config_is_stateless(config));
-        config = ovmf_config_free(config);
+        *ret_tmp = TAKE_PTR(tmp);
+        *ret_dir = TAKE_PTR(dir);
+}
 
-        check_find(STRV_MAKE("vmspawn-test-b"), /* exclude= */ NULL, /* flags= */ 0, "/test/b-stateful.fd", /* ret= */ NULL);
-        check_find(STRV_MAKE("vmspawn-test-b"), /* exclude= */ NULL, FIND_OVMF_STATELESS, "/test/b-stateless.fd", /* ret= */ NULL);
+/* Loading a descriptor reproduces what it declares. */
+TEST(load_ovmf_config) {
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *dir = NULL;
 
-        /* FIND_OVMF_REQUIRE_RAW skips firmware in other formats, which is accepted otherwise. */
-        write_descriptor(dir, "00-c-qcow2.json", "/test/c.qcow2", "qcow2", NULL, NULL, NULL, MAPPING_FLASH_STATELESS, STRV_MAKE("vmspawn-test-c"));
-        write_descriptor(dir, "10-c-raw.json", "/test/c.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_STATELESS, STRV_MAKE("vmspawn-test-c"));
+        if (native_arch_as_qemu(/* ret= */ NULL) < 0)
+                return (void) log_tests_skipped("native architecture not supported by qemu");
 
-        check_find(STRV_MAKE("vmspawn-test-c"), /* exclude= */ NULL, FIND_OVMF_STATELESS, "/test/c.qcow2", &config);
-        ASSERT_STREQ(config->format, "qcow2");
-        config = ovmf_config_free(config);
+        STRV_FOREACH(name, (char**) test_descriptors_stateless)
+                ASSERT_NOT_NULL(test_descriptor_find(*name));
 
-        check_find(STRV_MAKE("vmspawn-test-c"), /* exclude= */ NULL, FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW, "/test/c.fd", /* ret= */ NULL);
+        install_test_descriptors(&tmp, &dir);
 
-        /* Memory-mapped firmware (loaded via -bios) is stateless and raw by definition. */
-        write_descriptor(dir, "00-m-memory.json", "/test/m-memory.fd", "raw", NULL, NULL, NULL, MAPPING_MEMORY, STRV_MAKE("vmspawn-test-m"));
+        FOREACH_ELEMENT(d, test_descriptors) {
+                _cleanup_(ovmf_config_freep) OvmfConfig *config = NULL;
+                _cleanup_free_ char *path = NULL, *executable = NULL;
 
-        check_find(STRV_MAKE("vmspawn-test-m"), /* exclude= */ NULL, /* flags= */ 0, /* expect_path= */ NULL, /* ret= */ NULL);
-        check_find(STRV_MAKE("vmspawn-test-m"), /* exclude= */ NULL, FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW, "/test/m-memory.fd", &config);
-        ASSERT_NULL(config->vars);
-        ASSERT_NULL(config->format);
-        ASSERT_STREQ(ovmf_config_format(config), "raw");
-        ASSERT_TRUE(ovmf_config_is_stateless(config));
-        config = ovmf_config_free(config);
+                log_info("Loading test descriptor '%s'", d->name);
+                ASSERT_NOT_NULL(path = test_descriptor_path(dir, d));
 
-        /* Combined-mode flash firmware carries a writable variable store inside the executable, it must not be treated as stateless. */
-        write_descriptor(dir, "00-f-combined.json", "/test/f-combined.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_COMBINED, STRV_MAKE("vmspawn-test-f"));
+                if (d->mapping == MAPPING_KERNEL) {
+                        ASSERT_ERROR(load_ovmf_config(path, &config), EOPNOTSUPP);
+                        continue;
+                }
 
-        check_find(STRV_MAKE("vmspawn-test-f"), /* exclude= */ NULL, /* flags= */ 0, /* expect_path= */ NULL, /* ret= */ NULL);
-        check_find(STRV_MAKE("vmspawn-test-f"), /* exclude= */ NULL, FIND_OVMF_STATELESS, /* expect_path= */ NULL, /* ret= */ NULL);
+                ASSERT_OK(load_ovmf_config(path, &config));
 
-        /* Firmware that is not UEFI, uses an unsupported mapping device, or doesn't match the native
-         * architecture or machine type, is skipped. */
-        write_descriptor(dir, "00-d-bios.json", "/test/d-bios.fd", "raw", "bios", NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-d"));
-        write_descriptor(dir, "05-d-kernel.json", "/test/d-kernel.fd", "raw", NULL, NULL, NULL, MAPPING_KERNEL, STRV_MAKE("vmspawn-test-d"));
-        write_descriptor(dir, "10-d-arch.json", "/test/d-arch.fd", "raw", NULL, "vmspawn-test-arch", NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-d"));
-        write_descriptor(dir, "20-d-machine.json", "/test/d-machine.fd", "raw", NULL, NULL, "vmspawn-test-mach", MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-d"));
-        write_descriptor(dir, "30-d-good.json", "/test/d-good.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-d"));
+                bool flash = IN_SET(d->mapping, MAPPING_FLASH_SPLIT, MAPPING_FLASH_STATELESS, MAPPING_FLASH_COMBINED);
+                bool split = d->mapping == MAPPING_FLASH_SPLIT;
+                bool uefi_vars = d->mapping == MAPPING_MEMORY_UEFI_VARS;
 
-        check_find(STRV_MAKE("vmspawn-test-d"), /* exclude= */ NULL, /* flags= */ 0, "/test/d-good.fd", /* ret= */ NULL);
+                ASSERT_NOT_NULL(executable = test_descriptor_executable(d));
+                ASSERT_STREQ(config->path, executable);
+                /* Firmware not mapped into flash carries no format and is raw by definition. */
+                ASSERT_STREQ(ovmf_config_format(config), flash ? d->format ?: "raw" : "raw");
+                ASSERT_STREQ(config->vars, split ? "/test/vars.fd" : NULL);
+                ASSERT_STREQ(config->uefi_vars_template, uefi_vars ? "/test/vars.json" : NULL);
 
-        /* Feature include/exclude handling. */
-        write_descriptor(dir, "00-e-both.json", "/test/e-both.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-e1", "vmspawn-test-e2", "secure-boot"));
-        write_descriptor(dir, "10-e-one.json", "/test/e-one.fd", "raw", NULL, NULL, NULL, MAPPING_FLASH_SPLIT, STRV_MAKE("vmspawn-test-e1"));
+                ASSERT_EQ(ovmf_config_is_stateless(config), strv_contains((char**) test_descriptors_stateless, d->name));
+                ASSERT_EQ(ovmf_config_has_host_uefi_vars(config), strv_contains((char**) d->features, "host-uefi-vars"));
+                ASSERT_EQ(ovmf_config_has_feature(config, "secure-boot"), strv_contains((char**) d->features, "secure-boot"));
+        }
 
-        /* The first matching descriptor in sort order wins. */
-        check_find(STRV_MAKE("vmspawn-test-e1"), /* exclude= */ NULL, /* flags= */ 0, "/test/e-both.fd", &config);
-        ASSERT_TRUE(ovmf_config_has_feature(config, "secure-boot"));
-        config = ovmf_config_free(config);
+        ASSERT_OK_ERRNO(unsetenv("XDG_CONFIG_HOME"));
+}
 
-        /* Descriptors with an excluded feature are skipped. */
-        check_find(STRV_MAKE("vmspawn-test-e1"), STRV_MAKE("vmspawn-test-e2"), /* flags= */ 0, "/test/e-one.fd", &config);
-        ASSERT_TRUE(ovmf_config_has_feature(config, "vmspawn-test-e1"));
-        ASSERT_FALSE(ovmf_config_has_feature(config, "vmspawn-test-e2"));
-        config = ovmf_config_free(config);
+/* Each search finds exactly the expected descriptors, and automatic selection picks the first of them. */
+TEST(list_eligible_ovmf_config) {
+        _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
+        _cleanup_free_ char *dir = NULL;
 
-        /* Inclusion wins over exclusion. */
-        check_find(STRV_MAKE("vmspawn-test-e1", "vmspawn-test-e2"), STRV_MAKE("vmspawn-test-e2"), /* flags= */ 0, "/test/e-both.fd", &config);
-        ASSERT_TRUE(ovmf_config_has_feature(config, "vmspawn-test-e1"));
-        ASSERT_TRUE(ovmf_config_has_feature(config, "vmspawn-test-e2"));
-        config = ovmf_config_free(config);
+        if (native_arch_as_qemu(/* ret= */ NULL) < 0)
+                return (void) log_tests_skipped("native architecture not supported by qemu");
 
-        /* All included features must be present. */
-        check_find(STRV_MAKE("vmspawn-test-e1", "vmspawn-test-nonexistent"), /* exclude= */ NULL, /* flags= */ 0, /* expect_path= */ NULL, /* ret= */ NULL);
+        install_test_descriptors(&tmp, &dir);
 
-        /* The firmware description JSON is returned on request. */
-        _cleanup_set_free_ Set *inc = NULL;
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
-        ASSERT_OK(set_put_strdup(&inc, "vmspawn-test-a"));
-        ASSERT_OK(find_ovmf_config(inc, /* features_exclude= */ NULL, /* flags= */ 0, &config, &json));
-        ASSERT_TRUE(sd_json_variant_is_object(json));
+        FOREACH_ELEMENT(search, test_searches) {
+                _cleanup_strv_free_ char **found = NULL, **expected = NULL;
+                _cleanup_set_free_ Set *include = NULL, *exclude = NULL;
+                _cleanup_(ovmf_config_freep) OvmfConfig *config = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
+                int r;
+
+                log_info("Searching for %s", search->description);
+
+                test_descriptor_paths_extend(&expected, dir, search->expect);
+                if (QEMU_UEFI_VARS_DEVICE)
+                        test_descriptor_paths_extend(&expected, dir, search->expect_uefi_vars);
+
+                ASSERT_OK(set_put_strdup(&include, "vmspawn-test"));
+                ASSERT_OK(set_put_strdupv(&include, (char**) search->include));
+                ASSERT_OK(set_put_strdupv(&exclude, (char**) search->exclude));
+
+                ASSERT_OK(list_eligible_ovmf_config(include, exclude, search->flags, &found,
+                                                    /* ret_first= */ NULL, /* ret_first_json= */ NULL));
+
+                r = find_ovmf_config(include, exclude, search->flags, &config, &json);
+                if (strv_isempty(found))
+                        ASSERT_ERROR(r, ENOENT);
+                else {
+                        _cleanup_free_ char *selected = NULL;
+                        const char *name;
+
+                        /* Map the selected executable /test/<name> back to its descriptor. */
+                        ASSERT_OK(r);
+                        ASSERT_NOT_NULL(name = startswith(config->path, "/test/"));
+                        ASSERT_NOT_NULL(selected = strjoin(dir, "/", name, ".json"));
+                        ASSERT_STREQ(selected, found[0]);
+                        /* write_descriptor() names the descriptor after its file. */
+                        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(json, "description")),
+                                     last_path_component(found[0]));
+                }
+
+                /* All descriptors live in one directory, so the order of preference is by file name. */
+                strv_sort(expected);
+                if (!strv_equal(found, expected)) {
+                        _cleanup_free_ char *f = strv_join(found, "\n  "), *e = strv_join(expected, "\n  ");
+                        log_error("Searching for %s found:\n  %s\nbut expected:\n  %s", search->description, strnull(f), strnull(e));
+                }
+                ASSERT_TRUE(strv_equal(found, expected));
+        }
 
         ASSERT_OK_ERRNO(unsetenv("XDG_CONFIG_HOME"));
 }

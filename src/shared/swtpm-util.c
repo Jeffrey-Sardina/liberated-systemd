@@ -43,7 +43,7 @@ static int swtpm_find_best_profile(const char *swtpm_setup, char **ret) {
                 log_debug("About to spawn: %s", strnull(cmdline));
         }
 
-        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
         r = pidref_safe_fork_full(
                         "(swtpm-lprof)",
                         (int[]) { -EBADF, mfd, STDERR_FILENO },
@@ -55,12 +55,17 @@ static int swtpm_find_best_profile(const char *swtpm_setup, char **ret) {
                 return log_error_errno(r, "Failed to run swtpm_setup: %m");
         if (r == 0) {
                 /* Child */
-                execvp(args[0], args);
-                log_error_errno(errno, "Failed to execute '%s': %m", args[0]);
+                r = execvp_safe(args[0], args);
+                log_error_errno(r, "Failed to execute '%s': %m", args[0]);
                 _exit(EXIT_FAILURE);
         }
 
         r = pidref_wait_for_terminate_and_check("(swtpm-lprof)", &pidref, WAIT_LOG_ABNORMAL);
+        /* An exit status, -EPROTO for a child killed by a signal, and -ECHILD mean that the child is gone.
+         * The cleanup must not send SIGKILL then, because without a pidfd the PID might belong to another
+         * process by now. After any other failure the child is not reaped yet, and the cleanup kills it. */
+        if (r >= 0 || IN_SET(r, -EPROTO, -ECHILD))
+                pidref_done(&pidref);
         if (r < 0)
                 return r;
 
@@ -138,9 +143,9 @@ int manufacture_swtpm(const char *state_dir, const char *secret) {
 
         assert(state_dir);
 
-        _cleanup_close_ int state_dir_fd = open(state_dir, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        _cleanup_close_ int state_dir_fd = xopenat(AT_FDCWD, state_dir, O_RDONLY|O_DIRECTORY);
         if (state_dir_fd < 0)
-                return log_error_errno(errno, "Failed to open TPM state directory '%s': %m", state_dir);
+                return log_error_errno(state_dir_fd, "Failed to open TPM state directory '%s': %m", state_dir);
 
         _cleanup_free_ char *swtpm_setup = NULL;
         r = find_executable("swtpm_setup", &swtpm_setup);
@@ -236,18 +241,18 @@ int manufacture_swtpm(const char *state_dir, const char *secret) {
                 return log_error_errno(r, "Failed to run swtpm_setup: %m");
         if (r == 0) {
                 /* Child */
-                execvp(args[0], args);
-                log_error_errno(errno, "Failed to execute '%s': %m", args[0]);
+                r = execvp_safe(args[0], args);
+                log_error_errno(r, "Failed to execute '%s': %m", args[0]);
                 _exit(EXIT_FAILURE);
         }
 
         /* Persist swtpm_setup's freshly created TPM state before writing the completion marker. */
-        r = syncfs_path(state_dir_fd, NULL);
+        r = syncfs_path(state_dir_fd, /* path= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to sync TPM state directory: %m");
 
         /* Marker, written last, signals that manufacturing completed successfully. */
-        _cleanup_close_ int marker_fd = xopenat(state_dir_fd, SWTPM_MANUFACTURED_MARKER, O_WRONLY|O_CREAT|O_CLOEXEC|O_NOFOLLOW);
+        _cleanup_close_ int marker_fd = xopenat(state_dir_fd, SWTPM_MANUFACTURED_MARKER, O_WRONLY|O_CREAT|O_NOFOLLOW);
         if (marker_fd < 0)
                 return log_error_errno(marker_fd, "Failed to write '%s' marker: %m", SWTPM_MANUFACTURED_MARKER);
 

@@ -30,7 +30,7 @@
 TEST(packet_set_flags_dns_checking_enabled) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
         dns_packet_set_flags(packet, /* dnssec_checking_disabled= */ false, /* truncated= */ false);
 
@@ -49,7 +49,7 @@ TEST(packet_set_flags_dns_checking_enabled) {
 TEST(packet_set_flags_dns_checking_disabled) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
         dns_packet_set_flags(packet, /* dnssec_checking_disabled= */ true, /* truncated= */ false);
 
@@ -68,7 +68,7 @@ TEST(packet_set_flags_dns_checking_disabled) {
 TEST(packet_set_flags_llmnr) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_LLMNR, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_LLMNR, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
         dns_packet_set_flags(packet, /* dnssec_checking_disabled= */ true, /* truncated= */ false);
 
@@ -87,7 +87,7 @@ TEST(packet_set_flags_llmnr) {
 TEST(packet_set_flags_mdns_not_truncated) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
         dns_packet_set_flags(packet, /* dnssec_checking_disabled= */ true, /* truncated= */ false);
 
@@ -106,7 +106,7 @@ TEST(packet_set_flags_mdns_not_truncated) {
 TEST(packet_set_flags_mdns_truncated) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
         dns_packet_set_flags(packet, /* dnssec_checking_disabled= */ true, /* truncated= */ true);
 
@@ -129,7 +129,7 @@ TEST(packet_set_flags_mdns_truncated) {
 TEST(packet_new_query_checking_enabled) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new_query(&packet, DNS_PROTOCOL_DNS, 0, false));
+        ASSERT_OK(dns_packet_new_query(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, /* dnssec_checking_disabled= */ false));
         ASSERT_NOT_NULL(packet);
 
         ASSERT_EQ(DNS_PACKET_TC(packet), 0);
@@ -139,7 +139,7 @@ TEST(packet_new_query_checking_enabled) {
 TEST(packet_new_query_checking_disabled) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new_query(&packet, DNS_PROTOCOL_DNS, 0, true));
+        ASSERT_OK(dns_packet_new_query(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, /* dnssec_checking_disabled= */ true));
         ASSERT_NOT_NULL(packet);
 
         ASSERT_EQ(DNS_PACKET_TC(packet), 0);
@@ -154,7 +154,7 @@ TEST(packet_append_key_single_a) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -163,7 +163,7 @@ TEST(packet_append_key_single_a) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, 0, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, /* flags= */ 0, /* start= */ NULL));
         dns_resource_key_unref(key);
 
         const uint8_t data[] = {
@@ -178,15 +178,14 @@ TEST(packet_append_key_single_a) {
         /* IN */        0x00, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_key_single_soa_any_class) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -195,7 +194,7 @@ TEST(packet_append_key_single_soa_any_class) {
 
         key = dns_resource_key_new(DNS_CLASS_ANY, DNS_TYPE_SOA, "www.example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, 0, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, /* flags= */ 0, /* start= */ NULL));
         dns_resource_key_unref(key);
 
         const uint8_t data[] = {
@@ -210,15 +209,14 @@ TEST(packet_append_key_single_soa_any_class) {
         /* ANY */       0x00, 0xff
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_key_cache_flush_mdns) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -227,7 +225,7 @@ TEST(packet_append_key_cache_flush_mdns) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "example.local");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, /* start= */ NULL));
         dns_resource_key_unref(key);
 
         const uint8_t data[] = {
@@ -242,8 +240,7 @@ TEST(packet_append_key_cache_flush_mdns) {
                         0x80, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* The cache-flush bit is defined for mDNS only. RRs taken from our mDNS zone carry
@@ -253,7 +250,7 @@ TEST(packet_append_key_cache_flush_dns) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -262,7 +259,7 @@ TEST(packet_append_key_cache_flush_dns) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "example.local");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, /* start= */ NULL));
         dns_resource_key_unref(key);
 
         const uint8_t data[] = {
@@ -276,8 +273,7 @@ TEST(packet_append_key_cache_flush_dns) {
         /* IN */        0x00, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* mDNS probes carry the proposed RRs from our mDNS zone in the Authority Section. Those items carry
@@ -287,7 +283,7 @@ TEST(packet_append_key_cache_flush_mdns_query) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_MDNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 0, 0, 0, 0, DNS_RCODE_SUCCESS));
@@ -295,7 +291,7 @@ TEST(packet_append_key_cache_flush_mdns_query) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "example.local");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, DNS_ANSWER_CACHE_FLUSH, /* start= */ NULL));
         dns_resource_key_unref(key);
 
         const uint8_t data[] = {
@@ -309,8 +305,7 @@ TEST(packet_append_key_cache_flush_mdns_query) {
         /* IN */        0x00, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* ================================================================
@@ -327,20 +322,20 @@ TEST(packet_append_question_compression) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_question_add(question, key, 0));
+        ASSERT_OK(dns_question_add(question, key, /* flags= */ 0));
         dns_resource_key_unref(key);
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_MX, "mail.example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_question_add(question, key, 0));
+        ASSERT_OK(dns_question_add(question, key, /* flags= */ 0));
         dns_resource_key_unref(key);
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_SOA, "host.mail.example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_question_add(question, key, 0));
+        ASSERT_OK(dns_question_add(question, key, /* flags= */ 0));
         dns_resource_key_unref(key);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -371,8 +366,7 @@ TEST(packet_append_question_compression) {
         /* IN */        0x00, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* ================================================================
@@ -382,13 +376,13 @@ TEST(packet_append_question_compression) {
 TEST(packet_append_opt_basic) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -403,20 +397,19 @@ TEST(packet_append_opt_basic) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_opt_change_max_udp) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 4100, false, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 4100, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -431,20 +424,19 @@ TEST(packet_append_opt_change_max_udp) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_opt_dnssec_ok) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, true, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ true, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -459,20 +451,19 @@ TEST(packet_append_opt_dnssec_ok) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_opt_rcode) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, NULL, 0x97a, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, 0x97a, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -487,20 +478,19 @@ TEST(packet_append_opt_rcode) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_opt_nsid) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, "nsid.example.com", 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, "nsid.example.com", /* rcode= */ 0, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -519,15 +509,14 @@ TEST(packet_append_opt_nsid) {
                         'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_key_and_opt) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -536,9 +525,9 @@ TEST(packet_append_key_and_opt) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, 0, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, /* flags= */ 0, /* start= */ NULL));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_RD, DNS_RCODE_SUCCESS,
@@ -559,15 +548,14 @@ TEST(packet_append_key_and_opt) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_truncate_opt) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -576,9 +564,9 @@ TEST(packet_truncate_opt) {
 
         key = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "example.com");
         ASSERT_NOT_NULL(key);
-        ASSERT_OK(dns_packet_append_key(packet, key, 0, NULL));
+        ASSERT_OK(dns_packet_append_key(packet, key, /* flags= */ 0, /* start= */ NULL));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         ASSERT_TRUE(dns_packet_truncate_opt(packet));
 
@@ -593,8 +581,7 @@ TEST(packet_truncate_opt) {
         /* IN */        0x00, 0x01
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* ================================================================
@@ -604,13 +591,13 @@ TEST(packet_truncate_opt) {
 TEST(packet_patch_max_udp_size) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, DNS_RCODE_SUCCESS));
 
-        ASSERT_OK(dns_packet_append_opt(packet, 512, false, false, NULL, 0, NULL));
+        ASSERT_OK(dns_packet_append_opt(packet, 512, /* edns0_do= */ false, /* include_rfc6975= */ false, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL));
 
         ASSERT_TRUE(dns_packet_patch_max_udp_size(packet, 4097));
 
@@ -627,14 +614,13 @@ TEST(packet_patch_max_udp_size) {
         /* rdata */     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_patch_max_udp_size_no_opt) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
@@ -647,8 +633,7 @@ TEST(packet_patch_max_udp_size_no_opt) {
                         0x00, 0x00,     0x00, 0x00,     0x00, 0x00,     0x00, 0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* ================================================================
@@ -667,17 +652,17 @@ TEST(packet_dup) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&p1, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&p1, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(p1);
 
         DNS_PACKET_ID(p1) = htobe16(42);
         DNS_PACKET_HEADER(p1)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(p1)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(p1, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(p1, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -696,8 +681,7 @@ TEST(packet_dup) {
         ASSERT_OK(dns_packet_dup(&p2, p1));
         ASSERT_NOT_NULL(p2);
 
-        ASSERT_EQ(p2->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(p2), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(p2), p2->size, data, sizeof(data));
 }
 
 /* ================================================================
@@ -716,17 +700,17 @@ TEST(packet_append_answer_single_a) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -742,8 +726,7 @@ TEST(packet_append_answer_single_a) {
         /* ip */        0xc0, 0xa8, 0x01, 0x7f
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_ns) {
@@ -758,17 +741,17 @@ TEST(packet_append_answer_single_ns) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -785,8 +768,7 @@ TEST(packet_append_answer_single_ns) {
                         0xc0, 0x0c
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_cname) {
@@ -801,17 +783,17 @@ TEST(packet_append_answer_single_cname) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -828,8 +810,7 @@ TEST(packet_append_answer_single_cname) {
         /* name */      0xc0, 0x10
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_hinfo) {
@@ -845,17 +826,17 @@ TEST(packet_append_answer_single_hinfo) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -872,8 +853,7 @@ TEST(packet_append_answer_single_hinfo) {
         /* os */        0x09, 'G', 'N', 'U', '/', 'L', 'i', 'n', 'u', 'x'
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_ptr) {
@@ -888,17 +868,17 @@ TEST(packet_append_answer_single_ptr) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -920,8 +900,7 @@ TEST(packet_append_answer_single_ptr) {
                         0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 /* Reverse lookups for link-local addresses are answered from resolved's own mDNS zone, whose answer
@@ -940,17 +919,17 @@ TEST(packet_append_answer_single_ptr_ip6_cache_flush) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, DNS_ANSWER_CACHE_FLUSH, NULL);
+        dns_answer_add(answer, rr, 1, DNS_ANSWER_CACHE_FLUSH, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -972,8 +951,7 @@ TEST(packet_append_answer_single_ptr_ip6_cache_flush) {
                         0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_mx) {
@@ -989,17 +967,17 @@ TEST(packet_append_answer_single_mx) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1017,8 +995,7 @@ TEST(packet_append_answer_single_mx) {
                         0xc0, 0x0c
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_txt) {
@@ -1045,17 +1022,17 @@ TEST(packet_append_answer_single_txt) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1072,8 +1049,7 @@ TEST(packet_append_answer_single_txt) {
                         0x05, 'w', 'o', 'r', 'l', 'd'
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_loc) {
@@ -1094,17 +1070,17 @@ TEST(packet_append_answer_single_loc) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1126,8 +1102,7 @@ TEST(packet_append_answer_single_loc) {
         /* altitude */  0x00, 0x98, 0x96, 0x80
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_srv) {
@@ -1145,17 +1120,17 @@ TEST(packet_append_answer_single_srv) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1179,8 +1154,7 @@ TEST(packet_append_answer_single_srv) {
                         0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_single_naptr) {
@@ -1200,17 +1174,17 @@ TEST(packet_append_answer_single_naptr) {
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1243,8 +1217,7 @@ TEST(packet_append_answer_single_naptr) {
                         0x00
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 TEST(packet_append_answer_rrsig_with_a) {
@@ -1260,7 +1233,7 @@ TEST(packet_append_answer_rrsig_with_a) {
         rr->ttl = 3601;
         rr->a.in_addr.s_addr = htobe32(0xc0a8017f);
 
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_RRSIG, "www.example.com");
@@ -1281,17 +1254,17 @@ TEST(packet_append_answer_rrsig_with_a) {
         rr->rrsig.signature_size = sizeof(signature);
         rr->rrsig.signature = memdup(signature, rr->rrsig.signature_size);
 
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1325,8 +1298,7 @@ TEST(packet_append_answer_rrsig_with_a) {
         /* signature */ 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 static DnsSvcParam* add_svcb_param(DnsResourceRecord *rr, uint16_t key, const char *value, size_t len) {
@@ -1357,29 +1329,29 @@ TEST(packet_append_answer_single_svcb) {
 
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_MANDATORY, "\x00\x01\x00\x03", 4);
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
-        add_svcb_param(rr, DNS_SVC_PARAM_KEY_NO_DEFAULT_ALPN, NULL, 0);
+        add_svcb_param(rr, DNS_SVC_PARAM_KEY_NO_DEFAULT_ALPN, /* value= */ NULL, /* len= */ 0);
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_PORT, "\x01\xbb", 2);
 
-        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV4HINT, NULL, 2 * sizeof(struct in_addr));
+        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV4HINT, /* value= */ NULL, 2 * sizeof(struct in_addr));
         param->value_in_addr[0].s_addr = htobe32(0x7284fd3a);
         param->value_in_addr[1].s_addr = htobe32(0x48bcc7c0);
 
-        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV6HINT, NULL, sizeof(struct in6_addr));
+        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV6HINT, /* value= */ NULL, sizeof(struct in6_addr));
         param->value_in6_addr[0] = (struct in6_addr) { .s6_addr = { 0xf2, 0x34, 0x32, 0x2e, 0xb8, 0x25, 0x38, 0x35, 0x2f, 0xd7, 0xdb, 0x7b, 0x28, 0x7e, 0x60, 0xbb } };
 
         answer = dns_answer_new(1);
         ASSERT_NOT_NULL(answer);
-        dns_answer_add(answer, rr, 1, 0, NULL);
+        dns_answer_add(answer, rr, 1, /* flags= */ 0, /* rrsig= */ NULL);
         dns_resource_record_unref(rr);
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         ASSERT_NOT_NULL(packet);
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(1, 0, 1, 0, 1, 1, 0, 0, DNS_RCODE_SUCCESS));
         DNS_PACKET_HEADER(packet)->ancount = htobe16(dns_answer_size(answer));
 
-        ASSERT_OK(dns_packet_append_answer(packet, answer, NULL));
+        ASSERT_OK(dns_packet_append_answer(packet, answer, /* completed= */ NULL));
 
         const uint8_t data[] = {
                         0x00, 0x2a,     BIT_QR | BIT_AA | BIT_RD, BIT_RA | DNS_RCODE_SUCCESS,
@@ -1420,8 +1392,7 @@ TEST(packet_append_answer_single_svcb) {
                         0x2f, 0xd7, 0xdb, 0x7b, 0x28, 0x7e, 0x60, 0xbb
         };
 
-        ASSERT_EQ(packet->size, sizeof(data));
-        ASSERT_EQ(memcmp(DNS_PACKET_DATA(packet), data, sizeof(data)), 0);
+        ASSERT_MEMEQ_NN(DNS_PACKET_DATA(packet), packet->size, data, sizeof(data));
 }
 
 static void dump_packet_data(DnsPacket *packet) {
@@ -1437,14 +1408,14 @@ TEST(packet_append_key_name_too_long) {
         _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
         int r;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
 
         DNS_PACKET_ID(packet) = htobe16(42);
         DNS_PACKET_HEADER(packet)->flags = htobe16(DNS_PACKET_MAKE_FLAGS(0, 0, 0, 0, 1, 0, 0, 0, 0));
         DNS_PACKET_HEADER(packet)->qdcount = htobe16(1);
 
         key = ASSERT_PTR(dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_A, "www.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"));
-        r = dns_packet_append_key(packet, key, 0, NULL);
+        r = dns_packet_append_key(packet, key, /* flags= */ 0, /* start= */ NULL);
 
         log_debug("r = %d, size = %zu", r, packet->size);
         log_debug("key name = <%s>", dns_resource_key_name(key));
@@ -1472,14 +1443,14 @@ TEST(packet_read_name_rejects_reserved_label_types) {
                 ASSERT_OK(dns_packet_append_name(packet, "example.org",
                                                  /* allow_compression= */ false,
                                                  /* canonical_candidate= */ false,
-                                                 NULL));
+                                                 /* start= */ NULL));
 
                 at = packet->size;
-                ASSERT_OK(dns_packet_append_blob(packet, reserved, sizeof(reserved), NULL));
+                ASSERT_OK(dns_packet_append_blob(packet, reserved, sizeof(reserved), /* start= */ NULL));
                 dns_packet_rewind(packet, at);
 
                 ASSERT_ERROR(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true,
-                                                  NULL), EBADMSG);
+                                                  /* start= */ NULL), EBADMSG);
         }
 }
 
@@ -1495,7 +1466,7 @@ TEST(packet_append_name_beyond_compression_pointer_range) {
         _cleanup_(dns_packet_unrefp) DnsPacket *packet = NULL;
         size_t start;
 
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
 
         /* Fill the packet past the range a compression pointer can express (RFC 1035 pointers carry
          * 14 bits, i.e. offsets up to 0x3fff) with unique names. */
@@ -1506,7 +1477,7 @@ TEST(packet_append_name_beyond_compression_pointer_range) {
                 ASSERT_OK(dns_packet_append_name(packet, name,
                                                  /* allow_compression= */ true,
                                                  /* canonical_candidate= */ false,
-                                                 NULL));
+                                                 /* start= */ NULL));
         }
 
         /* The first occurrence of this name lands beyond pointer range, so it must not be added to
@@ -1526,7 +1497,7 @@ TEST(packet_append_name_beyond_compression_pointer_range) {
                                          &second));
         ASSERT_OK(dns_packet_append_name(packet, "far.example.org",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
         ASSERT_EQ(hashmap_size(packet->names), n_mapped);
         assert_offsets_in_pointer_range(packet);
 
@@ -1535,19 +1506,19 @@ TEST(packet_append_name_beyond_compression_pointer_range) {
         size_t before = packet->size;
         ASSERT_OK(dns_packet_append_name(packet, "filler0.example.com",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
         ASSERT_EQ(packet->size, before + 2);
 
         /* Both encodings must round-trip through the parser: the label-form re-occurrence beyond
          * pointer range and the pointer-form one within it. */
         _cleanup_free_ char *parsed = NULL;
         dns_packet_rewind(packet, second);
-        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, NULL));
+        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, /* start= */ NULL));
         ASSERT_STREQ(parsed, "far.example.org");
 
         parsed = mfree(parsed);
         dns_packet_rewind(packet, before);
-        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, NULL));
+        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, /* start= */ NULL));
         ASSERT_STREQ(parsed, "filler0.example.com");
 
         /* A name beyond the pointer range whose suffix IS mapped in range -- the shape every DNS-SD
@@ -1577,7 +1548,7 @@ TEST(packet_append_name_beyond_compression_pointer_range) {
 
                 parsed = mfree(parsed);
                 dns_packet_rewind(packet, at);
-                ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, NULL));
+                ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, /* start= */ NULL));
                 ASSERT_STREQ(parsed, "far.example.com");
         }
 }
@@ -1591,7 +1562,7 @@ static void pad_packet_to(DnsPacket *p, size_t target) {
         ASSERT_GT(target, p->size);
         gap = target - p->size;
         ASSERT_NOT_NULL(filler = malloc0(gap));
-        ASSERT_OK(dns_packet_append_blob(p, filler, gap, NULL));
+        ASSERT_OK(dns_packet_append_blob(p, filler, gap, /* start= */ NULL));
         ASSERT_EQ(p->size, target);
         ASSERT_EQ(hashmap_size(p->names), 0u);
 }
@@ -1602,7 +1573,7 @@ TEST(packet_append_name_at_compression_offset_max) {
 
         /* A name whose first label starts at exactly the last pointer-expressible offset must be
          * mapped and referenced by pointer... */
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         pad_packet_to(packet, DNS_COMPRESSION_OFFSET_MAX);
 
         ASSERT_OK(dns_packet_append_name(packet, "edge.example.org",
@@ -1615,7 +1586,7 @@ TEST(packet_append_name_at_compression_offset_max) {
         size_t before = packet->size;
         ASSERT_OK(dns_packet_append_name(packet, "edge.example.org",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
         ASSERT_EQ(packet->size, before + 2);
         /* The pointer's wire bytes, independent of the parser: offset 0x3FFF under the tag bits. */
         ASSERT_EQ(DNS_PACKET_DATA(packet)[before], 0xFFu);
@@ -1623,13 +1594,13 @@ TEST(packet_append_name_at_compression_offset_max) {
 
         _cleanup_free_ char *parsed = NULL;
         dns_packet_rewind(packet, before);
-        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, NULL));
+        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, /* start= */ NULL));
         ASSERT_STREQ(parsed, "edge.example.org");
 
         /* The same two bytes must be refused, not followed, where compression is not allowed. */
         parsed = mfree(parsed);
         dns_packet_rewind(packet, before);
-        ASSERT_ERROR(dns_packet_read_name(packet, &parsed, /* allow_compression= */ false, NULL),
+        ASSERT_ERROR(dns_packet_read_name(packet, &parsed, /* allow_compression= */ false, /* start= */ NULL),
                      EBADMSG);
 }
 
@@ -1640,7 +1611,7 @@ TEST(packet_append_name_past_compression_offset_max) {
 
         /* One byte past the last pointer-expressible offset, a name stays out of the map and every
          * occurrence is re-emitted as labels. */
-        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX));
+        ASSERT_OK(dns_packet_new(&packet, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX));
         pad_packet_to(packet, DNS_COMPRESSION_OFFSET_MAX + 1);
 
         ASSERT_OK(dns_packet_append_name(packet, "past.example.org",
@@ -1652,11 +1623,11 @@ TEST(packet_append_name_past_compression_offset_max) {
         before = packet->size;
         ASSERT_OK(dns_packet_append_name(packet, "past.example.org",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
         ASSERT_EQ(packet->size, before + STRLEN("past.example.org") + 2);
 
         dns_packet_rewind(packet, before);
-        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, NULL));
+        ASSERT_OK(dns_packet_read_name(packet, &parsed, /* allow_compression= */ true, /* start= */ NULL));
         ASSERT_STREQ(parsed, "past.example.org");
 }
 
@@ -1727,7 +1698,7 @@ TEST(packet_append_name_rolls_back_on_failure) {
 
         ASSERT_ERROR(dns_packet_append_name(packet, "abc",
                                             /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                            NULL), EMSGSIZE);
+                                            /* start= */ NULL), EMSGSIZE);
 
         /* Nothing of the half-written name is left on the wire... */
         ASSERT_EQ(packet->size, before);
@@ -1744,7 +1715,7 @@ TEST(packet_append_name_rolls_back_on_failure) {
                                  /* max_size= */ DNS_PACKET_HEADER_SIZE + 5));
         ASSERT_OK(dns_packet_append_name(packet, "abc",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
 
         /* Two labels, so more than one entry has to come back out: "a" and "b" fill the packet
          * exactly and the root byte fails, with the map holding "a.b" and "b". */
@@ -1755,7 +1726,7 @@ TEST(packet_append_name_rolls_back_on_failure) {
 
         ASSERT_ERROR(dns_packet_append_name(packet, "a.b",
                                             /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                            NULL), EMSGSIZE);
+                                            /* start= */ NULL), EMSGSIZE);
         ASSERT_EQ(packet->size, before);
         ASSERT_EQ(hashmap_size(packet->names), 0u);
 
@@ -1767,13 +1738,13 @@ TEST(packet_append_name_rolls_back_on_failure) {
                                  /* max_size= */ DNS_PACKET_HEADER_SIZE + 7));
         ASSERT_OK(dns_packet_append_name(packet, "ab",
                                          /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                         NULL));
+                                         /* start= */ NULL));
         ASSERT_EQ(hashmap_size(packet->names), 1u);
         before = packet->size;
 
         ASSERT_ERROR(dns_packet_append_name(packet, "cd",
                                             /* allow_compression= */ true, /* canonical_candidate= */ false,
-                                            NULL), EMSGSIZE);
+                                            /* start= */ NULL), EMSGSIZE);
         ASSERT_EQ(packet->size, before);
         ASSERT_EQ(hashmap_size(packet->names), 1u);
         ASSERT_EQ(PTR_TO_SIZE(hashmap_get(packet->names, "ab")), (size_t) DNS_PACKET_HEADER_SIZE);

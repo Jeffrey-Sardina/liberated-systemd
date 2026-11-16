@@ -12,25 +12,25 @@ static void test_alignment_one(const uint8_t *in, size_t len, const uint8_t *key
         unsigned i, j;
 
         out = siphash24(in, len, key);
-        assert_se(out == 0xa129ca6149be45e5);
+        ASSERT_EQ(out, UINT64_C(0xa129ca6149be45e5));
 
         /* verify the internal state as given in the above paper */
         siphash24_init(&state, key);
-        assert_se(state.v0 == 0x7469686173716475);
-        assert_se(state.v1 == 0x6b617f6d656e6665);
-        assert_se(state.v2 == 0x6b7f62616d677361);
-        assert_se(state.v3 == 0x7b6b696e727e6c7b);
+        ASSERT_EQ(state.v0, UINT64_C(0x7469686173716475));
+        ASSERT_EQ(state.v1, UINT64_C(0x6b617f6d656e6665));
+        ASSERT_EQ(state.v2, UINT64_C(0x6b7f62616d677361));
+        ASSERT_EQ(state.v3, UINT64_C(0x7b6b696e727e6c7b));
         siphash24_compress(in, len, &state);
-        assert_se(state.v0 == 0x4a017198de0a59e0);
-        assert_se(state.v1 == 0x0d52f6f62a4f59a4);
-        assert_se(state.v2 == 0x634cb3577b01fd3d);
-        assert_se(state.v3 == 0xa5224d6f55c7d9c8);
+        ASSERT_EQ(state.v0, UINT64_C(0x4a017198de0a59e0));
+        ASSERT_EQ(state.v1, UINT64_C(0x0d52f6f62a4f59a4));
+        ASSERT_EQ(state.v2, UINT64_C(0x634cb3577b01fd3d));
+        ASSERT_EQ(state.v3, UINT64_C(0xa5224d6f55c7d9c8));
         out = siphash24_finalize(&state);
-        assert_se(out == 0xa129ca6149be45e5);
-        assert_se(state.v0 == 0xf6bcd53893fecff1);
-        assert_se(state.v1 == 0x54b9964c7ea0d937);
-        assert_se(state.v2 == 0x1b38329c099bb55a);
-        assert_se(state.v3 == 0x1814bb89ad7be679);
+        ASSERT_EQ(out, UINT64_C(0xa129ca6149be45e5));
+        ASSERT_EQ(state.v0, UINT64_C(0xf6bcd53893fecff1));
+        ASSERT_EQ(state.v1, UINT64_C(0x54b9964c7ea0d937));
+        ASSERT_EQ(state.v2, UINT64_C(0x1b38329c099bb55a));
+        ASSERT_EQ(state.v3, UINT64_C(0x1814bb89ad7be679));
 
         /* verify that decomposing the input in three chunks gives the
            same result */
@@ -41,7 +41,7 @@ static void test_alignment_one(const uint8_t *in, size_t len, const uint8_t *key
                         siphash24_compress(&in[i], j - i, &state);
                         siphash24_compress(&in[j], len - j, &state);
                         out = siphash24_finalize(&state);
-                        assert_se(out == 0xa129ca6149be45e5);
+                        ASSERT_EQ(out, UINT64_C(0xa129ca6149be45e5));
                 }
         }
 }
@@ -84,7 +84,7 @@ TEST(short_hashes) {
                 two[i-1] = one[i-1];
                 siphash24_compress(two, i, &state2);
 
-                assert_se(memcmp(&state1, &state2, sizeof state1) == 0);
+                ASSERT_MEMEQ(&state1, &state2, sizeof state1);
         }
 
         /* hashing n and 1, n and 2, n and 3, ..., n-1 and 1, n-2 and 2, ... */
@@ -99,8 +99,21 @@ TEST(short_hashes) {
                         two[j-1] = one[j-1];
                         siphash24_compress(two, j, &state2);
 
-                        assert_se(memcmp(&state1, &state2, sizeof state1) == 0);
+                        ASSERT_MEMEQ(&state1, &state2, sizeof state1);
                 }
+        }
+}
+
+TEST(uint64) {
+        const uint8_t key[16] = { 0x22, 0x24, 0x41, 0x22, 0x55, 0x77, 0x88, 0x07,
+                                  0x23, 0x09, 0x23, 0x14, 0x0c, 0x33, 0x0e, 0x0f};
+        uint64_t x = 0;
+
+        for (unsigned i = 0; i < 1000; i++) {
+                uint64_t le = htole64(x);
+
+                ASSERT_EQ(siphash24_uint64(x, key), siphash24(&le, sizeof(le), key));
+                x = x * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
         }
 }
 

@@ -4,7 +4,92 @@ CHANGES WITH 263 in spe:
 
         Announcements of Future Feature Removals and Incompatible Changes:
 
+        * inotify-backed device watch support will be removed in a future
+          release, making fanotify mandatory. This requires kernel ≥ v5.13
+          with CONFIG_FANOTIFY, CONFIG_TMPFS, and CONFIG_SHMEM. See also the
+          changes in systemd-udevd below.
+
         Feature Removals and Incompatible Changes:
+
+        * The io.systemd.Unit.SetProperties() Varlink method now accepts a
+          dedicated UnitProperties input type containing only Markers. Clients
+          using generated bindings may need updates. The Markers JSON
+          representation is unchanged. Calls with runtime=false, previously
+          accepted without persistence, are now rejected; callers should pass
+          runtime=true.
+
+        * ConfigurationDirectory= passed as a transient-unit property over
+          D-Bus now uses the same directory:symlink:flags parser as the other
+          *Directory= settings, allowing the read-only flag with an empty
+          symlink field. Literal colons need an additional level of escaping
+          in the client value. For example, use the shell-quoted argument
+          --property='ConfigurationDirectory=foo\\:bar' for a directory named
+          foo:bar. Unit file syntax and the signature of the plain D-Bus
+          string array property are unchanged.
+
+        * Empty transient assignments to RuntimeDirectory=, StateDirectory=,
+          CacheDirectory= and LogsDirectory= now reset the corresponding
+          directory list instead of being ignored. ConfigurationDirectory=
+          continues to support resetting the list with an empty assignment.
+
+        * Transient *Directory= drop-ins now escape colons and quotes in
+          paths set through either D-Bus signature, preserving the paths
+          when the unit is reloaded.
+
+        * The *DirectorySymlink D-Bus properties now reject source and
+          destination paths equal to or below private/, which is reserved for
+          DynamicUser= directories. Unit files reject these symlink destinations
+          too, matching the existing restriction on source paths.
+
+        * systemctl show now includes directory flags in *DirectorySymlink
+          values. Read-only entries are shown as source:destination:ro instead
+          of source:destination. Unknown flags are shown numerically so newer
+          manager properties can still be displayed.
+
+        * The Varlink method io.systemd.Hostname.SetTags has been extedended to
+          allow globs and now applies the 'remove' list before the 'add' list.
+          Previously, both lists were only allowed to contain literal tag
+          specifications. That meant that there was little reason to include
+          the same item in both lists, and the item would always be removed
+          from the result. Now, if the same literal tag is present in both
+          lists, it'll be present in the result.
+
+          The change also applies to 'hostnamectl tags +… -…', which uses this
+          API internally.
+
+          The goal of the change in ordering is to allow the 'remove' list to
+          clear all tags from a specific namespace, before new values are
+          added. For example, to replace any assignments of 'org.ns.item='
+          with 'value':
+
+            hostnamectl tags -- '-org.ns.item=*' '+org.ns.item=value'
+
+        * For unprivileged clients, systemd-mountfsd shares Verity devices only
+          between mounts of the same backing image file.
+
+        * dm-verity signatures of disk images are now only required if the
+          image policy allows "signed" but not "verity" for the partition,
+          such as RootImagePolicy=root=signed or the built-in policies for
+          untrusted images, for example in systemd-mountfsd. With the other
+          default policies, an image whose signature is missing, malformed or
+          can't be validated is set up with Verity alone. A signature is
+          valid if the kernel or a certificate in /etc/verity.d/ validates
+          it.
+
+        * systemd-portabled now asks polkit before it inspects extension
+          images that are specified by path.
+
+        * systemd-veritysetup no longer fails if root-hash-signature=auto
+          finds no signature. It gained a root-hash-signature-required=
+          option, which systemd-gpt-auto-generator enables if
+          systemd.image_policy= requires a signature. If the kernel can't
+          validate the root hash signature, systemd-veritysetup now
+          validates it in userspace with the certificates in
+          /etc/verity.d/, like systemd-dissect does.
+
+        * systemd-mountfsd now asks polkit if the image policy denies
+          setting up Verity, or if the client's image policy doesn't
+          overlap with its own.
 
         * systemd-networkd and networkctl have been merged into a single
           multi-call binary, with the former becoming a symlink to the latter.
@@ -12,10 +97,322 @@ CHANGES WITH 263 in spe:
           MAC policy adjustments might be necessary. In particular, it is
           expected that the SELinux policy needs to be updated.
 
+        * systemd-networkd now updates the hostname sent by the DHCPv4 and
+          DHCPv6 clients when the system hostname is changed. Previously, the
+          hostname known when the interface was configured was sent until the
+          interface was reconfigured. The DHCPv4 and DHCPv6 leases are renewed
+          immediately to send the new hostname. Since some DHCP servers
+          provide different settings depending on the hostname sent by the
+          client, the previous behaviour may be restored with the new
+          SendHostnameUpdates=no setting in the [DHCPv4] and [DHCPv6]
+          sections.
+
+        * systemd-networkd now generates an IPv6 link-local address on
+          WireGuard interfaces by default, like on other interfaces.
+          Previously, LinkLocalAddressing= was ignored for WireGuard
+          interfaces, and an IPv6 link-local address could only be assigned
+          with Address=. The previous behaviour may be restored with
+          LinkLocalAddressing=no.
+
+        * The "appStream" key of
+          org.freedesktop.sysupdate1.Target.DescribeFeature() is now an array of
+          strings rather than a single optional string.
+
+        * systemd-sysext/systemd-confext now match IMAGE_ID= and
+          IMAGE_VERSION= fields from extension-release files against the host
+          os-release. If an extension declares IMAGE_ID= or IMAGE_VERSION=, the
+          host must declare the same field with a matching value, or the
+          extension is rejected. Previously these fields were ignored during
+          validation and could appear in extension-release files as harmless
+          descriptive metadata. Extensions that set IMAGE_ID= or IMAGE_VERSION=
+          without intending them as host constraints should remove these fields
+          or prefix them with SYSEXT_/CONFEXT_ to describe the extension
+          itself.
+
+        * The file system constraints encoded in the user.validatefs.*
+          extended attributes (as written by systemd-repart's AddValidateFS=
+          setting, which is enabled by default for most file systems) are now
+          also enforced when mounting partitions of disk images, i.e. via
+          systemd-dissect, systemd-nspawn, systemd-sysext, portabled,
+          systemd-mountfsd and RootImage=. Any constraint that is set must be
+          fulfilled: in particular this means that file systems carrying GPT
+          partition label or type constraints may no longer be used as bare
+          file system images without partition table (for example
+          partitions split out of a DDI via systemd-repart --split=yes), and
+          file systems declared for a specific mount point may no longer be
+          used as root file system. Set AddValidateFS=no when building such
+          images, or set $SYSTEMD_DISSECT_VALIDATEFS=0 when using them to
+          restore the previous behaviour.
+
+        * ConditionCredential= and AssertCredential= now also search the
+          credential store directories (/etc/credstore/, /run/credstore/,
+          /usr/lib/credstore/, their .encrypted counterparts, and the XDG
+          counterparts for the per-user service manager), the same way
+          ImportCredential= does. Previously they only checked the credentials
+          passed into the service manager itself. This makes credentials
+          imported by e.g. "systemd-imds --import" usable for conditionalizing
+          units. Units with such conditions may now start (or, with "!", be
+          skipped) because of credential store entries that were not intended
+          as per-boot switches. The same applies to SuggestOnCredential= in
+          systemd-sysupdate. The Credential= match in .network, .netdev, and
+          .link files is unchanged.
+
+        * Units that the vendor enabled with a .wants/, .requires/ or .upholds/
+          symlink below /usr/ are now reported as "enabled" by "systemctl
+          is-enabled" and "systemctl status". Previously such units were
+          reported as "disabled" (or "static" for instances) even though the
+          service manager acts on those symlinks and starts the units at boot,
+          which means "systemctl is-enabled" now exits 0 where it used to exit
+          1 for them. Distributions install such symlinks for a number of
+          units, so this may be visible in packaging scripts.
+
+          "systemctl disable" can now turn such units off. It places a symlink
+          to /dev/null with the same name in /etc/, which shadows the symlink
+          below /usr/, and "systemctl enable" removes it again. The symlink
+          below /usr/ stays, as /usr/ is frequently read-only and the next
+          image update would restore it.
+
+          "systemctl disable" no longer removes masks. Previously, disabling a
+          template unit removed the masks of its instances, which unmasked
+          them.
+
+          A preset policy of "disable" leaves the symlinks below /usr/ in
+          effect, so that "systemctl preset-all" keeps behaving as before on
+          existing systems. Preset files never had to name the units the
+          vendor enabled, and shadowing the symlinks would stop those units
+          from starting at boot.
+
+          Only a symlink that "systemctl enable" would create counts, i.e. one
+          in a directory that WantedBy=, RequiredBy= or UpheldBy= in the
+          [Install] section of the unit names. Any other dependency symlink
+          below /usr/ is a static dependency rather than enablement: the unit
+          is not reported as enabled because of it, and "systemctl disable"
+          leaves it in effect.
+
+        * systemd may now optionally be built with support for programs
+          written in Rust, controlled by the new -Drust= meson option. This
+          adds rustc >= 1.85, bindgen >= 0.71.1 and meson >= 1.4.0 as
+          optional build dependencies.
+
+        * The ID_SMARTCARD_READER udev property for USB smartcard (CCID)
+          readers is now set through the udev hwdb instead of by a udev rule
+          that directly matches the USB interfaces. If a smartcard reader is
+          already used in the initrd, e.g. by systemd-cryptsetup to activate
+          encrypted host disks, the initrd must now include hwdb.bin.
+          Otherwise, the reader does not get the property and
+          systemd-cryptsetup may not find the device, so the activation may no
+          longer work.
+
+        * In udev rules, the SYMLINK, TAG and TAGS match keys now compare an
+          empty match against an empty string instead of skipping it when the
+          device has no symlink or tag. As a result SYMLINK=="", TAG=="" and
+          TAGS=="", as well as match lists with an empty alternative such as
+          SYMLINK=="foo|", now match a device that has no device symlink or tag
+          (for TAGS, the device and its parent devices are considered).
+          Previously such matches never succeeded. The negated forms, e.g.
+          SYMLINK!="", change accordingly.
+
+        * systemd-udevd now validates more of a rule's keys when the rule file
+          is parsed, rather than only when the rule is applied. Rules that were
+          previously accepted but could never match, or that used an invalid
+          name, value or path, may now be rejected or warned about. Check
+          existing rules with "udevadm verify".
+
+        Changes in the system and service manager:
+
+        * systemd-inhibit gained a new --signal= option. Used together with
+          --mode=delay it sends the specified signal to the invoked command
+          when the system is about to go to sleep or shut down.
+
+        * LockPersonality= no longer refuses querying the personality with
+          personality(0xffffffff).
+
+        * RestrictFileSystemAccess= now answers execveat() queries carrying
+          the AT_EXECVE_CHECK flag (Linux 6.14 or newer) with the verdict a
+          real execution of the file would get, so that script interpreters
+          honouring SECBIT_EXEC_RESTRICT_FILE can enforce the policy for the
+          scripts they run.
+
+        * A new SecureBits= setting in system.conf and user.conf sets secure
+          bits on the service manager itself, so that all processes inherit
+          them. With RestrictFileSystemAccess=, exec-restrict-file and its
+          locked variant ask interpreters that support the executability
+          check to enforce the policy for their scripts.
+
+        * RestrictFileSystemAccess= now refuses the READ_IMPLIES_EXEC
+          personality flag, which makes brk() hand out writable and
+          executable memory.
+
+        * StandardInput=file:, StandardOutput=file:/append:/truncate: and
+          StandardError=file:/append:/truncate: no longer create the specified
+          file through a dangling symlink. If the path is a symlink whose
+          target does not exist yet, the service now fails to start with an
+          ELOOP error, in line with the other file-creating code in systemd.
+
+        Changes in systemd-logind:
+
+        * systemd-inhibit --mode=delay now defaults to --what=sleep:shutdown,
+          since logind does not accept delay locks for any other operation.
+
+        Changes in systemd-udevd:
+
+        * systemd-udevd now uses fanotify rather than inotify to watch device
+          nodes (as enabled by the "watch" udev rule option, i.e.
+          OPTIONS+="watch"). This requires kernel ≥ v5.13, CONFIG_FANOTIFY,
+          CONFIG_TMPFS, and CONFIG_SHMEM (for tmpfs-backed devtmpfs); on older
+          kernels or with CONFIG_SHMEM=n (ramfs), device watch uses inotify.
+          Upgrading from an older, inotify-based systemd-udevd is seamless:
+          existing watches are migrated automatically. Downgrading back is not
+          supported: after a downgrade, device watches must be re-established by
+          running "udevadm trigger" for all devices that have a device node.
+
         Changes in systemd-networkd:
 
         * As mentioned above, systemd-networkd and networkctl have been merged
           into a single multi-call binary to reduce the installation footprint.
+
+        * As mentioned above, an IPv6 link-local address is now generated on
+          WireGuard interfaces by default. This is useful e.g. for running
+          routing protocols like Babel over the tunnel.
+
+        * As mentioned above, the hostname sent by the DHCPv4 and DHCPv6
+          clients now follows the system hostname. The new
+          SendHostnameUpdates= setting in the [DHCPv4] and [DHCPv6] sections
+          may be used to disable this.
+
+        * "networkctl renew" now renews the DHCPv6 lease too, not only the
+          DHCPv4 lease. When the DHCPv6 client runs in the information
+          request mode, the information, e.g. DNS servers, is requested
+          again.
+
+        * "networkctl status" now shows why a link is still in the
+          configuring state, e.g. that static routes are not configured yet.
+          The reason is also exposed in the new ConfiguringReasons field of
+          the interface description provided over Varlink.
+
+        * The [DHCPServerStaticLease] section gained new ClientIdentifier=,
+          IAID=, DUIDType=, and DUIDRawData= settings. With
+          ClientIdentifier=duid, a static address is assigned to a client
+          based on the IAID and DUID it sends, instead of its hardware
+          address. This is useful e.g. to tell apart hosts that share a
+          hardware address, like ipvlan interfaces in L2 mode.
+
+        Changes in systemd-sysupdate:
+
+        * systemd-sysupdate's "update" command acquired a new --loop= switch.
+          If specified, the update logic is run repeatedly until no further
+          updates are installed, or the specified number of iterations is
+          reached. This is useful for updates that make further updates
+          available, for example because they ship new or changed transfer
+          files. systemd-sysupdate-update.service now uses --loop=16.
+
+        Changes in the TPM Subsystem:
+
+        * If the booted UKI carries no PCR public key or no signed PCR policy
+          with the "initrd" policy reference, NvPCRs are now initialized in the
+          initrd with a write policy bound to the current value of PCR 11,
+          instead of not being initialized at all. The names of such NvPCRs,
+          which are measured into PCR 9, change whenever the UKI changes, so
+          this is mostly useful where the value of PCR 11 in the initrd is
+          predictable.
+
+        Changes in libsystemd:
+
+        * sd-varlink-idl.h gained SD_VARLINK_EXPERIMENTAL, which may be used
+          to mark Varlink interfaces, methods, errors, types, fields and enum
+          values as experimental, together with _FULL variants of the
+          definition macros that take flags. The marker is informational
+          only, calls are not refused. Experimental items are shown with a
+          "# [Experimental]" comment line in the interface description, which
+          sd_varlink_idl_parse() turns back into the flag.
+
+        Changes in systemd-keyring-setup:
+
+        * A new service systemd-keyring-setup.service has been added that
+          enrolls X.509 certificates into the kernel's .dm-verity, .fs-verity
+          and .bpf keyrings early during boot, and seals the keyrings
+          afterwards. The certificates are read from the File Hierarchy for
+          the Verification of OS Artifacts (VOA), i.e. from /etc/voa/,
+          /run/voa/, /usr/local/share/voa/ and /usr/share/voa/, or may be
+          passed in as keyring-setup.* system credentials. This allows the
+          kernel to verify signed dm-verity volumes, fs-verity files and BPF
+          programs with certificates provided by the OS vendor or the local
+          administrator, without rebuilding the kernel or enrolling keys into
+          the firmware. Note that the kernel seals the .dm-verity and .bpf
+          keyrings while they are still empty, unless
+          dm_verity.keyring_unsealed=1 or bpf.keyring_unsealed=1 is specified
+          on the kernel command line, respectively. The service is enabled
+          statically whenever it is built, and is considered experimental for
+          now. See
+          systemd-keyring-setup.service(8) and
+          https://uapi-group.org/specifications/specs/file_hierarchy_for_the_verification_of_os_artifacts/
+          for details.
+
+          systemd-keyring-setup is the first systemd component written in
+          Rust, and is hence only built if Rust support is enabled with the
+          new -Drust= build option.
+
+        Changes in systemd-cryptsetup:
+
+        * systemd-cryptsetup gained support for a new friendly-name= option in
+          /etc/crypttab. It can be used to override the default device
+          description shown when the user is asked for the passphrase or PKCS#11
+          token PIN to unlock a device.
+
+        Changes in varlinkctl:
+
+        * varlinkctl serve gained a --polkit-action= switch which verifies
+          via polkit that the client is authorized for the specified action
+          before the connection is upgraded and the command is executed.
+
+        * New optional varlink-sftp-root.socket and varlink-sftp-root-ro.socket
+          units expose the local file system via SFTP over an upgraded Varlink
+          connection, read-write and read-only respectively. Access is
+          controlled via the polkit actions io.systemd.sftp.root and
+          io.systemd.sftp.root-read-only. They are built only with
+          -Dvarlink-sftp=true, and are disabled by default. Note that both
+          run as root so allowing access is equivalent to r/w root access or
+          r/o /etc/shadow access.
+
+        Other changes:
+
+        * systemd-random-seed, "importctl export-tar/export-raw",
+          "userdbctl load-credentials" and the --direct mode of systemd-import
+          and systemd-pull no longer create their output files through a
+          dangling symlink and fail with an ELOOP error instead, in line with
+          the other file-creating code in systemd.
+
+        * "systemctl preset" and "systemctl preset-all" no longer write an
+          enablement symlink into /etc/ where the vendor already provides the
+          same link below /usr/, be it a .wants/, .requires/ or .upholds/
+          entry or an Alias= name pointing at the unit: presetting re-asserts a
+          policy rather than recording an administrator's decision, so there is
+          nothing to record. An image built with "preset-all --vendor" now
+          comes up with an empty /etc/ after a later "preset-all". "systemctl
+          enable" is unaffected and still records itself. As a consequence a
+          unit whose [Install] section contains nothing but Alias= is reported
+          as disabled once its alias is provided below /usr/, since an Alias=
+          symlink there does not by itself count as enablement.
+
+        * "systemctl enable", "disable", "reenable", "preset" and "preset-all"
+          gained a new "--vendor" switch, which makes them operate on
+          /usr/lib/systemd/system/ instead of /etc/systemd/system/. This is
+          intended for image builds: "systemctl preset-all --vendor --root=…"
+          applies the preset policy to the image and leaves /etc/ empty, so
+          that it remains available for the administrator and stays a
+          meaningful indicator of what was configured locally. Units enabled
+          this way remain overridable from /etc/ as usual. Only the names an
+          [Install] section asks for are touched there, so the compatibility
+          and slot names distributions install below /usr/, such as default.target
+          or the runlevel*.target symlinks, are left where they are.
+
+          Unlike a preset into /etc/, presetting the vendor directories does
+          turn off units the vendor enabled, by removing the symlink. Where the
+          preset files contain a catch-all "disable *" rule, as most
+          distributions' do, units installed as enabled below /usr/ therefore
+          have to be named by an earlier rule to remain enabled: systemd's own
+          90-systemd.preset gained six such entries for units it installs into
+          sockets.target.wants/.
 
 CHANGES WITH 262:
 

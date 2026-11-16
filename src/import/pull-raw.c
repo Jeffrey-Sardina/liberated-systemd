@@ -111,7 +111,6 @@ int raw_pull_new(
                 RawPullFinished on_finished,
                 void *userdata) {
 
-        _cleanup_(curl_glue_unrefp) CurlGlue *g = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_(raw_pull_unrefp) RawPull *p = NULL;
         _cleanup_free_ char *root = NULL;
@@ -132,10 +131,6 @@ int raw_pull_new(
                         return r;
         }
 
-        r = curl_glue_new(&g, e);
-        if (r < 0)
-                return r;
-
         p = new(RawPull, 1);
         if (!p)
                 return -ENOMEM;
@@ -145,7 +140,6 @@ int raw_pull_new(
                 .userdata = userdata,
                 .image_root = TAKE_PTR(root),
                 .event = TAKE_PTR(e),
-                .glue = TAKE_PTR(g),
                 .offset = UINT64_MAX,
         };
 
@@ -221,7 +215,7 @@ static void raw_pull_report_progress(RawPull *p, RawProgress progress) {
                 assert_not_reached();
         }
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+        sd_notifyf(/* unset_environment= */ false, "X_IMPORT_PROGRESS=%u%%", percent);
         log_debug("Combined progress %u%%", percent);
 }
 
@@ -248,13 +242,13 @@ static int raw_pull_maybe_convert_qcow2(RawPull *p) {
                 return 0;
 
         /* This is a QCOW2 image, let's convert it */
-        r = tempfn_random(p->final_path, NULL, &f);
+        r = tempfn_random(p->final_path, /* extra= */ NULL, &f);
         if (r < 0)
                 return log_oom();
 
-        converted_fd = open(f, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+        converted_fd = xopenat_full(AT_FDCWD, f, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
         if (converted_fd < 0)
-                return log_error_errno(errno, "Failed to create %s: %m", f);
+                return log_error_errno(converted_fd, "Failed to create %s: %m", f);
 
         t = TAKE_PTR(f);
 
@@ -355,9 +349,9 @@ static int raw_pull_make_local_copy(RawPull *p) {
 
                 assert(p->raw_job->disk_fd < 0);
 
-                p->raw_job->disk_fd = open(p->final_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
+                p->raw_job->disk_fd = xopenat(AT_FDCWD, p->final_path, O_RDONLY|O_NOCTTY);
                 if (p->raw_job->disk_fd < 0)
-                        return log_error_errno(errno, "Failed to open vendor image: %m");
+                        return log_error_errno(p->raw_job->disk_fd, "Failed to open vendor image: %m");
         } else {
                 /* We freshly downloaded the image, use it */
 
@@ -377,13 +371,13 @@ static int raw_pull_make_local_copy(RawPull *p) {
                 _cleanup_close_ int dfd = -EBADF;
                 _cleanup_free_ char *f = NULL;
 
-                r = tempfn_random(path, NULL, &f);
+                r = tempfn_random(path, /* extra= */ NULL, &f);
                 if (r < 0)
                         return log_oom();
 
-                dfd = open(f, O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+                dfd = xopenat_full(AT_FDCWD, f, O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
                 if (dfd < 0)
-                        return log_error_errno(errno, "Failed to create writable copy of image: %m");
+                        return log_error_errno(dfd, "Failed to create writable copy of image: %m");
 
                 tp = TAKE_PTR(f);
 
@@ -396,7 +390,7 @@ static int raw_pull_make_local_copy(RawPull *p) {
                         return log_error_errno(r, "Failed to make writable copy of image: %m");
 
                 (void) copy_times(p->raw_job->disk_fd, dfd, COPY_CRTIME);
-                (void) copy_xattr(p->raw_job->disk_fd, NULL, dfd, NULL, 0);
+                (void) copy_xattr(p->raw_job->disk_fd, /* from= */ NULL, dfd, /* to= */ NULL, /* copy_flags= */ 0);
 
                 dfd = safe_close(dfd);
 
@@ -538,6 +532,15 @@ static void raw_pull_job_on_finished(PullJob *j) {
          *
          * We only do something when we got all files */
 
+        /* If the signature job was deferred, only now we know whether we need the detached signature file */
+        if (j == p->checksum_job) {
+                r = pull_signature_job_begin(p->checksum_job, &p->signature_job);
+                if (r < 0) {
+                        r = log_error_errno(r, "Failed to start signature job: %m");
+                        goto finish;
+                }
+        }
+
         if (!raw_pull_is_done(p))
                 return;
 
@@ -558,6 +561,7 @@ static void raw_pull_job_on_finished(PullJob *j) {
                 raw_pull_report_progress(p, RAW_VERIFYING);
 
                 r = pull_verify(p->verify,
+                                p->flags,
                                 p->raw_job,
                                 p->checksum_job,
                                 p->signature_job,
@@ -579,7 +583,7 @@ static void raw_pull_job_on_finished(PullJob *j) {
 
                 if (p->local) {
                         r = install_file(AT_FDCWD, p->local,
-                                         AT_FDCWD, NULL,
+                                         AT_FDCWD, /* target_name= */ NULL,
                                          ((p->flags & IMPORT_READ_ONLY) && p->offset == UINT64_MAX ? INSTALL_READ_ONLY : 0) |
                                          (p->flags & IMPORT_SYNC ? INSTALL_FSYNC_FULL : 0));
                         if (r < 0) {
@@ -685,9 +689,9 @@ static int raw_pull_job_on_open_disk_generic(
 
         (void) mkdir_parents_label(*temp_path, 0700);
 
-        j->disk_fd = open(*temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+        j->disk_fd = xopenat_full(AT_FDCWD, *temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
         if (j->disk_fd < 0)
-                return log_error_errno(errno, "Failed to create %s: %m", *temp_path);
+                return log_error_errno(j->disk_fd, "Failed to create %s: %m", *temp_path);
 
         return 0;
 }
@@ -713,9 +717,9 @@ static int raw_pull_job_on_open_disk_raw(PullJob *j) {
 
                 (void) mkdir_parents_label(p->local, 0700);
 
-                j->disk_fd = open(p->local, O_RDWR|O_NOCTTY|O_CLOEXEC|(p->offset == UINT64_MAX ? O_TRUNC|O_CREAT : 0), 0664);
+                j->disk_fd = xopenat_full(AT_FDCWD, p->local, O_RDWR|O_NOCTTY|(p->offset == UINT64_MAX ? O_TRUNC|O_CREAT : 0), /* xopen_flags= */ 0, 0664);
                 if (j->disk_fd < 0)
-                        return log_error_errno(errno, "Failed to open destination '%s': %m", p->local);
+                        return log_error_errno(j->disk_fd, "Failed to open destination '%s': %m", p->local);
 
                 if (p->offset == UINT64_MAX)
                         (void) import_set_nocow_and_log(j->disk_fd, p->local);
@@ -797,23 +801,31 @@ int raw_pull_start(
                 const char *local,
                 uint64_t offset,
                 uint64_t size_max,
+                uint64_t source_offset,
+                uint64_t source_size,
+                Compression compression,
                 ImportFlags flags,
                 ImportVerify verify,
-                const struct iovec *checksum) {
+                const struct iovec *checksum,
+                const struct iovec *decoded_checksum) {
 
         int r;
 
         assert(p);
         assert(url);
+        assert(compression < _COMPRESSION_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify < _IMPORT_VERIFY_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify >= 0);
         assert((verify < 0) || !iovec_is_set(checksum));
         assert(!(flags & ~IMPORT_PULL_FLAGS_MASK_RAW));
         assert(offset == UINT64_MAX || FLAGS_SET(flags, IMPORT_DIRECT));
+        assert(!FLAGS_SET(flags, IMPORT_ZERO_FILL) || (offset != UINT64_MAX && size_max != UINT64_MAX));
+        assert((source_offset == 0 && source_size == UINT64_MAX) || FLAGS_SET(flags, IMPORT_DIRECT));
+        assert((source_offset == 0 && source_size == UINT64_MAX) || !IN_SET(verify, IMPORT_VERIFY_CHECKSUM, IMPORT_VERIFY_SIGNATURE));
         assert(!(flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) || !(flags & IMPORT_DIRECT));
         assert(!(flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) || !iovec_is_set(checksum));
 
-        if (!http_url_is_valid(url) && !file_url_is_valid(url))
+        if (!http_url_is_valid(url) && !file_url_is_valid(url) && !provider_url_is_valid(url))
                 return -EINVAL;
 
         if (local && !pull_validate_local(local, flags))
@@ -829,13 +841,23 @@ int raw_pull_start(
         p->flags = flags;
         p->verify = verify;
 
+        /* Everything but provider: URLs is transported via curl, hence set up the curl glue on first use. This
+         * also defers loading libcurl to this point, so that pulling from a resource provider works without it. */
+        if (!provider_url_is_valid(url) && !p->glue) {
+                r = curl_glue_new(&p->glue, p->event);
+                if (r < 0)
+                        return r;
+        }
+
         /* Queue job for the image itself */
-        r = pull_job_new(&p->raw_job, url, p->glue, p);
+        r = pull_job_new(&p->raw_job, url, p->event, p->glue, p);
         if (r < 0)
                 return r;
 
         p->raw_job->on_finished = raw_pull_job_on_finished;
         p->raw_job->on_open_disk = raw_pull_job_on_open_disk_raw;
+        p->raw_job->compression = compression;
+        import_digest_init(&p->raw_job->decoded_digest, decoded_checksum);
 
         if (iovec_is_set(checksum)) {
                 if (!iovec_memdup(checksum, &p->raw_job->expected_checksum))
@@ -846,7 +868,7 @@ int raw_pull_start(
                 /* Calculate checksum of the main download unless the users asks for a SHA256SUM file or its
                  * signature, which we let gpg verify instead. */
 
-                r = pull_url_needs_checksum(url);
+                r = pull_url_needs_checksum(url, flags);
                 if (r < 0)
                         return r;
 
@@ -859,8 +881,15 @@ int raw_pull_start(
                 p->raw_job->uncompressed_max = size_max;
         if (offset != UINT64_MAX)
                 p->raw_job->offset = p->offset = offset;
+        p->raw_job->zero_fill = FLAGS_SET(flags, IMPORT_ZERO_FILL);
+        p->raw_job->source_offset = source_offset;
+        p->raw_job->source_size = source_size;
+        /* Only a download that is not verified as a whole may be acquired partially */
+        p->raw_job->allow_range_request = verify == IMPORT_VERIFY_NO && !iovec_is_set(checksum);
 
-        if (!FLAGS_SET(flags, IMPORT_DIRECT)) {
+        /* A previously downloaded image is neither keyed by the compression algorithm nor was it
+         * necessarily verified against the decoded digest, hence don't reuse it if either is requested. */
+        if (!FLAGS_SET(flags, IMPORT_DIRECT) && compression < 0 && !iovec_is_set(decoded_checksum)) {
                 r = pull_find_old_etags(url, p->image_root, DT_REG, ".raw-", ".raw", &p->raw_job->old_etags);
                 if (r < 0)
                         return r;
@@ -870,7 +899,9 @@ int raw_pull_start(
                         &p->checksum_job,
                         &p->signature_job,
                         verify,
+                        flags,
                         url,
+                        p->event,
                         p->glue,
                         raw_pull_job_on_finished,
                         p);
@@ -884,6 +915,7 @@ int raw_pull_start(
                                 raw_strip_suffixes,
                                 ".nspawn",
                                 verify,
+                                p->event,
                                 p->glue,
                                 raw_pull_job_on_open_disk_settings,
                                 raw_pull_job_on_finished,
@@ -899,6 +931,7 @@ int raw_pull_start(
                                 raw_strip_suffixes,
                                 ".roothash",
                                 verify,
+                                p->event,
                                 p->glue,
                                 raw_pull_job_on_open_disk_roothash,
                                 raw_pull_job_on_finished,
@@ -914,6 +947,7 @@ int raw_pull_start(
                                 raw_strip_suffixes,
                                 ".roothash.p7s",
                                 verify,
+                                p->event,
                                 p->glue,
                                 raw_pull_job_on_open_disk_roothash_signature,
                                 raw_pull_job_on_finished,
@@ -929,6 +963,7 @@ int raw_pull_start(
                                 raw_strip_suffixes,
                                 ".verity",
                                 verify,
+                                p->event,
                                 p->glue,
                                 raw_pull_job_on_open_disk_verity,
                                 raw_pull_job_on_finished,
@@ -952,6 +987,10 @@ int raw_pull_start(
 
                 j->on_progress = raw_pull_job_on_progress;
                 j->sync = FLAGS_SET(flags, IMPORT_SYNC);
+
+                /* The signature job might only be started once the checksum job finished, see raw_pull_job_on_finished() */
+                if (j == p->signature_job && pull_signature_job_deferred(p->checksum_job, p->signature_job))
+                        continue;
 
                 r = pull_job_begin(j);
                 if (r < 0)

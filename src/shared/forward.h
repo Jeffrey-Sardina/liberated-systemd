@@ -20,6 +20,7 @@ typedef enum BusTransport BusTransport;
 typedef enum CatFlags CatFlags;
 typedef enum CertificateSourceType CertificateSourceType;
 typedef enum ConditionType ConditionType;
+typedef enum DissectImageFlags DissectImageFlags;
 typedef enum DnsAnswerFlags DnsAnswerFlags;
 typedef enum DnsCacheMode DnsCacheMode;
 typedef enum DnsOverTlsMode DnsOverTlsMode;
@@ -73,6 +74,7 @@ typedef struct DnsTxtItem DnsTxtItem;
 typedef struct FDSet FDSet;
 typedef struct Fido2HmacSalt Fido2HmacSalt;
 typedef struct GroupRecord GroupRecord;
+typedef struct HostProperties HostProperties;
 typedef struct Image Image;
 typedef struct ImageFilter ImageFilter;
 typedef struct ImagePolicy ImagePolicy;
@@ -93,7 +95,17 @@ typedef struct Table Table;
 typedef struct Tpm2Context Tpm2Context;
 typedef struct Tpm2Handle Tpm2Handle;
 typedef struct Tpm2PCRValue Tpm2PCRValue;
+typedef struct Uapi16Contents Uapi16Contents;
+typedef struct Uapi16Object Uapi16Object;
+typedef struct Uapi16Xattr Uapi16Xattr;
 typedef struct UnitInfo UnitInfo;
+typedef struct UnitResult UnitResult;
 typedef struct UserRecord UserRecord;
 typedef struct Verb Verb;
 typedef struct VeritySettings VeritySettings;
+
+typedef int (*qmp_event_callback_t)(
+                QmpClient *client,
+                const char *event,
+                sd_json_variant *data,
+                void *userdata);

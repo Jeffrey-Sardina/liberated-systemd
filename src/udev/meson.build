@@ -40,8 +40,10 @@ udevadm_export_sources = files(
         'udev-node.c',
         'udev-rules.c',
         'udev-spawn.c',
+        'udev-synth.c',
         'udev-varlink.c',
-        'udev-watch.c',
+        'udev-watch-fanotify.c',
+        'udev-watch-inotify.c',
         'udev-worker.c',
 )
 
@@ -115,7 +117,6 @@ udev_dependencies = [
 ]
 
 udev_plugin_template = executable_template + {
-        'public' : true,
         'install' : get_option('link-udev-shared') ? 'yes' : 'static',
         'install_dir' : udevlibexecdir,
         'install_tag' : 'udev',
@@ -134,7 +135,6 @@ udev_fuzz_template = fuzz_template + udev_common_template
 udev_binaries_dict = [
         executable_template + {
                 'name' : 'udevadm',
-                'public' : true,
                 'sources' : udevadm_sources +
                             keyboard_keys_from_name_inc,
                 'export' : udevadm_export_sources,

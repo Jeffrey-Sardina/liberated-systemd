@@ -38,7 +38,7 @@ static int wlan_get_wiphy(NetDev *netdev, Wiphy **ret) {
 }
 
 static int wlan_is_ready_to_create(NetDev *netdev, Link *link) {
-        return wlan_get_wiphy(netdev, NULL) >= 0;
+        return wlan_get_wiphy(netdev, /* ret= */ NULL) >= 0;
 }
 
 static int wlan_fill_message(NetDev *netdev, sd_netlink_message *m) {
@@ -206,12 +206,8 @@ int config_parse_wlan_iftype(
         t = nl80211_iftype_from_string(rvalue);
         /* We reuse the kernel provided enum which does not contain negative value. So, the cast
          * below is mandatory. Otherwise, the check below always passes. */
-        if ((int) t < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, t,
-                           "Failed to parse wlan interface type, ignoring assignment: %s",
-                           rvalue);
-                return 0;
-        }
+        if ((int) t < 0)
+                return log_syntax_parse_error(unit, filename, line, t, lvalue, rvalue);
 
         *iftype = t;
         return 0;

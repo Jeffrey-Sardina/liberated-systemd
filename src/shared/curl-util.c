@@ -9,6 +9,7 @@
 
 #include "alloc-util.h"
 #include "dlfcn-util.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "hashmap.h"
 #include "set.h"
@@ -245,7 +246,7 @@ static int curl_glue_on_timer(sd_event_source *s, uint64_t usec, void *userdata)
 
         assert(s);
 
-        if (sym_curl_multi_socket_action(g->curl, CURL_SOCKET_TIMEOUT, 0, &k) != CURLM_OK)
+        if (sym_curl_multi_socket_action(g->curl, CURL_SOCKET_TIMEOUT, /* ev_bitmask= */ 0, &k) != CURLM_OK)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Failed to propagate timeout.");
 
@@ -255,7 +256,7 @@ static int curl_glue_on_timer(sd_event_source *s, uint64_t usec, void *userdata)
 
 static int curl_glue_timer_callback(CURLM *curl, long timeout_ms, void *userdata) {
         CurlGlue *g = ASSERT_PTR(userdata);
-        usec_t usec;
+        usec_t usec, accuracy;
 
         assert(curl);
 
@@ -275,14 +276,23 @@ static int curl_glue_timer_callback(CURLM *curl, long timeout_ms, void *userdata
 
         usec = (usec_t) timeout_ms * USEC_PER_MSEC + USEC_PER_MSEC - 1;
 
+        /* libcurl frequently asks for very short (often zero) timeouts, for example to kick off a new
+         * transfer. Applying the default accuracy to those would delay them by up to that much, hence
+         * dispatch timers that elapse sooner than the default accuracy as accurately as possible, and use
+         * the default accuracy for everything else, so that we can still coalesce wakeups for those. */
+        accuracy = usec < EVENT_DEFAULT_ACCURACY_USEC ? 1 : 0;
+
         if (g->timer) {
                 if (sd_event_source_set_time_relative(g->timer, usec) < 0)
+                        return -1;
+
+                if (sd_event_source_set_time_accuracy(g->timer, accuracy) < 0)
                         return -1;
 
                 if (sd_event_source_set_enabled(g->timer, SD_EVENT_ONESHOT) < 0)
                         return -1;
         } else {
-                if (sd_event_add_time_relative(g->event, &g->timer, CLOCK_BOOTTIME, usec, 0, curl_glue_on_timer, g) < 0)
+                if (sd_event_add_time_relative(g->event, &g->timer, CLOCK_BOOTTIME, usec, accuracy, curl_glue_on_timer, g) < 0)
                         return -1;
 
                 (void) sd_event_source_set_description(g->timer, "curl-timer");
@@ -331,6 +341,12 @@ static CurlGlue* curl_glue_free(CurlGlue *g) {
 }
 
 DEFINE_TRIVIAL_REF_UNREF_FUNC(CurlGlue, curl_glue, curl_glue_free);
+
+sd_event* curl_glue_get_event(CurlGlue *g) {
+        assert(g);
+
+        return g->event;
+}
 
 int curl_glue_new(CurlGlue **glue, sd_event *event) {
         _cleanup_(curl_glue_unrefp) CurlGlue *g = NULL;
@@ -504,7 +520,7 @@ struct curl_slist *curl_slist_new(const char *first, ...) {
         if (!first)
                 return NULL;
 
-        l = sym_curl_slist_append(NULL, first);
+        l = sym_curl_slist_append(/* list= */ NULL, first);
         if (!l)
                 return NULL;
 
@@ -569,7 +585,7 @@ int curl_parse_http_time(const char *t, usec_t *ret) {
         assert(t);
         assert(ret);
 
-        time_t v = sym_curl_getdate(t, NULL);
+        time_t v = sym_curl_getdate(t, /* unused= */ NULL);
         if (v == (time_t) -1)
                 return -EINVAL;
 

@@ -95,7 +95,7 @@ static Operation* operation_free(Operation *p) {
         if (*p->remaining == 0)
                 /* We want to crash the program if we can't exit the loop
                  * cleanly, otherwise it will just hang */
-                assert_se(sd_event_exit(p->event, 0) >= 0);
+                assert_se(sd_event_exit(p->event, /* code= */ 0) >= 0);
 
         free(p->job_path);
         free(p->acquired_version);
@@ -146,7 +146,7 @@ static int ensure_targets(sd_bus *bus, char **argv, char ***ret_targets) {
         if (strv_isempty(argv)) {
                 const char *class, *name, *path;
 
-                r = bus_call_method(bus, bus_sysupdate_mgr, "ListTargets", &error, &reply, NULL);
+                r = bus_call_method(bus, bus_sysupdate_mgr, "ListTargets", &error, &reply, /* types= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to call ListTargets: %s", bus_error_message(&error, r));
 
@@ -175,7 +175,7 @@ static int ensure_targets(sd_bus *bus, char **argv, char ***ret_targets) {
                 if (r < 0)
                         return bus_log_parse_error(r);
         } else {
-                r = strv_extend_strv(&targets, argv, true);
+                r = strv_extend_strv(&targets, argv, /* filter_duplicates= */ true);
                 if (r < 0)
                         return log_oom();
         }
@@ -318,7 +318,7 @@ static int list_targets(sd_bus *bus) {
 
                 r = sd_bus_call_method(bus, bus_sysupdate_mgr->destination,
                                        target_paths[i], SYSUPDATE_TARGET_INTERFACE,
-                                       "GetVersion", &error, &reply, NULL);
+                                       "GetVersion", &error, &reply, /* types= */ NULL);
                 if (r < 0)
                         return log_bus_error(r, &error, targets[i], "get current version");
                 r = sd_bus_message_read_basic(reply, 's', &version);
@@ -351,6 +351,8 @@ typedef struct DescribeParams {
         bool partial;
         bool pending;
         bool obsolete;
+        bool too_new;
+        bool candidate;
         bool protected;
         bool incomplete;
 } DescribeParams;
@@ -374,7 +376,7 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = sd_json_parse(version_json, 0, &json, NULL, NULL);
+        r = sd_json_parse(version_json, /* flags= */ 0, &json, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse JSON: %m");
 
@@ -388,6 +390,8 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
                 { "partial",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, partial),       0 },
                 { "pending",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, pending),       0 },
                 { "obsolete",      SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, obsolete),      0 },
+                { "tooNew",        SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, too_new),       0 },
+                { "candidate",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, candidate),     0 },
                 { "protected",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, protected),     0 },
                 { "incomplete",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(DescribeParams, incomplete),    0 },
                 { "changelogUrls", SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_strv,    offsetof(DescribeParams, v.changelog),   0 },
@@ -407,10 +411,12 @@ static int parse_describe(sd_bus_message *reply, Version *ret) {
         SET_FLAG(p.v.flags, UPDATE_PARTIAL, p.partial);
         SET_FLAG(p.v.flags, UPDATE_PENDING, p.pending);
         SET_FLAG(p.v.flags, UPDATE_OBSOLETE, p.obsolete);
+        SET_FLAG(p.v.flags, UPDATE_TOO_NEW, p.too_new);
+        SET_FLAG(p.v.flags, UPDATE_CANDIDATE, p.candidate);
         SET_FLAG(p.v.flags, UPDATE_PROTECTED, p.protected);
         SET_FLAG(p.v.flags, UPDATE_INCOMPLETE, p.incomplete);
 
-        r = sd_json_variant_format(p.contents_json, 0, &p.v.contents_json);
+        r = sd_json_variant_format(p.contents_json, /* flags= */ 0, &p.v.contents_json);
         if (r < 0)
                 return log_error_errno(r, "Failed to format JSON for contents: %m");
 
@@ -431,7 +437,7 @@ static int list_versions_finished(sd_bus_message *reply, void *userdata, sd_bus_
 
         e = sd_bus_message_get_error(reply);
         if (e)
-                return log_bus_error(0, e, NULL, "call Describe");
+                return log_bus_error(0, e, /* target= */ NULL, "call Describe");
 
         r = parse_describe(reply, &v);
         if (r < 0)
@@ -451,7 +457,7 @@ static int list_versions_finished(sd_bus_message *reply, void *userdata, sd_bus_
                            TABLE_STRING,    version_link ?: v.version,
                            TABLE_SET_COLOR, color,
                            TABLE_SET_URL,   strv_isempty(v.changelog) ? NULL : v.changelog[0],
-                           TABLE_STRING,    update_set_flags_to_string(v.flags),
+                           TABLE_STRING,    FORMAT_UPDATE_SET_FLAGS(v.flags),
                            TABLE_SET_COLOR, color);
         if (r < 0)
                 return table_log_add_error(r);
@@ -479,7 +485,7 @@ static int list_versions(sd_bus *bus, const char *target_path) {
                         "t",
                         arg_offline ? SD_SYSUPDATE_OFFLINE : 0);
         if (r < 0)
-                return log_bus_error(r, &error, NULL, "call List");
+                return log_bus_error(r, &error, /* target= */ NULL, "call List");
 
         r = sd_bus_message_read_strv(reply, &versions);
         if (r < 0)
@@ -496,7 +502,7 @@ static int list_versions(sd_bus *bus, const char *target_path) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get event loop: %m");
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -506,12 +512,12 @@ static int list_versions(sd_bus *bus, const char *target_path) {
 
         STRV_FOREACH(version, versions) {
                 _cleanup_(operation_freep) Operation *op = NULL;
-                op = operation_new(table, bus, &remaining, NULL, NULL);
+                op = operation_new(table, bus, &remaining, /* target_path= */ NULL, /* target_id= */ NULL);
                 if (!op)
                         return log_oom();
 
                 r = sd_bus_call_method_async(bus,
-                                             NULL,
+                                             /* ret_slot= */ NULL,
                                              bus_sysupdate_mgr->destination,
                                              target_path,
                                              SYSUPDATE_TARGET_INTERFACE,
@@ -557,7 +563,7 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
                         version,
                         arg_offline ? SD_SYSUPDATE_OFFLINE : 0);
         if (r < 0)
-                return log_bus_error(r, &error, NULL, "call Describe");
+                return log_bus_error(r, &error, /* target= */ NULL, "call Describe");
 
         r = parse_describe(reply, &v);
         if (r < 0)
@@ -572,13 +578,13 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
                ansi_normal(),
                v.version,
                color,
-               update_set_flags_to_string(v.flags),
+               FORMAT_UPDATE_SET_FLAGS(v.flags),
                ansi_normal());
 
         STRV_FOREACH(url, v.changelog) {
                 _cleanup_free_ char *changelog_link = NULL;
 
-                r = terminal_urlify(*url, NULL, &changelog_link);
+                r = terminal_urlify(*url, /* text= */ NULL, &changelog_link);
                 if (r < 0)
                         return log_error_errno(r, "Could not urlify link to change-log: %m");
 
@@ -586,7 +592,7 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
         }
         printf("\n");
 
-        r = sd_json_parse(v.contents_json, 0, &json, NULL, NULL);
+        r = sd_json_parse(v.contents_json, /* flags= */ 0, &json, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse JSON: %m");
 
@@ -604,7 +610,7 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
 
                         JSON_VARIANT_OBJECT_FOREACH(key, value, entry) {
 
-                                r = table_add_cell(table, NULL, TABLE_HEADER, key);
+                                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_HEADER, key);
                                 if (r < 0)
                                         return table_log_add_error(r);
                         }
@@ -642,7 +648,7 @@ static int describe(sd_bus *bus, const char *target_path, const char *version) {
                         else if (streq(key, "mtime"))
                                 type = TABLE_TIMESTAMP;
 
-                        r = table_add_cell(table, NULL, type, data);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, type, data);
                         if (r < 0)
                                 return table_log_add_error(r);
                 }
@@ -686,7 +692,7 @@ static int check_describe_finished(sd_bus_message *reply, void *userdata, sd_bus
 
         e = sd_bus_message_get_error(reply);
         if (e)
-                return log_bus_error(0, e, NULL, "call Describe");
+                return log_bus_error(0, e, /* target= */ NULL, "call Describe");
 
         r = parse_describe(reply, &v);
         if (r < 0)
@@ -700,7 +706,7 @@ static int check_describe_finished(sd_bus_message *reply, void *userdata, sd_bus
                         "GetVersion",
                         &error,
                         &reply,
-                        NULL);
+                        /* types= */ NULL);
         if (r < 0)
                 return log_bus_error(r, &error, op->target_id, "get current version");
 
@@ -747,7 +753,7 @@ static int check_finished(sd_bus_message *reply, void *userdata, sd_bus_error *r
                 return 0;
 
         r = sd_bus_call_method_async(op->bus,
-                                     NULL,
+                                     /* ret_slot= */ NULL,
                                      bus_sysupdate_mgr->destination,
                                      op->target_path,
                                      SYSUPDATE_TARGET_INTERFACE,
@@ -793,7 +799,7 @@ static int verb_check(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get event loop: %m");
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -807,7 +813,7 @@ static int verb_check(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (!op)
                         return log_oom();
 
-                r = sd_bus_call_method_async(bus, NULL, bus_sysupdate_mgr->destination, target_paths[i], SYSUPDATE_TARGET_INTERFACE, "CheckNew", check_finished, op, NULL);
+                r = sd_bus_call_method_async(bus, /* ret_slot= */ NULL, bus_sysupdate_mgr->destination, target_paths[i], SYSUPDATE_TARGET_INTERFACE, "CheckNew", check_finished, op, /* types= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to call CheckNew for target %s: %m", targets[i]);
                 TAKE_PTR(op);
@@ -996,10 +1002,10 @@ static int update_install_started(sd_bus_message *reply, void *userdata, sd_bus_
                         "org.freedesktop.DBus.Properties",
                         "PropertiesChanged",
                         update_properties_changed,
-                        NULL,
+                        /* install_callback= */ NULL,
                         op);
         if (r < 0)
-                return log_bus_error(r, NULL, op->target_id, "listen for PropertiesChanged");
+                return log_bus_error(r, /* error= */ NULL, op->target_id, "listen for PropertiesChanged");
 
         TAKE_PTR(op); /* update_install_finished/update_interrupted take ownership of the data */
 
@@ -1066,19 +1072,22 @@ static int update_acquire_finished(sd_bus_message *m, void *userdata, sd_bus_err
         if (r < 0)
                 log_debug_errno(r, "Failed to update hashmap: %m");
 
+        if (status != UPDATE_PROGRESS_ACQUIRED)
+                return 0;
+
         /* Renew the JobRemoved notification for the Install() call instead. */
-        sd_bus_slot_unref(op->job_finished_slot);
+        op->job_finished_slot = sd_bus_slot_unref(op->job_finished_slot);
         r = bus_match_signal_async(
-                        op->bus, &op->job_finished_slot, bus_sysupdate_mgr, "JobRemoved", update_install_finished, NULL, op);
+                        op->bus, &op->job_finished_slot, bus_sysupdate_mgr, "JobRemoved", update_install_finished, /* install_callback= */ NULL, op);
         if (r < 0)
-                return log_bus_error(r, NULL, op->target_id, "listen for JobRemoved");
+                return log_bus_error(r, /* error= */ NULL, op->target_id, "listen for JobRemoved");
 
         /* With the Acquire() call finished, immediately call Install() to deploy the downloaded update.
          * This reuses the same Operation struct so the progress reporting continues to be done in the same
          * slot in the terminal. */
         r = sd_bus_call_method_async(
                         op->bus,
-                        NULL,
+                        /* ret_slot= */ NULL,
                         bus_sysupdate_mgr->destination,
                         op->target_path,
                         SYSUPDATE_TARGET_INTERFACE,
@@ -1089,7 +1098,7 @@ static int update_acquire_finished(sd_bus_message *m, void *userdata, sd_bus_err
                         op->requested_version,
                         0LU);
         if (r < 0)
-                return log_bus_error(r, NULL, op->target_id, "call Install");
+                return log_bus_error(r, /* error= */ NULL, op->target_id, "call Install");
         TAKE_PTR(op);
 
         return 0;
@@ -1112,9 +1121,9 @@ static int update_interrupted(sd_event_source *source, void *userdata) {
                                "Cancel",
                                &error,
                                /* ret_reply= */ NULL,
-                               NULL);
+                               /* types= */ NULL);
         if (r < 0)
-                return log_bus_error(r, &error, NULL, "call Cancel");
+                return log_bus_error(r, &error, /* target= */ NULL, "call Cancel");
 
         r = ordered_hashmap_replace(map, op->target_id, INT_TO_PTR(-ECANCELED));
         if (r < 0)
@@ -1194,10 +1203,10 @@ static int update_acquire_started(sd_bus_message *reply, void *userdata, sd_bus_
                         "org.freedesktop.DBus.Properties",
                         "PropertiesChanged",
                         update_properties_changed,
-                        NULL,
+                        /* install_callback= */ NULL,
                         op);
         if (r < 0)
-                return log_bus_error(r, NULL, op->target_id, "listen for PropertiesChanged");
+                return log_bus_error(r, /* error= */ NULL, op->target_id, "listen for PropertiesChanged");
 
         TAKE_PTR(op); /* update_acquire_finished/update_interrupted take ownership of the data */
 
@@ -1230,7 +1239,7 @@ static int do_update(sd_bus *bus, char **targets) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get event loop: %m");
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -1246,13 +1255,13 @@ static int do_update(sd_bus *bus, char **targets) {
 
                 /* Sign up for notification when the associated job finishes */
                 r = bus_match_signal_async(
-                                op->bus, &op->job_finished_slot, bus_sysupdate_mgr, "JobRemoved", update_acquire_finished, NULL, op);
+                                op->bus, &op->job_finished_slot, bus_sysupdate_mgr, "JobRemoved", update_acquire_finished, /* install_callback= */ NULL, op);
                 if (r < 0)
-                        return log_bus_error(r, NULL, op->target_id, "listen for JobRemoved");
+                        return log_bus_error(r, /* error= */ NULL, op->target_id, "listen for JobRemoved");
 
                 r = sd_bus_call_method_async(
                                 bus,
-                                NULL,
+                                /* ret_slot= */ NULL,
                                 bus_sysupdate_mgr->destination,
                                 target_paths[i],
                                 SYSUPDATE_TARGET_INTERFACE,
@@ -1263,7 +1272,7 @@ static int do_update(sd_bus *bus, char **targets) {
                                 versions[i],
                                 0LU);
                 if (r < 0)
-                        return log_bus_error(r, NULL, targets[i], "call Acquire");
+                        return log_bus_error(r, /* error= */ NULL, targets[i], "call Acquire");
 
                 op->requested_version = strdup(versions[i]);
                 if (!op->requested_version)
@@ -1275,7 +1284,7 @@ static int do_update(sd_bus *bus, char **targets) {
         }
 
         /* Set up the rendering */
-        r = sd_event_add_post(event, NULL, update_render_progress, map);
+        r = sd_event_add_post(event, /* ret= */ NULL, update_render_progress, map);
         if (r < 0)
                 return log_error_errno(r, "Failed to add progress rendering callback: %m");
 
@@ -1340,7 +1349,7 @@ static int do_vacuum(sd_bus *bus, const char *target, const char *path) {
         uint32_t count, disabled;
         int r;
 
-        r = sd_bus_call_method(bus, bus_sysupdate_mgr->destination, path, SYSUPDATE_TARGET_INTERFACE, "Vacuum", &error, &reply, NULL);
+        r = sd_bus_call_method(bus, bus_sysupdate_mgr->destination, path, SYSUPDATE_TARGET_INTERFACE, "Vacuum", &error, &reply, /* types= */ NULL);
         if (r < 0)
                 return log_bus_error(r, &error, target, "call Vacuum");
 
@@ -1391,7 +1400,7 @@ typedef struct Feature {
         bool enabled;
         int suggested;
         char **documentation;
-        char *appstream;
+        char **appstream_urls;
         char **transfers;
 } Feature;
 
@@ -1405,7 +1414,7 @@ static void feature_done(Feature *f) {
         f->id = mfree(f->id);
         f->description = mfree(f->description);
         f->documentation = strv_free(f->documentation);
-        f->appstream = mfree(f->appstream);
+        f->appstream_urls = strv_free(f->appstream_urls);
         f->transfers = strv_free(f->transfers);
 }
 
@@ -1423,7 +1432,7 @@ static int describe_feature(sd_bus *bus, const char *feature, Feature *ret) {
                 { "enabled",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,  offsetof(Feature, enabled),       SD_JSON_MANDATORY },
                 { "suggested",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, offsetof(Feature, suggested),     SD_JSON_NULLABLE  },
                 { "documentation", SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_strv,     offsetof(Feature, documentation), SD_JSON_NULLABLE  },
-                { "appStream",     SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,   offsetof(Feature, appstream),     SD_JSON_NULLABLE  },
+                { "appStream",     SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_strv,     offsetof(Feature, appstream_urls), SD_JSON_NULLABLE  },
                 { "transfers",     SD_JSON_VARIANT_ARRAY,   sd_json_dispatch_strv,     offsetof(Feature, transfers),     SD_JSON_NULLABLE  },
                 {}
         };
@@ -1449,7 +1458,7 @@ static int describe_feature(sd_bus *bus, const char *feature, Feature *ret) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = sd_json_parse(json, 0, &v, NULL, NULL);
+        r = sd_json_parse(json, /* flags= */ 0, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse JSON: %m");
 
@@ -1473,6 +1482,8 @@ static int list_features(sd_bus *bus) {
         table = table_new("", "feature", "description");
         if (!table)
                 return log_oom();
+
+        (void) table_set_sort(table, 1);
 
         r = sd_bus_call_method(bus,
                                bus_sysupdate_mgr->destination,
@@ -1566,11 +1577,10 @@ static int verb_features(int argc, char *argv[], uintptr_t _data, void *userdata
                         return table_log_add_error(r);
         }
 
-        if (f.appstream) {
+        if (!strv_isempty(f.appstream_urls)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "AppStream",
-                                   TABLE_STRING, f.appstream,
-                                   TABLE_SET_URL, f.appstream);
+                                   TABLE_STRV_WRAPPED, f.appstream_urls);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -1581,7 +1591,7 @@ static int verb_features(int argc, char *argv[], uintptr_t _data, void *userdata
                         return table_log_add_error(r);
         }
 
-        return table_print_with_pager(table, SD_JSON_FORMAT_OFF, arg_pager_flags, false);
+        return table_print_with_pager(table, SD_JSON_FORMAT_OFF, arg_pager_flags, /* show_header= */ false);
 }
 
 VERB(verb_enable, "enable", "FEATURE...\0", 2, VERB_ANY, VERB_ONLINE_ONLY,
@@ -1635,7 +1645,7 @@ static int verb_enable(int argc, char *argv[], uintptr_t _data, void *userdata) 
                                        "GetVersion",
                                        &error,
                                        &reply,
-                                       NULL);
+                                       /* types= */ NULL);
                 if (r < 0)
                         return log_bus_error(r, &error, "host", "get current version");
 

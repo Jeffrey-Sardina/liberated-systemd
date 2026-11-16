@@ -36,6 +36,8 @@ typedef enum ExecInput {
         EXEC_INPUT_NAMED_FD,
         EXEC_INPUT_DATA,
         EXEC_INPUT_FILE,
+        EXEC_INPUT_BROKER,      /* Acquire a pseudo TTY from ptybrokerd, output discarded */
+        EXEC_INPUT_BROKER_LOG,  /* Acquire a pseudo TTY from ptybrokerd, output written to the logs */
         _EXEC_INPUT_MAX,
         _EXEC_INPUT_INVALID = -EINVAL,
 } ExecInput;
@@ -53,6 +55,8 @@ typedef enum ExecOutput {
         EXEC_OUTPUT_FILE,
         EXEC_OUTPUT_FILE_APPEND,
         EXEC_OUTPUT_FILE_TRUNCATE,
+        EXEC_OUTPUT_BROKER,      /* Acquire a pseudo TTY from ptybrokerd, output discarded */
+        EXEC_OUTPUT_BROKER_LOG,  /* Acquire a pseudo TTY from ptybrokerd, output written to the logs */
         _EXEC_OUTPUT_MAX,
         _EXEC_OUTPUT_INVALID = -EINVAL,
 } ExecOutput;
@@ -379,6 +383,9 @@ typedef struct ExecContext {
         bool address_families_allow_list:1;
         Set *address_families;
 
+        bool io_uring_filter_allow_list:1;
+        Set *io_uring_filter; /* io_uring opcodes plus one */
+
         char *user_namespace_path;
         char *network_namespace_path;
         char *ipc_namespace_path;
@@ -470,6 +477,7 @@ typedef struct ExecParameters {
 
         bool debug_invocation;
         bool selinux_context_net;
+        bool io_uring_bpf_filter_supported;
 } ExecParameters;
 
 #define EXEC_PARAMETERS_INIT(_flags)              \
@@ -486,11 +494,28 @@ typedef struct ExecParameters {
                 .pidref_transport_fd    = -EBADF, \
         }
 
-static inline bool exec_input_is_terminal(ExecInput i) {
+static inline bool exec_input_is_broker(ExecInput i) {
         return IN_SET(i,
+                      EXEC_INPUT_BROKER,
+                      EXEC_INPUT_BROKER_LOG);
+}
+
+static inline bool exec_input_is_terminal(ExecInput i) {
+        /* Note that PTYs acquired from ptybrokerd are terminals too, even though they are not backed by a
+         * physical TTY device. The distinction matters for the few places that operate on the physical
+         * console (see exec_context_may_touch_console()), but for the purpose of stdio setup, controlling
+         * terminal handling, terminal sizing and $TERM propagation they behave exactly like any other TTY. */
+        return exec_input_is_broker(i) ||
+               IN_SET(i,
                       EXEC_INPUT_TTY,
                       EXEC_INPUT_TTY_FORCE,
                       EXEC_INPUT_TTY_FAIL);
+}
+
+static inline bool exec_output_is_broker(ExecOutput o) {
+        return IN_SET(o,
+                      EXEC_OUTPUT_BROKER,
+                      EXEC_OUTPUT_BROKER_LOG);
 }
 
 static inline bool exec_context_has_tty(const ExecContext *context) {
@@ -501,6 +526,15 @@ static inline bool exec_context_has_tty(const ExecContext *context) {
                 exec_input_is_terminal(context->std_input) ||
                 context->std_output == EXEC_OUTPUT_TTY ||
                 context->std_error == EXEC_OUTPUT_TTY;
+}
+
+static inline bool exec_context_has_broker(const ExecContext *context) {
+        assert(context);
+
+        return
+                exec_input_is_broker(context->std_input) ||
+                exec_output_is_broker(context->std_output) ||
+                exec_output_is_broker(context->std_error);
 }
 
 static inline bool exec_input_is_inheritable(ExecInput i) {
@@ -539,6 +573,8 @@ void exec_command_reset_status_list_array(ExecCommand **c, size_t n);
 
 void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix);
+/* Takes ownership of argv_consume, including on failure. */
+int exec_command_new(const char *path, char **argv_consume, ExecCommandFlags flags, ExecCommand **ret);
 void exec_command_append_list(ExecCommand **l, ExecCommand *e);
 int exec_command_to_setting(const ExecCommand *c, char **ret);
 int exec_command_set(ExecCommand *c, const char *path, ...) _sentinel_;
@@ -587,9 +623,13 @@ char** exec_context_get_syscall_filter(const ExecContext *c);
 char** exec_context_get_syscall_archs(const ExecContext *c);
 char** exec_context_get_syscall_log(const ExecContext *c);
 char** exec_context_get_address_families(const ExecContext *c);
+char** exec_context_get_io_uring_filter(const ExecContext *c);
 char** exec_context_get_restrict_filesystems(const ExecContext *c);
+bool exec_context_has_address_families(const ExecContext *c);
+bool exec_context_has_syscall_filters(const ExecContext *c);
 bool exec_context_restrict_namespaces_set(const ExecContext *c);
 bool exec_context_restrict_filesystems_set(const ExecContext *c);
+bool exec_context_io_uring_filter_set(const ExecContext *c);
 bool exec_context_with_rootfs(const ExecContext *c);
 bool exec_context_with_rootfs_strict(const ExecContext *c);
 
@@ -642,7 +682,6 @@ DECLARE_STRING_TABLE_LOOKUP(exec_preserve_mode, ExecPreserveMode);
 
 DECLARE_STRING_TABLE_LOOKUP(exec_keyring_mode, ExecKeyringMode);
 
-DECLARE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 DECLARE_STRING_TABLE_LOOKUP(exec_directory_type_mode, ExecDirectoryType);
 
 DECLARE_STRING_TABLE_LOOKUP(exec_resource_type, ExecDirectoryType);

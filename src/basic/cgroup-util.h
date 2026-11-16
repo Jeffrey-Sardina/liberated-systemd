@@ -183,12 +183,13 @@ int cg_path_get_session(const char *path, char **ret_session);
 int cg_path_get_owner_uid(const char *path, uid_t *ret_uid);
 int cg_path_get_unit_full(const char *path, char **ret_unit, char **ret_subgroup);
 static inline int cg_path_get_unit(const char *path, char **ret_unit) {
-        return cg_path_get_unit_full(path, ret_unit, NULL);
+        return cg_path_get_unit_full(path, ret_unit, /* ret_subgroup= */ NULL);
 }
-int cg_path_get_unit_path(const char *path, char **ret_unit);
+int cg_path_get_unit_path(const char *path, char **ret_path);
+int cg_path_get_user_unit_path(const char *path, char **ret_path);
 int cg_path_get_user_unit_full(const char *path, char **ret_unit, char **ret_subgroup);
 static inline int cg_path_get_user_unit(const char *path, char **ret_unit) {
-        return cg_path_get_user_unit_full(path, ret_unit, NULL);
+        return cg_path_get_user_unit_full(path, ret_unit, /* ret_subgroup= */ NULL);
 }
 int cg_path_get_machine_name(const char *path, char **ret_machine);
 int cg_path_get_slice(const char *path, char **ret_slice);
@@ -196,6 +197,7 @@ int cg_path_get_user_slice(const char *path, char **ret_slice);
 
 int cg_shift_path(const char *cgroup, const char *cached_root, const char **ret_shifted);
 int cg_pid_get_path_shifted(pid_t pid, const char *cached_root, char **ret_cgroup);
+int cg_pidref_get_path_shifted(const PidRef *pidref, const char *cached_root, char **ret_cgroup);
 
 int cg_pid_get_session(pid_t pid, char **ret_session);
 int cg_pidref_get_session(const PidRef *pidref, char **ret);
@@ -203,23 +205,30 @@ int cg_pid_get_owner_uid(pid_t pid, uid_t *ret_uid);
 int cg_pidref_get_owner_uid(const PidRef *pidref, uid_t *ret);
 int cg_pid_get_unit_full(pid_t pid, char **ret_unit, char **ret_subgroup);
 static inline int cg_pid_get_unit(pid_t pid, char **ret_unit) {
-        return cg_pid_get_unit_full(pid, ret_unit, NULL);
+        return cg_pid_get_unit_full(pid, ret_unit, /* ret_subgroup= */ NULL);
 }
+int cg_pid_get_unit_path(pid_t pid, char **ret_path);
 int cg_pidref_get_unit_full(const PidRef *pidref, char **ret_unit, char **ret_subgroup);
 static inline int cg_pidref_get_unit(const PidRef *pidref, char **ret_unit) {
-        return cg_pidref_get_unit_full(pidref, ret_unit, NULL);
+        return cg_pidref_get_unit_full(pidref, ret_unit, /* ret_subgroup= */ NULL);
 }
+int cg_pidref_get_unit_path(const PidRef *pidref, char **ret_path);
 int cg_pid_get_user_unit_full(pid_t pid, char **ret_unit, char **ret_subgroup);
 static inline int cg_pid_get_user_unit(pid_t pid, char **ret_unit) {
-        return cg_pid_get_user_unit_full(pid, ret_unit, NULL);
+        return cg_pid_get_user_unit_full(pid, ret_unit, /* ret_subgroup= */ NULL);
 }
+int cg_pid_get_user_unit_path(pid_t pid, char **ret_path);
 int cg_pidref_get_user_unit_full(const PidRef *pidref, char **ret_unit, char **ret_subgroup);
 static inline int cg_pidref_get_user_unit(const PidRef *pidref, char **ret_unit) {
-        return cg_pidref_get_user_unit_full(pidref, ret_unit, NULL);
+        return cg_pidref_get_user_unit_full(pidref, ret_unit, /* ret_subgroup= */ NULL);
 }
+int cg_pidref_get_user_unit_path(const PidRef *pidref, char **ret_path);
 int cg_pid_get_machine_name(pid_t pid, char **ret_machine);
+int cg_pidref_get_machine_name(const PidRef *pidref, char **ret_machine);
 int cg_pid_get_slice(pid_t pid, char **ret_slice);
+int cg_pidref_get_slice(const PidRef *pidref, char **ret_slice);
 int cg_pid_get_user_slice(pid_t pid, char **ret_slice);
+int cg_pidref_get_user_slice(const PidRef *pidref, char **ret_slice);
 
 int cg_path_decode_unit(const char *cgroup, char **ret_unit);
 

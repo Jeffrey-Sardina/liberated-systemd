@@ -97,15 +97,15 @@ static int value_handler(sd_bus *bus, const char *path, const char *interface, c
 static int notify_test(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_properties_changed(sd_bus_message_get_bus(m), m->path, "org.freedesktop.systemd.ValueTest", "Value", NULL));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
 
 static int notify_test2(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
-        ASSERT_OK(sd_bus_emit_properties_changed_strv(sd_bus_message_get_bus(m), m->path, "org.freedesktop.systemd.ValueTest", NULL));
+        ASSERT_OK(sd_bus_emit_properties_changed_strv(sd_bus_message_get_bus(m), m->path, "org.freedesktop.systemd.ValueTest", /* names= */ NULL));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
@@ -113,7 +113,7 @@ static int notify_test2(sd_bus_message *m, void *userdata, sd_bus_error *reterr_
 static int emit_interfaces_added(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_interfaces_added(sd_bus_message_get_bus(m), "/value/a/x", "org.freedesktop.systemd.ValueTest", NULL));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
@@ -121,7 +121,7 @@ static int emit_interfaces_added(sd_bus_message *m, void *userdata, sd_bus_error
 static int emit_interfaces_removed(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_interfaces_removed(sd_bus_message_get_bus(m), "/value/a/x", "org.freedesktop.systemd.ValueTest", NULL));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
@@ -129,7 +129,7 @@ static int emit_interfaces_removed(sd_bus_message *m, void *userdata, sd_bus_err
 static int emit_object_added(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_object_added(sd_bus_message_get_bus(m), "/value/a/x"));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
@@ -137,13 +137,13 @@ static int emit_object_added(sd_bus_message *m, void *userdata, sd_bus_error *re
 static int emit_object_with_manager_added(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_object_added(sd_bus_message_get_bus(m), "/value/a"));
 
-        return ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        return ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 }
 
 static int emit_object_removed(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         ASSERT_OK(sd_bus_emit_object_removed(sd_bus_message_get_bus(m), "/value/a/x"));
 
-        ASSERT_OK(sd_bus_reply_method_return(m, NULL));
+        ASSERT_OK(sd_bus_reply_method_return(m, /* types= */ NULL));
 
         return 1;
 }
@@ -225,14 +225,14 @@ static int server(void *userdata) {
         ASSERT_OK(sd_bus_set_fd(bus, c->fds[0], c->fds[0]));
         ASSERT_OK(sd_bus_set_server(bus, 1, id));
 
-        ASSERT_OK(sd_bus_add_object_vtable(bus, NULL, "/foo", "org.freedesktop.systemd.test", vtable, c));
-        ASSERT_OK(sd_bus_add_object_vtable(bus, NULL, "/foo", "org.freedesktop.systemd.test2", vtable, c));
-        ASSERT_OK(sd_bus_add_fallback_vtable(bus, NULL, "/value", "org.freedesktop.systemd.ValueTest", vtable2, NULL, UINT_TO_PTR(20)));
-        ASSERT_OK(sd_bus_add_node_enumerator(bus, NULL, "/value", enumerator_callback, NULL));
-        ASSERT_OK(sd_bus_add_node_enumerator(bus, NULL, "/value/a", enumerator2_callback, NULL));
-        ASSERT_OK(sd_bus_add_node_enumerator(bus, NULL, "/value/b", enumerator3_callback, NULL));
-        ASSERT_OK(sd_bus_add_object_manager(bus, NULL, "/value"));
-        ASSERT_OK(sd_bus_add_object_manager(bus, NULL, "/value/a"));
+        ASSERT_OK(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/foo", "org.freedesktop.systemd.test", vtable, c));
+        ASSERT_OK(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/foo", "org.freedesktop.systemd.test2", vtable, c));
+        ASSERT_OK(sd_bus_add_fallback_vtable(bus, /* ret_slot= */ NULL, "/value", "org.freedesktop.systemd.ValueTest", vtable2, /* find= */ NULL, UINT_TO_PTR(20)));
+        ASSERT_OK(sd_bus_add_node_enumerator(bus, /* ret_slot= */ NULL, "/value", enumerator_callback, /* userdata= */ NULL));
+        ASSERT_OK(sd_bus_add_node_enumerator(bus, /* ret_slot= */ NULL, "/value/a", enumerator2_callback, /* userdata= */ NULL));
+        ASSERT_OK(sd_bus_add_node_enumerator(bus, /* ret_slot= */ NULL, "/value/b", enumerator3_callback, /* userdata= */ NULL));
+        ASSERT_OK(sd_bus_add_object_manager(bus, /* ret_slot= */ NULL, "/value"));
+        ASSERT_OK(sd_bus_add_object_manager(bus, /* ret_slot= */ NULL, "/value/a"));
 
         ASSERT_OK(sd_bus_start(bus));
 
@@ -241,7 +241,7 @@ static int server(void *userdata) {
         while (!c->quit) {
                 log_error("Loop!");
 
-                r = sd_bus_process(bus, NULL);
+                r = sd_bus_process(bus, /* ret= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to process requests: %m");
 
@@ -270,7 +270,7 @@ static int client(void *p) {
         ASSERT_OK(sd_bus_set_fd(bus, c->fds[1], c->fds[1]));
         ASSERT_OK(sd_bus_start(bus));
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "NoOperation", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "NoOperation", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "AlterSomething", &error, &reply, "s", "hallo"));
 
@@ -284,7 +284,7 @@ static int client(void *p) {
 
         sd_bus_error_free(&error);
 
-        ASSERT_FAIL(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "Doesntexist", &error, &reply, NULL)); /* NULL and "" are equivalent */
+        ASSERT_FAIL(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "Doesntexist", &error, &reply, /* types= */ NULL)); /* NULL and "" are equivalent */
         ASSERT_TRUE(sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD));
 
         sd_bus_error_free(&error);
@@ -325,7 +325,15 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, NULL)); /* NULL and "" are equivalent */
+        ASSERT_OK(sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd.test",
+                        "/foo",
+                        "org.freedesktop.DBus.Introspectable",
+                        "Introspect",
+                        &error,
+                        &reply,
+                        /* types= */ NULL)); /* NULL and "" are equivalent */
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &s));
         fputs(s, stdout);
@@ -339,21 +347,21 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, /* types= */ NULL));
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &s));
         fputs(s, stdout);
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, /* types= */ NULL));
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &s));
         fputs(s, stdout);
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, /* types= */ NULL));
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &s));
         fputs(s, stdout);
@@ -366,7 +374,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/b", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/b", "org.freedesktop.DBus.Introspectable", "Introspect", &error, &reply, /* types= */ NULL));
 
         ASSERT_OK(sd_bus_message_read(reply, "s", &s));
         fputs(s, stdout);
@@ -392,11 +400,11 @@ static int client(void *p) {
         ASSERT_TRUE(sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_INTERFACE));
         sd_bus_error_free(&error);
 
-        ASSERT_FAIL(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &error, &reply, NULL));
+        ASSERT_FAIL(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &error, &reply, /* types= */ NULL));
         ASSERT_TRUE(sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD));
         sd_bus_error_free(&error);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &error, &reply, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", &error, &reply, /* types= */ NULL));
 
         sd_bus_message_dump(reply, stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
 
@@ -449,7 +457,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.systemd.ValueTest", "NotifyTest", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.systemd.ValueTest", "NotifyTest", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -458,7 +466,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.systemd.ValueTest", "NotifyTest2", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/value/a", "org.freedesktop.systemd.ValueTest", "NotifyTest2", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -467,7 +475,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitInterfacesAdded", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitInterfacesAdded", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -476,7 +484,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitInterfacesRemoved", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitInterfacesRemoved", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -485,7 +493,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectAdded", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectAdded", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -511,7 +519,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectWithManagerAdded", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectWithManagerAdded", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(sd_bus_process(bus, &reply));
 
@@ -542,7 +550,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectRemoved", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "EmitObjectRemoved", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         ASSERT_OK_POSITIVE(r = sd_bus_process(bus, &reply));
 
@@ -562,7 +570,7 @@ static int client(void *p) {
 
         reply = sd_bus_message_unref(reply);
 
-        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "Exit", &error, NULL, NULL));
+        ASSERT_OK(sd_bus_call_method(bus, "org.freedesktop.systemd.test", "/foo", "org.freedesktop.systemd.test", "Exit", &error, /* ret_reply= */ NULL, /* types= */ NULL));
 
         return 0;
 }
@@ -581,9 +589,73 @@ static void test_vtable_partial_failure(void) {
 
         /* Registration fails at the invalid member, after "Foo" was already inserted into the global vtable
          * member tables. Check that the fail path removes it again. */
-        ASSERT_ERROR(sd_bus_add_object_vtable(bus, NULL, "/x", "org.test.iface", partial_vtable, NULL), EINVAL);
+        ASSERT_ERROR(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/x", "org.test.iface", partial_vtable, /* userdata= */ NULL), EINVAL);
 
         ASSERT_TRUE(set_isempty(bus->vtable_methods));
+}
+
+static void test_vtable_failure_preserves_existing_members(void) {
+        static const sd_bus_vtable existing_vtable[] = {
+                SD_BUS_VTABLE_START(0),
+                SD_BUS_METHOD("Existing", NULL, NULL, NULL, 0),
+                SD_BUS_PROPERTY("ExistingProperty", "t", NULL, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+                SD_BUS_VTABLE_END,
+        };
+        static const sd_bus_vtable duplicate_vtable[] = {
+                SD_BUS_VTABLE_START(0),
+                SD_BUS_METHOD("Transient", NULL, NULL, NULL, 0),
+                SD_BUS_PROPERTY("TransientProperty", "t", NULL, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+                SD_BUS_METHOD("Existing", NULL, NULL, NULL, 0),
+                SD_BUS_VTABLE_END,
+        };
+        static const sd_bus_vtable invalid_vtable[] = {
+                SD_BUS_VTABLE_START(0),
+                SD_BUS_METHOD("Transient", NULL, NULL, NULL, 0),
+                { .type = 0xff },
+                SD_BUS_VTABLE_END,
+        };
+        static const sd_bus_vtable invalid_after_duplicate_vtable[] = {
+                SD_BUS_VTABLE_START(0),
+                SD_BUS_METHOD("Existing", NULL, NULL, NULL, 0),
+                { .type = 0xff },
+                SD_BUS_VTABLE_END,
+        };
+        static const sd_bus_vtable recovery_vtable[] = {
+                SD_BUS_VTABLE_START(0),
+                SD_BUS_METHOD("Transient", NULL, NULL, NULL, 0),
+                SD_BUS_PROPERTY("TransientProperty", "t", NULL, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+                SD_BUS_VTABLE_END,
+        };
+        _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *existing = NULL, *recovery = NULL;
+        uint64_t value = 0;
+
+        ASSERT_OK(sd_bus_new(&bus));
+        ASSERT_OK(sd_bus_add_object_vtable(bus, &existing, "/x", "org.test.iface", existing_vtable, &value));
+
+        /* A failed addition must undo both kinds of new members without removing members owned by
+         * another vtable at the same path and interface. */
+        ASSERT_ERROR(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/x", "org.test.iface", duplicate_vtable, &value), EEXIST);
+        ASSERT_EQ(set_size(bus->vtable_methods), 1U);
+        ASSERT_EQ(set_size(bus->vtable_properties), 1U);
+
+        ASSERT_ERROR(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/x", "org.test.iface", invalid_vtable, &value), EINVAL);
+        ASSERT_EQ(set_size(bus->vtable_methods), 1U);
+        ASSERT_EQ(set_size(bus->vtable_properties), 1U);
+
+        /* Report the first registration error, even when a later entry has an invalid type. */
+        ASSERT_ERROR(sd_bus_add_object_vtable(bus, /* ret_slot= */ NULL, "/x", "org.test.iface", invalid_after_duplicate_vtable, &value), EEXIST);
+
+        ASSERT_OK(sd_bus_add_object_vtable(bus, &recovery, "/x", "org.test.iface", recovery_vtable, &value));
+        ASSERT_EQ(set_size(bus->vtable_methods), 2U);
+        ASSERT_EQ(set_size(bus->vtable_properties), 2U);
+
+        recovery = sd_bus_slot_unref(recovery);
+        ASSERT_EQ(set_size(bus->vtable_methods), 1U);
+        ASSERT_EQ(set_size(bus->vtable_properties), 1U);
+        existing = sd_bus_slot_unref(existing);
+        ASSERT_TRUE(set_isempty(bus->vtable_methods));
+        ASSERT_TRUE(set_isempty(bus->vtable_properties));
 }
 
 int main(int argc, char *argv[]) {
@@ -594,6 +666,7 @@ int main(int argc, char *argv[]) {
         test_setup_logging(LOG_DEBUG);
 
         test_vtable_partial_failure();
+        test_vtable_failure_preserves_existing_members();
 
         c.automatic_integer_property = 4711;
         ASSERT_NOT_NULL(c.automatic_string_property = strdup("dudeldu"));

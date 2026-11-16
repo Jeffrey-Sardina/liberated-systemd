@@ -206,7 +206,7 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                          * copy all data to a new file without the NOCOW flag set. */
 
                         if (f->archive) {
-                                r = chattr_fd(f->fd, 0, FS_NOCOW_FL);
+                                r = chattr_fd(f->fd, /* value= */ 0, FS_NOCOW_FL);
                                 if (r >= 0)
                                         continue;
 
@@ -217,11 +217,11 @@ static void journal_file_set_offline_internal(JournalFile *f) {
                                  * unlinkat_deallocate() is called in the main thread while this thread is
                                  * copying the file. See issue #24150 and #31222. */
                                 r = copy_file_atomic_at_full(
-                                                f->fd, NULL, AT_FDCWD, f->path, f->mode,
-                                                0,
+                                                f->fd, /* from= */ NULL, AT_FDCWD, f->path, f->mode,
+                                                /* chattr_flags= */ 0,
                                                 FS_NOCOW_FL,
                                                 COPY_REPLACE | COPY_FSYNC | COPY_HOLES | COPY_ALL_XATTRS | COPY_VERIFY_LINKED,
-                                                NULL, NULL);
+                                                /* progress= */ NULL, /* userdata= */ NULL);
                                 if (r < 0) {
                                         log_debug_errno(r, "Failed to rewrite %s: %m", f->path);
                                         continue;
@@ -293,6 +293,37 @@ static bool journal_file_set_offline_try_restart(JournalFile *f) {
                         return false;
                 }
         }
+}
+
+static int journal_file_start_offline_thread(JournalFile *f, void* (*func)(void*)) {
+        sigset_t ss, saved_ss;
+        int r, k;
+
+        assert(f);
+        assert(func);
+
+        assert_se(sigfillset(&ss) >= 0);
+        /* Don't block SIGBUS since the offlining thread accesses a memory mapped file.
+         * Asynchronous SIGBUS signals can safely be handled by either thread. */
+        assert_se(sigdelset(&ss, SIGBUS) >= 0);
+
+        r = pthread_sigmask(SIG_BLOCK, &ss, &saved_ss);
+        if (r > 0) {
+                f->offline_state = OFFLINE_JOINED;
+                return -r;
+        }
+
+        r = pthread_create(&f->offline_thread, NULL, func, f);
+
+        k = pthread_sigmask(SIG_SETMASK, &saved_ss, NULL);
+        if (r > 0) {
+                f->offline_state = OFFLINE_JOINED;
+                return -r;
+        }
+        if (k > 0)
+                return -k;
+
+        return 0;
 }
 
 /* Sets a journal offline.
@@ -368,27 +399,9 @@ int journal_file_set_offline(JournalFile *f, bool wait) {
                 f->offline_state = OFFLINE_JOINED;
 
         } else {
-                sigset_t ss, saved_ss;
-                int k;
-
-                assert_se(sigfillset(&ss) >= 0);
-                /* Don't block SIGBUS since the offlining thread accesses a memory mapped file.
-                 * Asynchronous SIGBUS signals can safely be handled by either thread. */
-                assert_se(sigdelset(&ss, SIGBUS) >= 0);
-
-                r = pthread_sigmask(SIG_BLOCK, &ss, &saved_ss);
-                if (r > 0)
-                        return -r;
-
-                r = pthread_create(&f->offline_thread, NULL, journal_file_set_offline_thread, f);
-
-                k = pthread_sigmask(SIG_SETMASK, &saved_ss, NULL);
-                if (r > 0) {
-                        f->offline_state = OFFLINE_JOINED;
-                        return -r;
-                }
-                if (k > 0)
-                        return -k;
+                r = journal_file_start_offline_thread(f, journal_file_set_offline_thread);
+                if (r < 0)
+                        return r;
         }
 
         return 0;
@@ -415,11 +428,11 @@ JournalFile* journal_file_offline_close(JournalFile *f) {
         if (r < 0)
                 log_debug_errno(r, "Failed to append tag when closing journal, ignoring: %m");
 
-        if (sd_event_source_get_enabled(f->post_change_timer, NULL) > 0)
+        if (sd_event_source_get_enabled(f->post_change_timer, /* ret= */ NULL) > 0)
                 journal_file_post_change(f);
         f->post_change_timer = sd_event_source_disable_unref(f->post_change_timer);
 
-        journal_file_set_offline(f, true);
+        journal_file_set_offline(f, /* wait= */ true);
 
         return journal_file_close(f);
 }
@@ -434,7 +447,7 @@ JournalFile* journal_file_initiate_close(JournalFile *f, Set *deferred_closes) {
                 if (r < 0)
                         log_debug_errno(r, "Failed to add file to deferred close set, closing immediately.");
                 else {
-                        (void) journal_file_set_offline(f, false);
+                        (void) journal_file_set_offline(f, /* wait= */ false);
                         return NULL;
                 }
         }
@@ -447,6 +460,7 @@ int journal_file_rotate(
                 MMapCache *mmap_cache,
                 JournalFileFlags file_flags,
                 uint64_t compress_threshold_bytes,
+                const sd_id128_t *seqnum_id,
                 Set *deferred_closes) {
 
         _cleanup_free_ char *path = NULL;
@@ -466,7 +480,7 @@ int journal_file_rotate(
 
         set_clear(deferred_closes);
 
-        r = journal_file_open(
+        r = journal_file_open_full(
                         /* fd= */ -EBADF,
                         path,
                         (*f)->open_flags,
@@ -476,6 +490,7 @@ int journal_file_rotate(
                         /* metrics= */ NULL,
                         mmap_cache,
                         /* template= */ *f,
+                        seqnum_id,
                         &new_file);
 
         journal_file_initiate_close(*f, deferred_closes);
@@ -492,12 +507,13 @@ int journal_file_open_reliably(
                 uint64_t compress_threshold_bytes,
                 JournalMetrics *metrics,
                 MMapCache *mmap_cache,
+                const sd_id128_t *seqnum_id,
                 JournalFile **ret) {
 
         _cleanup_(journal_file_offline_closep) JournalFile *old_file = NULL;
         int r;
 
-        r = journal_file_open(
+        r = journal_file_open_full(
                         /* fd= */ -EBADF,
                         fname,
                         open_flags,
@@ -507,6 +523,7 @@ int journal_file_open_reliably(
                         metrics,
                         mmap_cache,
                         /* template= */ NULL,
+                        seqnum_id,
                         ret);
         if (!IN_SET(r,
                     -EBADMSG,           /* Corrupted */
@@ -536,7 +553,7 @@ int journal_file_open_reliably(
          * sequence number and ID. */
         r = journal_file_open(-EBADF, fname,
                               (open_flags & ~(O_ACCMODE_STRICT|O_CREAT|O_EXCL)) | O_RDONLY,
-                              file_flags, 0, compress_threshold_bytes, NULL,
+                              file_flags, /* mode= */ 0, compress_threshold_bytes, /* metrics= */ NULL,
                               mmap_cache, /* template= */ NULL, &old_file);
         if (r < 0)
                 log_debug_errno(r, "Failed to continue sequence from file %s, ignoring: %m", fname);
@@ -545,8 +562,8 @@ int journal_file_open_reliably(
         if (r < 0)
                 return r;
 
-        return journal_file_open(-EBADF, fname, open_flags, file_flags, mode, compress_threshold_bytes, metrics,
-                                 mmap_cache, /* template= */ old_file, ret);
+        return journal_file_open_full(-EBADF, fname, open_flags, file_flags, mode, compress_threshold_bytes, metrics,
+                                      mmap_cache, /* template= */ old_file, seqnum_id, ret);
 }
 
 DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(

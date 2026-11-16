@@ -1,6 +1,8 @@
 cff-version: 1.2.0
 title: Liberated systemd
 type: software
+authors:
+  - name: "Liberated Systemd Project"
 repository-code: 'https://github.com/Jeffrey-Sardina/systemd'
 url: 'https://github.com/Jeffrey-Sardina/systemd'
 abstract: >-

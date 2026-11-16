@@ -2,7 +2,6 @@
 
 #include <printf.h>
 
-#include "memory-util.h"
 #include "strv.h"
 #include "tests.h"
 
@@ -20,7 +19,7 @@ static void test_parse_printf_format_one(const char *fmt, size_t m, const int *e
                 else
                         log_debug("types[%zu]=n/a, expected[%zu]=%i", i, i, expected[i]);
 
-        ASSERT_EQ(memcmp_nn(types, n * sizeof(int), expected, m * sizeof(int)), 0);
+        ASSERT_MEMEQ_NN(types, n * sizeof(int), expected, m * sizeof(int));
 }
 
 TEST(parse_printf_format) {
@@ -77,7 +76,7 @@ TEST(parse_printf_format) {
                 fmt = mfree(fmt);
 
                 ASSERT_NOT_NULL(fmt = strjoin("%", i->prefix));
-                test_parse_printf_format_one(fmt, 0, NULL);
+                test_parse_printf_format_one(fmt, 0, /* expected= */ NULL);
         }
 
         FOREACH_ELEMENT(i, float_table) {
@@ -90,7 +89,7 @@ TEST(parse_printf_format) {
                 }
 
                 ASSERT_NOT_NULL(fmt = strjoin("%", i->prefix));
-                test_parse_printf_format_one(fmt, 0, NULL);
+                test_parse_printf_format_one(fmt, 0, /* expected= */ NULL);
         }
 
         test_parse_printf_format_one("%c",  1, (int[]) { PA_CHAR });
@@ -103,10 +102,10 @@ TEST(parse_printf_format) {
 
         test_parse_printf_format_one("%p",  1, (int[]) { PA_POINTER });
 
-        test_parse_printf_format_one("%m",  0, NULL);
-        test_parse_printf_format_one("%%",  0, NULL);
+        test_parse_printf_format_one("%m",  0, /* expected= */ NULL);
+        test_parse_printf_format_one("%%",  0, /* expected= */ NULL);
 
-        test_parse_printf_format_one("asfhghejmlahpgakdmsalc", 0, NULL);
+        test_parse_printf_format_one("asfhghejmlahpgakdmsalc", 0, /* expected= */ NULL);
         test_parse_printf_format_one(
                         "%d%i%o%u%x%X", 6,
                         (int[]) { PA_INT, PA_INT, PA_INT, PA_INT, PA_INT, PA_INT });

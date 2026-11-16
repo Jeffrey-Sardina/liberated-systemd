@@ -64,6 +64,7 @@ static int open_output(RemoteServer *s, Writer *w, const char *host) {
                         UINT64_MAX,
                         &w->metrics,
                         w->mmap,
+                        /* seqnum_id= */ NULL,
                         &w->journal);
         if (r < 0)
                 return log_error_errno(r, "Failed to open output journal %s: %m", filename);
@@ -181,7 +182,7 @@ static int get_source_for_fd(RemoteServer *s,
                 return log_warning_errno(r, "Failed to get writer for source %s: %m", name);
 
         if (!s->sources[fd]) {
-                s->sources[fd] = source_new(fd, false, TAKE_PTR(name), writer);
+                s->sources[fd] = source_new(fd, /* passive_fd= */ false, TAKE_PTR(name), writer);
                 if (!s->sources[fd]) {
                         writer_unref(writer);
                         return log_oom();
@@ -540,5 +541,5 @@ static int dispatch_raw_connection_event(
         if (fd2 < 0)
                 return fd2;
 
-        return journal_remote_add_source(s, fd2, hostname, true);
+        return journal_remote_add_source(s, fd2, hostname, /* own_name= */ true);
 }

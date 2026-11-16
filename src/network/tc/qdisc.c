@@ -495,10 +495,10 @@ static bool qdisc_is_ready_to_configure(QDisc *qdisc, Link *link) {
         /* TC_H_CLSACT == TC_H_INGRESS */
         if (!IN_SET(qdisc->parent, TC_H_ROOT, TC_H_CLSACT)) {
                 if (TC_H_MIN(qdisc->parent) == 0) {
-                        if (link_find_qdisc(link, qdisc->parent, NULL, NULL) < 0)
+                        if (link_find_qdisc(link, qdisc->parent, /* kind= */ NULL, /* ret= */ NULL) < 0)
                                 return false;
                 } else {
-                        if (link_find_tclass(link, qdisc->parent, NULL) < 0)
+                        if (link_find_tclass(link, qdisc->parent, /* ret= */ NULL) < 0)
                                 return false;
                 }
         }
@@ -542,7 +542,7 @@ int link_request_qdisc(Link *link, const QDisc *qdisc) {
         assert(qdisc);
         assert(qdisc->source != NETWORK_CONFIG_SOURCE_FOREIGN);
 
-        if (qdisc_get_request(link, qdisc, NULL) >= 0)
+        if (qdisc_get_request(link, qdisc, /* ret= */ NULL) >= 0)
                 return 0; /* already requested, skipping. */
 
         r = qdisc_dup(qdisc, &tmp);
@@ -774,12 +774,8 @@ int config_parse_qdisc_parent(
                 qdisc->handle = TC_H_MAKE(TC_H_INGRESS, 0);
         } else {
                 r = parse_handle(rvalue, &qdisc->parent);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse 'Parent=', ignoring assignment: %s",
-                                   rvalue);
-                        return 0;
-                }
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         }
 
         if (STR_IN_SET(rvalue, "clsact", "ingress")) {
@@ -831,12 +827,8 @@ int config_parse_qdisc_handle(
         }
 
         r = safe_atou16_full(rvalue, 16, &n);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse 'Handle=', ignoring assignment: %s",
-                           rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         qdisc->handle = (uint32_t) n << 16;
         TAKE_PTR(qdisc);

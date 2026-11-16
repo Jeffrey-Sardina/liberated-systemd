@@ -18,16 +18,23 @@
 #include "escape.h"
 #include "fileio.h"
 #include "format-table.h"
+#include "fs-util.h"
 #include "hashmap.h"
 #include "hexdecoct.h"
+#include "initrd-cpio.h"
+#include "io-util.h"
+#include "iovec-util.h"
 #include "json-util.h"
 #include "libmount-util.h"
 #include "log.h"
+#include "machine-credential.h"
 #include "main-func.h"
+#include "memfd-util.h"
 #include "memory-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
+#include "pe-addon.h"
 #include "polkit-agent.h"
 #include "stat-util.h"
 #include "string-table.h"
@@ -211,7 +218,7 @@ static int is_tmpfs_with_noswap(dev_t devno) {
         if (!fs)
                 return -ENODEV;
 
-        r = sym_mnt_fs_get_option(fs, "noswap", /* value= */ NULL, /* valuesz= */ NULL);
+        r = sym_mnt_fs_get_option(fs, "noswap", /* value= */ NULL, /* valsz= */ NULL);
         if (r < 0)
                 return r;
 
@@ -253,12 +260,12 @@ static int add_credentials_to_table(Table *t, bool encrypted) {
                 if (!credential_name_valid(de->d_name))
                         continue;
 
-                fd = openat(dirfd(d), de->d_name, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                fd = xopenat(dirfd(d), de->d_name, O_PATH|O_NOFOLLOW);
                 if (fd < 0) {
-                        if (errno == ENOENT) /* Vanished by now? */
+                        if (fd == -ENOENT) /* Vanished by now? */
                                 continue;
 
-                        return log_error_errno(errno, "Failed to open credential '%s': %m", de->d_name);
+                        return log_error_errno(fd, "Failed to open credential '%s': %m", de->d_name);
                 }
 
                 if (fstat(fd, &st) < 0)
@@ -276,7 +283,7 @@ static int add_credentials_to_table(Table *t, bool encrypted) {
                 } else {
                         struct statfs sfs;
                         if (fstatfs(fd, &sfs) < 0)
-                                return log_error_errno(r, "fstatfs() failed on '%s': %m", de->d_name);
+                                return log_error_errno(errno, "fstatfs() failed on '%s': %m", de->d_name);
 
                         bool is_secure;
                         if (is_fs_type(&sfs, RAMFS_MAGIC))
@@ -321,7 +328,7 @@ static int verb_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (!t)
                 return log_oom();
 
-        (void) table_set_align_percent(t, table_get_cell(t, 0, 2), 100);
+        (void) table_set_align_percent(t, table_get_cell(t, /* row= */ 0, 2), 100);
 
         r = add_credentials_to_table(t, /* encrypted= */ true);
         if (r < 0)
@@ -375,7 +382,7 @@ static int transcode(
         }
 
         case TRANSCODE_UNBASE64:
-                r = unbase64mem_full(input, input_size, true, ret_output, ret_output_size);
+                r = unbase64mem_full(input, input_size, /* secure= */ true, ret_output, ret_output_size);
                 if (r == -EPIPE) /* Uneven number of chars */
                         return -EINVAL;
 
@@ -394,7 +401,7 @@ static int transcode(
         }
 
         case TRANSCODE_UNHEX:
-                r = unhexmem_full(input, input_size, true, ret_output, ret_output_size);
+                r = unhexmem_full(input, input_size, /* secure= */ true, ret_output, ret_output_size);
                 if (r == -EPIPE) /* Uneven number of chars */
                         return -EINVAL;
 
@@ -443,11 +450,11 @@ static int write_blob(FILE *f, const void *data, size_t size) {
                 if (r < 0)
                         return log_error_errno(r, "Unable to convert binary string to C string: %m");
 
-                r = sd_json_parse(suffixed, SD_JSON_PARSE_SENSITIVE, &v, NULL, NULL);
+                r = sd_json_parse(suffixed, SD_JSON_PARSE_SENSITIVE, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse JSON: %m");
 
-                sd_json_variant_dump(v, arg_json_format_flags, f, NULL);
+                sd_json_variant_dump(v, arg_json_format_flags, f, /* prefix= */ NULL);
                 return 0;
         }
 
@@ -495,7 +502,7 @@ static int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 for (encrypted = 0; encrypted < 2; encrypted++) {
                         _cleanup_closedir_ DIR *d = NULL;
 
-                        r = open_credential_directory(encrypted, &d, NULL);
+                        r = open_credential_directory(encrypted, &d, /* ret_prefix= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to open credentials directory: %m");
                         if (!d) /* Not set */
@@ -509,7 +516,7 @@ static int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
                                         dirfd(d), *cn,
                                         UINT64_MAX, SIZE_MAX,
                                         flags,
-                                        NULL,
+                                        /* bind_name= */ NULL,
                                         (char**) &content, &size);
                         if (r == -ENOENT) /* Not found */
                                 continue;
@@ -561,28 +568,57 @@ static int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return ret;
 }
 
+static int read_plaintext(const char *input, struct iovec *ret) {
+        _cleanup_(iovec_done_erase) struct iovec plaintext = {};
+        int r;
+
+        assert(ret);
+
+        /* Reads a plaintext credential from the specified file, or from stdin if NULL, empty or "-" */
+
+        if (!empty_or_dash(input))
+                r = read_full_file_full(
+                                AT_FDCWD,
+                                input,
+                                UINT64_MAX,
+                                CREDENTIAL_SIZE_MAX,
+                                READ_FULL_FILE_SECURE | READ_FULL_FILE_FAIL_WHEN_LARGER,
+                                /* bind_name= */ NULL,
+                                (char **) &plaintext.iov_base,
+                                &plaintext.iov_len);
+        else
+                r = read_full_stream_full(
+                                stdin,
+                                /* filename= */ NULL,
+                                UINT64_MAX,
+                                CREDENTIAL_SIZE_MAX,
+                                READ_FULL_FILE_SECURE | READ_FULL_FILE_FAIL_WHEN_LARGER,
+                                (char **) &plaintext.iov_base,
+                                &plaintext.iov_len);
+        if (r == -E2BIG)
+                return log_error_errno(r, "Plaintext too long for credential (allowed size: %zu).", (size_t) CREDENTIAL_SIZE_MAX);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read plaintext: %m");
+
+        *ret = TAKE_STRUCT(plaintext);
+        return 0;
+}
+
 VERB(verb_encrypt, "encrypt", "INPUT OUTPUT\0", 3, 3, 0,
      "Encrypt plaintext credential file and write to ciphertext credential file");
 static int verb_encrypt(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(iovec_done_erase) struct iovec plaintext = {}, output = {};
         _cleanup_free_ char *base64_buf = NULL, *fname = NULL;
-        const char *input_path, *output_path, *name;
+        const char *output_path, *name;
         ssize_t base64_size;
         usec_t timestamp;
         int r;
 
         assert(argc == 3);
 
-        input_path = empty_or_dash(argv[1]) ? NULL : argv[1];
-
-        if (input_path)
-                r = read_full_file_full(AT_FDCWD, input_path, UINT64_MAX, CREDENTIAL_SIZE_MAX, READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER, NULL, (char**) &plaintext.iov_base, &plaintext.iov_len);
-        else
-                r = read_full_stream_full(stdin, NULL, UINT64_MAX, CREDENTIAL_SIZE_MAX, READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER, (char**) &plaintext.iov_base, &plaintext.iov_len);
-        if (r == -E2BIG)
-                return log_error_errno(r, "Plaintext too long for credential (allowed size: %zu).", (size_t) CREDENTIAL_SIZE_MAX);
+        r = read_plaintext(argv[1], &plaintext);
         if (r < 0)
-                return log_error_errno(r, "Failed to read plaintext: %m");
+                return r;
 
         output_path = empty_or_dash(argv[2]) ? NULL : argv[2];
 
@@ -664,7 +700,7 @@ static int verb_encrypt(int argc, char *argv[], uintptr_t _data, void *userdata)
         if (output_path)
                 r = write_string_file(output_path, base64_buf, WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_CREATE);
         else
-                r = write_string_stream(stdout, base64_buf, 0);
+                r = write_string_stream(stdout, base64_buf, /* flags= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to write result: %m");
 
@@ -687,9 +723,24 @@ static int verb_decrypt(int argc, char *argv[], uintptr_t _data, void *userdata)
         input_path = empty_or_dash(argv[1]) ? NULL : argv[1];
 
         if (input_path)
-                r = read_full_file_full(AT_FDCWD, argv[1], UINT64_MAX, CREDENTIAL_ENCRYPTED_SIZE_MAX, READ_FULL_FILE_UNBASE64|READ_FULL_FILE_FAIL_WHEN_LARGER, NULL, (char**) &input, &input.iov_len);
+                r = read_full_file_full(
+                                AT_FDCWD,
+                                argv[1],
+                                UINT64_MAX,
+                                CREDENTIAL_ENCRYPTED_SIZE_MAX,
+                                READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_FAIL_WHEN_LARGER,
+                                /* bind_name= */ NULL,
+                                (char **) &input,
+                                &input.iov_len);
         else
-                r = read_full_stream_full(stdin, NULL, UINT64_MAX, CREDENTIAL_ENCRYPTED_SIZE_MAX, READ_FULL_FILE_UNBASE64|READ_FULL_FILE_FAIL_WHEN_LARGER, (char**) &input, &input.iov_len);
+                r = read_full_stream_full(
+                                stdin,
+                                /* filename= */ NULL,
+                                UINT64_MAX,
+                                CREDENTIAL_ENCRYPTED_SIZE_MAX,
+                                READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_FAIL_WHEN_LARGER,
+                                (char **) &input,
+                                &input.iov_len);
         if (r == -E2BIG)
                 return log_error_errno(r, "Data too long for encrypted credential (allowed size: %zu).", (size_t) CREDENTIAL_ENCRYPTED_SIZE_MAX);
         if (r < 0)
@@ -751,6 +802,156 @@ static int verb_decrypt(int argc, char *argv[], uintptr_t _data, void *userdata)
         r = write_blob(f, plaintext.iov_base, plaintext.iov_len);
         if (r < 0)
                 return r;
+
+        return EXIT_SUCCESS;
+}
+
+static bool addon_credential_name_valid(const char *name) {
+        /* The credential is stored as "<name>.cred" in the cpio archive, and the kernel silently skips
+         * files whose name exceeds NAME_MAX when unpacking it, hence refuse names that would not fit. */
+        return credential_name_valid(name) && strlen(name) <= NAME_MAX - STRLEN(".cred");
+}
+
+static int make_addon(const char *name, const struct iovec *data, const char *stub, struct iovec *ret) {
+        int r;
+
+        assert(addon_credential_name_valid(name));
+        assert(data);
+        assert(stub);
+        assert(ret);
+
+        /* Wraps the plaintext credential in a cpio archive, in the same layout systemd-firstboot uses for
+         * its addons, i.e. .extra/system_credentials/<name>.cred, which PID 1 imports into the trusted
+         * system credentials. That archive is then placed in the .initrd section of an (unsigned, i.e.
+         * only usable via trust on first use) systemd-stub addon. */
+
+        _cleanup_(machine_credential_context_done) MachineCredentialContext creds = {};
+        r = machine_credential_add(&creds, name, data->iov_base, data->iov_len);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add credential '%s': %m", name);
+
+        _cleanup_(iovec_done_erase) struct iovec cpio = {};
+        r = initrd_cpio_credentials_to_memory(&creds, &cpio);
+        if (r < 0)
+                return r;
+
+        /* The PE writer wants a regular file to write to, hence build the addon in a memfd first */
+        _cleanup_close_ int fd = memfd_new("addon");
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to allocate memory file: %m");
+
+        r = pe_addon_make(stub, /* cmdline= */ NULL, &cpio, fd);
+        if (r < 0)
+                return r;
+
+        char *addon;
+        size_t size;
+        r = read_full_file_full(
+                        fd,
+                        /* filename= */ NULL,
+                        /* offset= */ 0,
+                        SIZE_MAX,
+                        READ_FULL_FILE_SECURE,
+                        /* bind_name= */ NULL,
+                        &addon,
+                        &size);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read addon: %m");
+
+        *ret = IOVEC_MAKE(addon, size);
+        return 0;
+}
+
+static int addon_name_from_path(const char *path, char **ret) {
+        _cleanup_free_ char *fname = NULL;
+        int r;
+
+        assert(path);
+        assert(ret);
+
+        /* Derives the credential name from the output file name, with the usual addon suffix removed, so
+         * that "foo.addon.efi" carries the credential "foo". The suffix is matched case-insensitively, since
+         * addons typically live on the (case-insensitive) VFAT file system of the ESP, and systemd-stub
+         * matches the suffix case-insensitively too. */
+
+        r = path_extract_filename(path, &fname);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract filename from '%s': %m", path);
+        if (r == O_DIRECTORY)
+                return log_error_errno(SYNTHETIC_ERRNO(EISDIR), "Path '%s' refers to directory, refusing.", path);
+
+        FOREACH_STRING(suffix, ".addon.efi", ".efi") {
+                char *e = endswith_no_case(fname, suffix);
+                if (e) {
+                        *e = 0;
+                        break;
+                }
+        }
+
+        if (!addon_credential_name_valid(fname))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Credential name '%s' derived from '%s' is not valid, specify one with --name=.",
+                                       fname, path);
+
+        *ret = TAKE_PTR(fname);
+        return 0;
+}
+
+VERB(verb_make_addon, "make-addon", "INPUT OUTPUT\0", 3, 3, 0,
+     "Wrap plaintext credential file in an (unsigned) systemd-stub addon");
+static int verb_make_addon(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(iovec_done_erase) struct iovec plaintext = {}, addon = {};
+        _cleanup_free_ char *fname = NULL;
+        const char *output_path, *name;
+        int r;
+
+        assert(argc == 3);
+
+        /* The addon carries the credential in plaintext, hence refuse the options that only make sense
+         * when encrypting, rather than silently ignoring them */
+        if (!sd_id128_equal(arg_with_key, _CRED_AUTO) || uid_is_valid(arg_uid))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Addons carry plaintext credentials, --with-key=, -H, -T, --user and --uid= are not supported.");
+        if (arg_timestamp != USEC_INFINITY || arg_not_after != USEC_INFINITY)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Addons carry plaintext credentials, --timestamp= and --not-after= are not supported.");
+        if (arg_tpm2_device || arg_tpm2_public_key || arg_tpm2_signature)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Addons carry plaintext credentials, --tpm2-device=, --tpm2-public-key= and --tpm2-signature= are not supported.");
+        if (arg_pretty)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--pretty is not supported for addons.");
+
+        output_path = empty_or_dash(argv[2]) ? NULL : argv[2];
+
+        /* The credential name becomes the file name, hence unlike when encrypting, it is mandatory */
+        if (arg_name_any)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "A credential name is required for addons, refusing empty --name=.");
+        if (arg_name) {
+                if (!addon_credential_name_valid(arg_name))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential name '%s' is too long for an addon.", arg_name);
+
+                name = arg_name;
+        } else if (output_path) {
+                r = addon_name_from_path(output_path, &fname);
+                if (r < 0)
+                        return r;
+
+                name = fname;
+        } else
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "A credential name is required when writing the addon to standard output, specify one with --name=.");
+
+        r = read_plaintext(argv[1], &plaintext);
+        if (r < 0)
+                return r;
+
+        r = make_addon(name, &plaintext, secure_getenv("SYSTEMD_ADDON_STUB") ?: PE_ADDON_STUB_PATH, &addon);
+        if (r < 0)
+                return r;
+
+        /* The addon carries the credential in plaintext, hence don't make it readable to anyone else */
+        if (output_path)
+                r = write_data_file_atomic_at(AT_FDCWD, output_path, &addon, WRITE_DATA_FILE_MODE_0400);
+        else
+                r = loop_write(STDOUT_FILENO, addon.iov_base, addon.iov_len);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write addon: %m");
 
         return EXIT_SUCCESS;
 }
@@ -1262,7 +1463,7 @@ static int vl_method_encrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
                         cflags,
                         &output);
         if (r == -ESRCH)
-                return sd_varlink_error(link, "io.systemd.Credentials.NoSuchUser", NULL);
+                return sd_varlink_error(link, "io.systemd.Credentials.NoSuchUser", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1382,11 +1583,11 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
         }
 
         if (ERRNO_IS_NEG_TPM2_UNSEAL_BAD_PCR(r))
-                return sd_varlink_error(link, "io.systemd.Credentials.UnexpectedPCRState", NULL);
+                return sd_varlink_error(link, "io.systemd.Credentials.UnexpectedPCRState", /* parameters= */ NULL);
         if (r < 0) {
                 const CredentialsVarlinkError *e = credentials_varlink_error_by_errno(r);
                 if (e)
-                        return sd_varlink_error(link, e->id, NULL);
+                        return sd_varlink_error(link, e->id, /* parameters= */ NULL);
 
                 return r;
         }
@@ -1397,6 +1598,66 @@ static int vl_method_decrypt(sd_varlink *link, sd_json_variant *parameters, sd_v
         if (r < 0)
                 return r;
 
+        sd_json_variant_sensitive(reply);
+
+        return sd_varlink_reply(link, reply);
+}
+
+typedef struct MethodMakeAddonParameters {
+        const char *name;
+        const char *text;
+        struct iovec data;
+} MethodMakeAddonParameters;
+
+static void method_make_addon_parameters_done(MethodMakeAddonParameters *p) {
+        assert(p);
+
+        iovec_done_erase(&p->data);
+}
+
+static int vl_method_make_addon(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "name", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, offsetof(MethodMakeAddonParameters, name), SD_JSON_MANDATORY },
+                { "text", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, offsetof(MethodMakeAddonParameters, text), SD_JSON_NULLABLE  },
+                { "data", SD_JSON_VARIANT_STRING, json_dispatch_unbase64_iovec,  offsetof(MethodMakeAddonParameters, data), SD_JSON_NULLABLE  },
+                {}
+        };
+        _cleanup_(method_make_addon_parameters_done) MethodMakeAddonParameters p = {};
+        _cleanup_(iovec_done_erase) struct iovec addon = {};
+        int r;
+
+        assert(link);
+
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
+                return r;
+
+        if (!addon_credential_name_valid(p.name))
+                return sd_varlink_error_invalid_parameter_name(link, "name");
+        /* Specifying both or neither the text string and the binary data is not allowed */
+        if (!!p.text == !!p.data.iov_base)
+                return sd_varlink_error_invalid_parameter_name(link, "data");
+
+        const struct iovec *plaintext = p.text ? &IOVEC_MAKE_STRING(p.text) : &p.data;
+        if (plaintext->iov_len > CREDENTIAL_SIZE_MAX)
+                return sd_varlink_error_invalid_parameter_name(link, p.text ? "text" : "data");
+
+        /* No Polkit authentication needed: this involves no key material and no privileged resources, it
+         * merely transforms plaintext the client passed in. For the same reason the stub is not
+         * configurable by clients. */
+        r = make_addon(p.name, plaintext, PE_ADDON_STUB_PATH, &addon);
+        if (r == -ENOENT)
+                return sd_varlink_error(link, "io.systemd.Credentials.NoAddonStub", /* parameters= */ NULL);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        r = sd_json_buildo(&reply, JSON_BUILD_PAIR_IOVEC_BASE64("blob", &addon));
+        if (r < 0)
+                return r;
+
+        /* The addon carries the credential in plaintext */
         sd_json_variant_sensitive(reply);
 
         return sd_varlink_reply(link, reply);
@@ -1422,8 +1683,9 @@ static int vl_server(void) {
 
         r = sd_varlink_server_bind_method_many(
                         varlink_server,
-                        "io.systemd.Credentials.Encrypt", vl_method_encrypt,
-                        "io.systemd.Credentials.Decrypt", vl_method_decrypt);
+                        "io.systemd.Credentials.Encrypt",   vl_method_encrypt,
+                        "io.systemd.Credentials.Decrypt",   vl_method_decrypt,
+                        "io.systemd.Credentials.MakeAddon", vl_method_make_addon);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind Varlink methods: %m");
 

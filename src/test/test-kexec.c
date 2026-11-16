@@ -7,6 +7,7 @@
 #include "alloc-util.h"
 #include "compress.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "io-util.h"
 #include "reboot-util.h"
 #include "string-util.h"
@@ -119,7 +120,7 @@ TEST(gzip_round_trip) {
         /* Compress it with gzip */
         ASSERT_OK_ERRNO(lseek(src_fd, 0, SEEK_SET));
         ASSERT_OK(gz_fd = mkostemp_safe(gz_path));
-        ASSERT_OK(compress_stream(COMPRESSION_GZIP, src_fd, gz_fd, UINT64_MAX, NULL));
+        ASSERT_OK(compress_stream(COMPRESSION_GZIP, src_fd, gz_fd, UINT64_MAX, /* ret_uncompressed_size= */ NULL));
 
         /* Feed the gzip file to kexec_maybe_decompress_kernel */
         ASSERT_OK_ERRNO(lseek(gz_fd, 0, SEEK_SET));
@@ -132,7 +133,7 @@ TEST(gzip_round_trip) {
         /* Verify the decompressed content matches the original */
         char result[4096];
         ASSERT_OK_EQ_ERRNO(pread(kernel_fd, result, sizeof(result), 0), (ssize_t) sizeof(result));
-        ASSERT_EQ(memcmp(buf, result, sizeof(buf)), 0);
+        ASSERT_MEMEQ(buf, result, sizeof(buf));
 }
 
 TEST(zboot_synthetic) {
@@ -159,7 +160,7 @@ TEST(zboot_synthetic) {
         ASSERT_OK_ERRNO(lseek(src_fd, 0, SEEK_SET));
 
         ASSERT_OK(gz_fd = mkostemp_safe(gz_path));
-        ASSERT_OK(compress_stream(COMPRESSION_GZIP, src_fd, gz_fd, UINT64_MAX, NULL));
+        ASSERT_OK(compress_stream(COMPRESSION_GZIP, src_fd, gz_fd, UINT64_MAX, /* ret_uncompressed_size= */ NULL));
 
         /* Read the compressed data */
         struct stat st;
@@ -198,7 +199,7 @@ TEST(zboot_synthetic) {
         /* Verify decompressed content matches original payload */
         char result[512];
         ASSERT_OK_EQ_ERRNO(pread(kernel_fd, result, sizeof(result), 0), (ssize_t) sizeof(result));
-        ASSERT_EQ(memcmp(payload, result, sizeof(payload)), 0);
+        ASSERT_MEMEQ(payload, result, sizeof(payload));
 }
 
 TEST(system_kernel) {
@@ -214,9 +215,9 @@ TEST(system_kernel) {
 
         log_info("Found kernel image: %s", path);
 
-        fd = open(path, O_RDONLY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY);
         if (fd < 0) {
-                log_tests_skipped_errno(errno, "Cannot open kernel image '%s'", path);
+                log_tests_skipped_errno(fd, "Cannot open kernel image '%s'", path);
                 return;
         }
 

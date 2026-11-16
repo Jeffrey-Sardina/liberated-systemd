@@ -111,7 +111,6 @@ int tar_pull_new(
                 TarPullFinished on_finished,
                 void *userdata) {
 
-        _cleanup_(curl_glue_unrefp) CurlGlue *g = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_(tar_pull_unrefp) TarPull *p = NULL;
         _cleanup_free_ char *root = NULL;
@@ -132,10 +131,6 @@ int tar_pull_new(
                         return r;
         }
 
-        r = curl_glue_new(&g, e);
-        if (r < 0)
-                return r;
-
         p = new(TarPull, 1);
         if (!p)
                 return -ENOMEM;
@@ -145,7 +140,6 @@ int tar_pull_new(
                 .userdata = userdata,
                 .image_root = TAKE_PTR(root),
                 .event = TAKE_PTR(e),
-                .glue = TAKE_PTR(g),
                 .tar_pid = PIDREF_NULL,
                 .tree_fd = -EBADF,
                 .userns_fd = -EBADF,
@@ -212,7 +206,7 @@ static void tar_pull_report_progress(TarPull *p, TarProgress progress) {
         if (!ratelimit_below(&p->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+        sd_notifyf(/* unset_environment= */ false, "X_IMPORT_PROGRESS=%u%%", percent);
 
         if (isatty_safe(STDERR_FILENO))
                 draw_progress_bar("Total:", percent);
@@ -265,7 +259,7 @@ static int tar_pull_make_local_copy(TarPull *p) {
                 return log_oom();
 
         if (FLAGS_SET(p->flags, IMPORT_PULL_KEEP_DOWNLOAD)) {
-                r = tempfn_random(path, NULL, &t);
+                r = tempfn_random(path, /* extra= */ NULL, &t);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate temporary filename for %s: %m", path);
 
@@ -285,9 +279,9 @@ static int tar_pull_make_local_copy(TarPull *p) {
                          * already downloaded the image before, and are just making a copy of the original
                          * download, we need to open ->tree_fd now */
                         if (p->tree_fd < 0) {
-                                _cleanup_close_ int directory_fd = open(p->final_path, O_DIRECTORY|O_CLOEXEC);
+                                _cleanup_close_ int directory_fd = xopenat(AT_FDCWD, p->final_path, O_DIRECTORY);
                                 if (directory_fd < 0)
-                                        return log_error_errno(errno, "Failed to open '%s': %m", p->final_path);
+                                        return log_error_errno(directory_fd, "Failed to open '%s': %m", p->final_path);
 
                                 struct stat st;
                                 if (fstat(directory_fd, &st) < 0)
@@ -310,14 +304,9 @@ static int tar_pull_make_local_copy(TarPull *p) {
                         }
 
                         _cleanup_close_ int directory_fd = -EBADF;
-                        r = mountfsd_make_directory(
-                                        mountfsd_link,
-                                        t,
-                                        MODE_INVALID,
-                                        /* flags= */ 0,
-                                        &directory_fd);
+                        r = mkdir_foreign(t, MODE_INVALID, &directory_fd);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to make directory via mountfsd: %m");
+                                return log_error_errno(r, "Failed to make foreign UID range owned directory: %m");
 
                         _cleanup_close_ int copy_fd = -EBADF;
                         r = mountfsd_mount_directory_fd(
@@ -343,7 +332,7 @@ static int tar_pull_make_local_copy(TarPull *p) {
                                                 BTRFS_SNAPSHOT_FALLBACK_DIRECTORY|
                                                 BTRFS_SNAPSHOT_RECURSIVE);
                         else
-                                r = copy_tree(p->final_path, t, UID_INVALID, GID_INVALID, COPY_HARDLINKS, NULL, NULL);
+                                r = copy_tree(p->final_path, t, UID_INVALID, GID_INVALID, COPY_HARDLINKS, /* denylist= */ NULL, /* subvolumes= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to create original download image: %m");
                 }
@@ -447,6 +436,15 @@ static void tar_pull_job_on_finished(PullJob *j) {
         /* This is invoked if either the download completed successfully, or the download was skipped because
          * we already have the etag. */
 
+        /* If the signature job was deferred, only now we know whether we need the detached signature file */
+        if (j == p->checksum_job) {
+                r = pull_signature_job_begin(p->checksum_job, &p->signature_job);
+                if (r < 0) {
+                        r = log_error_errno(r, "Failed to start signature job: %m");
+                        goto finish;
+                }
+        }
+
         if (!tar_pull_is_done(p))
                 return;
 
@@ -479,6 +477,7 @@ static void tar_pull_job_on_finished(PullJob *j) {
 
                 clear_progress_bar(/* prefix= */ NULL);
                 r = pull_verify(p->verify,
+                                p->flags,
                                 p->tar_job,
                                 p->checksum_job,
                                 p->signature_job,
@@ -503,7 +502,7 @@ static void tar_pull_job_on_finished(PullJob *j) {
 
                 r = install_file(
                                 AT_FDCWD, p->local,
-                                AT_FDCWD, NULL,
+                                AT_FDCWD, /* target_name= */ NULL,
                                 (p->flags & IMPORT_READ_ONLY ? INSTALL_READ_ONLY|INSTALL_GRACEFUL : 0) |
                                 (p->flags & IMPORT_SYNC ? INSTALL_SYNCFS|INSTALL_GRACEFUL : 0));
                 if (r < 0) {
@@ -511,7 +510,7 @@ static void tar_pull_job_on_finished(PullJob *j) {
                         goto finish;
                 }
         } else {
-                r = tar_pull_determine_path(p, NULL, &p->final_path);
+                r = tar_pull_determine_path(p, /* suffix= */ NULL, &p->final_path);
                 if (r < 0)
                         goto finish;
 
@@ -623,14 +622,9 @@ static int tar_pull_job_on_open_disk_tar(PullJob *j) {
                         return log_error_errno(r, "Failed to connect to mountfsd: %m");
 
                 _cleanup_close_ int directory_fd = -EBADF;
-                r = mountfsd_make_directory(
-                                mountfsd_link,
-                                where,
-                                MODE_INVALID,
-                                /* flags= */ 0,
-                                &directory_fd);
+                r = mkdir_foreign(where, MODE_INVALID, &directory_fd);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to make directory via mountfsd: %m");
+                        return log_error_errno(r, "Failed to make foreign UID range owned directory: %m");
 
                 r = mountfsd_mount_directory_fd(
                                 mountfsd_link,
@@ -657,9 +651,9 @@ static int tar_pull_job_on_open_disk_tar(PullJob *j) {
                         (void) import_assign_pool_quota_and_warn(where);
                 }
 
-                p->tree_fd = open(where, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                p->tree_fd = xopenat(AT_FDCWD, where, O_DIRECTORY|O_NOFOLLOW);
                 if (p->tree_fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", where);
+                        return log_error_errno(p->tree_fd, "Failed to open '%s': %m", where);
         }
 
         j->disk_fd = import_fork_tar_x(p->tree_fd, p->userns_fd, &p->tar_pid);
@@ -687,9 +681,9 @@ static int tar_pull_job_on_open_disk_settings(PullJob *j) {
 
         (void) mkdir_parents_label(p->settings_temp_path, 0700);
 
-        j->disk_fd = open(p->settings_temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+        j->disk_fd = xopenat_full(AT_FDCWD, p->settings_temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
         if (j->disk_fd < 0)
-                return log_error_errno(errno, "Failed to create %s: %m", p->settings_temp_path);
+                return log_error_errno(j->disk_fd, "Failed to create %s: %m", p->settings_temp_path);
 
         return 0;
 }
@@ -709,13 +703,16 @@ int tar_pull_start(
                 TarPull *p,
                 const char *url,
                 const char *local,
+                Compression compression,
                 ImportFlags flags,
                 ImportVerify verify,
-                const struct iovec *checksum) {
+                const struct iovec *checksum,
+                const struct iovec *decoded_checksum) {
 
         int r;
 
         assert(p);
+        assert(compression < _COMPRESSION_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify < _IMPORT_VERIFY_MAX);
         assert(verify == _IMPORT_VERIFY_INVALID || verify >= 0);
         assert((verify < 0) || !iovec_is_set(checksum));
@@ -723,7 +720,7 @@ int tar_pull_start(
         assert(!(flags & IMPORT_PULL_SETTINGS) || !(flags & IMPORT_DIRECT));
         assert(!(flags & IMPORT_PULL_SETTINGS) || !iovec_is_set(checksum));
 
-        if (!http_url_is_valid(url) && !file_url_is_valid(url))
+        if (!http_url_is_valid(url) && !file_url_is_valid(url) && !provider_url_is_valid(url))
                 return -EINVAL;
 
         if (local && !pull_validate_local(local, flags))
@@ -739,13 +736,23 @@ int tar_pull_start(
         p->flags = flags;
         p->verify = verify;
 
+        /* Everything but provider: URLs is transported via curl, hence set up the curl glue on first use. This
+         * also defers loading libcurl to this point, so that pulling from a resource provider works without it. */
+        if (!provider_url_is_valid(url) && !p->glue) {
+                r = curl_glue_new(&p->glue, p->event);
+                if (r < 0)
+                        return r;
+        }
+
         /* Set up download job for TAR file */
-        r = pull_job_new(&p->tar_job, url, p->glue, p);
+        r = pull_job_new(&p->tar_job, url, p->event, p->glue, p);
         if (r < 0)
                 return r;
 
         p->tar_job->on_finished = tar_pull_job_on_finished;
         p->tar_job->on_open_disk = tar_pull_job_on_open_disk_tar;
+        p->tar_job->compression = compression;
+        import_digest_init(&p->tar_job->decoded_digest, decoded_checksum);
 
         if (iovec_is_set(checksum)) {
                 if (!iovec_memdup(checksum, &p->tar_job->expected_checksum))
@@ -755,8 +762,10 @@ int tar_pull_start(
         } else
                 p->tar_job->calc_checksum = verify != IMPORT_VERIFY_NO;
 
-        if (!FLAGS_SET(flags, IMPORT_DIRECT)) {
-                r = pull_find_old_etags(url, p->image_root, DT_DIR, ".tar-", NULL, &p->tar_job->old_etags);
+        /* A previously downloaded image is neither keyed by the compression algorithm nor was it
+         * necessarily verified against the decoded digest, hence don't reuse it if either is requested. */
+        if (!FLAGS_SET(flags, IMPORT_DIRECT) && compression < 0 && !iovec_is_set(decoded_checksum)) {
+                r = pull_find_old_etags(url, p->image_root, DT_DIR, ".tar-", /* suffix= */ NULL, &p->tar_job->old_etags);
                 if (r < 0)
                         return r;
         }
@@ -766,7 +775,9 @@ int tar_pull_start(
                         &p->checksum_job,
                         &p->signature_job,
                         verify,
+                        flags,
                         url,
+                        p->event,
                         p->glue,
                         tar_pull_job_on_finished,
                         p);
@@ -781,6 +792,7 @@ int tar_pull_start(
                                 tar_strip_suffixes,
                                 ".nspawn",
                                 verify,
+                                p->event,
                                 p->glue,
                                 tar_pull_job_on_open_disk_settings,
                                 tar_pull_job_on_finished,
@@ -801,6 +813,10 @@ int tar_pull_start(
 
                 j->on_progress = tar_pull_job_on_progress;
                 j->sync = FLAGS_SET(flags, IMPORT_SYNC);
+
+                /* The signature job might only be started once the checksum job finished, see tar_pull_job_on_finished() */
+                if (j == p->signature_job && pull_signature_job_deferred(p->checksum_job, p->signature_job))
+                        continue;
 
                 r = pull_job_begin(j);
                 if (r < 0)

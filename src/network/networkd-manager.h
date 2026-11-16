@@ -22,6 +22,7 @@ typedef struct Manager {
         sd_event *event;
         sd_resolve *resolve;
         sd_bus *bus;
+        sd_bus_slot *timezone_slot;
         sd_varlink_server *varlink_server;
         sd_varlink_server *varlink_resolve_hook_server;
         sd_varlink_server *varlink_metrics_server;
@@ -84,6 +85,10 @@ typedef struct Manager {
 
         char* dynamic_hostname;
         char* dynamic_timezone;
+
+        /* For updating the hostname sent by DHCP clients */
+        sd_event_source *hostname_event_source;
+        char *kernel_hostname;
 
         Set *rules;
 

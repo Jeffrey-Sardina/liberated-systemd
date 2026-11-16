@@ -96,6 +96,14 @@ static int netdev_bond_fill_message_create(NetDev *netdev, Link *link, sd_netlin
                         return r;
         }
 
+        if (b->lacp_active >= 0 &&
+            b->mode == NETDEV_BOND_MODE_802_3AD &&
+            !up) {
+                r = sd_netlink_message_append_u8(m, IFLA_BOND_AD_LACP_ACTIVE, b->lacp_active);
+                if (r < 0)
+                        return r;
+        }
+
         if (b->miimon != 0) {
                 r = sd_netlink_message_append_u32(m, IFLA_BOND_MIIMON, b->miimon / USEC_PER_MSEC);
                 if (r < 0)
@@ -277,15 +285,9 @@ int config_parse_arp_ip_target_address(
                 _cleanup_free_ char *n = NULL;
                 union in_addr_union ip;
 
-                r = extract_first_word(&p, &n, NULL, 0);
-                if (r == -ENOMEM)
-                        return log_oom();
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse Bond ARP IP target address, ignoring assignment: %s",
-                                   rvalue);
-                        return 0;
-                }
+                r = extract_first_word(&p, &n, /* separators= */ NULL, /* flags= */ 0);
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
                         return 0;
 
@@ -303,7 +305,7 @@ int config_parse_arp_ip_target_address(
                         continue;
                 }
 
-                r = ordered_set_ensure_put(&b->arp_ip_targets, NULL, UINT32_TO_PTR(ip.in.s_addr));
+                r = ordered_set_ensure_put(&b->arp_ip_targets, /* ops= */ NULL, UINT32_TO_PTR(ip.in.s_addr));
                 if (r == -ENOMEM)
                         return log_oom();
                 if (r == -EEXIST)
@@ -336,7 +338,7 @@ int config_parse_ad_actor_sys_prio(
 
         return config_parse_uint16_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        1, UINT16_MAX, true,
+                        1, UINT16_MAX, /* ignoring= */ true,
                         &b->ad_actor_sys_prio);
 }
 
@@ -361,7 +363,7 @@ int config_parse_ad_user_port_key(
 
         return config_parse_uint16_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        0, 1023, /* ignoring= */ true,
+                        /* min= */ 0, 1023, /* ignoring= */ true,
                         &b->ad_user_port_key);
 }
 
@@ -424,6 +426,7 @@ static void bond_init(NetDev *netdev) {
 
         b->all_slaves_active = false;
         b->tlb_dynamic_lb = -1;
+        b->lacp_active = -1;
 
         b->resend_igmp = RESEND_IGMP_DEFAULT;
         b->packets_per_slave = PACKETS_PER_SLAVE_DEFAULT;

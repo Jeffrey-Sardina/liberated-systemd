@@ -143,14 +143,14 @@ static int add_syscall_filters(
                                                     i->name,
                                                     SCMP_ACT_ALLOW,
                                                     syscall_deny_list,
-                                                    false,
+                                                    /* log_missing= */ false,
                                                     &added);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add syscall filter item %s: %m", i->name);
         }
 
         STRV_FOREACH(p, syscall_allow_list) {
-                r = seccomp_add_syscall_filter_item(ctx, *p, SCMP_ACT_ALLOW, syscall_deny_list, true, &added);
+                r = seccomp_add_syscall_filter_item(ctx, *p, SCMP_ACT_ALLOW, syscall_deny_list, /* log_missing= */ true, &added);
                 if (r < 0)
                         log_warning_errno(r, "Failed to add rule for system call %s on %s, ignoring: %m",
                                           *p, seccomp_arch_to_string(arch));
@@ -158,7 +158,7 @@ static int add_syscall_filters(
 
         /* The default action is ENOSYS. Respond with EPERM to all other "known" but not allow-listed
          * syscalls. */
-        r = seccomp_add_syscall_filter_item(ctx, "@known", SCMP_ACT_ERRNO(EPERM), added, true, NULL);
+        r = seccomp_add_syscall_filter_item(ctx, "@known", SCMP_ACT_ERRNO(EPERM), added, /* log_missing= */ true, /* added= */ NULL);
         if (r < 0)
                 log_warning_errno(r, "Failed to add rule for @known set on %s, ignoring: %m",
                                   seccomp_arch_to_string(arch));
@@ -233,8 +233,8 @@ int setup_seccomp(
                                 SCMP_ACT_ERRNO(EAFNOSUPPORT),
                                 SCMP_SYS(socket),
                                 2,
-                                SCMP_A0(SCMP_CMP_EQ, AF_NETLINK),
-                                SCMP_A2(SCMP_CMP_EQ, NETLINK_AUDIT));
+                                SCMP_A0(SCMP_CMP_MASKED_EQ, UINT32_MAX, AF_NETLINK),
+                                SCMP_A2(SCMP_CMP_MASKED_EQ, UINT32_MAX, NETLINK_AUDIT));
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add audit seccomp rule, ignoring: %m");
                         continue;

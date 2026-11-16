@@ -108,6 +108,75 @@ test "$FDSTORE" -eq 7
 N="/tmp/$RANDOM"
 echo $RANDOM >"$N"
 systemd-notify --fd=4 --fdname=quux --pid=parent 4<"$N"
+systemd-notify --fd=4 --fdname=other 4</dev/null
+systemd-notify --fd=4 4</dev/zero
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 3
+
+(! systemd-notify --fdstore-wipe)
+(! systemd-notify --fdstore-wipe='*' --fd=4 4</dev/null)
+(! systemd-notify --fd=4 --fdstore-wipe '*' 4</dev/null)
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 3
+
+systemd-notify --fd=4 --fd=5 --fdname=quux-extra 4</dev/null 5</dev/zero
+systemd-notify --fd=4 --fdname=xquux 4</dev/null
+systemd-notify --fd=4 --fdname='quux*' 4</dev/zero
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 7
+
+(! systemd-notify --fdstore-wipe=bad:name)
+(! systemd-notify --fdstore-wipe='[[:digit:]]')
+(! systemd-notify --fdstore-wipe=$'bad\tname')
+(! systemd-notify --fdstore-wipe=quux --fd=4 4</dev/null)
+for pattern in missing 'Quux*' "" bad:name '[[:digit:]]' $'bad\tname'; do
+    systemd-notify "FDSTOREWIPE=$pattern"
+    test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 7
+done
+
+systemd-notify FDSTOREREMOVE=1 'FDNAME=quux*'
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 6
+systemd-notify --fd=4 --fdname='quux*' 4</dev/zero
+systemd-notify --fdstore-wipe='quux\*'
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 6
+systemd-notify --fdstore-wipe quux FDNAME=other
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 5
+systemd-notify --fdstore-wipe missing --fdstore-wipe='quux-*' FDNAME=other
+systemd-analyze fdstore "$1" --json=short | jq -e '[.[].fdname] | sort == ["other", "stored", "xquux"]'
+
+for name in 0 1 1-prefix; do
+    systemd-notify --fd=4 --fdname="$name" 4</dev/null
+    systemd-notify --fd=4 --fdname="$name-extra" 4</dev/zero
+    systemd-notify --fdstore-wipe="$name"
+    test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 4
+    systemd-notify --fdstore-wipe="$name-*"
+    test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 3
+done
+
+for name in connection-1 connection-2 connection-x; do
+    systemd-notify --fd=4 --fdname="$name" 4</dev/null
+done
+systemd-notify --fdstore-wipe='connection-[0-9]'
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 4
+systemd-notify --fdstore-wipe='connection-[!0-9]'
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 3
+
+systemd-notify 'FDSTOREWIPE=xq??x' FDSTOREREMOVE=1 FDNAME=other
+systemd-analyze fdstore "$1" --json=short | jq -e '[.[].fdname] | sort == ["other", "stored"]'
+
+for name in .hidden path/name ""; do
+    systemd-notify --fd=4 --fdname="$name" 4</dev/null
+done
+
+for wipe in '--fdstore-wipe=*' --fdstore-wipe=; do
+    systemd-notify --fd=4 --fdname=1 4</dev/null
+    systemd-notify "$wipe"
+    test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 0
+done
+systemd-notify --fd=4 --fdname=1 4</dev/null
+systemd-notify --fdstore-wipe ''
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 0
+systemd-notify --fdstore-wipe=''
+test "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 0
+
+systemd-notify --fd=4 --fdname=quux --pid=parent 4<"$N"
 rm "$N"
 systemd-notify --ready
 exec sleep infinity
@@ -115,14 +184,28 @@ EOF
 
 chmod +x "$MYSCRIPT"
 
-MYUNIT="myunit$RANDOM.service"
-systemd-run -u "$MYUNIT" -p Type=notify -p FileDescriptorStoreMax=7 "$MYSCRIPT"
+for request in 'FDSTOREWIPE=*' 'FDSTOREWIPE=qu*' FDSTOREREMOVE=1; do
+    MYUNIT="myunit$RANDOM.service"
+    systemd-run -u "$MYUNIT" -p Type=notify -p FileDescriptorStoreMax=7 \
+        -p FileDescriptorStorePreserve=yes -p NotifyAccess=all -p KillMode=none "$MYSCRIPT" "$MYUNIT"
 
-test "$(systemd-analyze fdstore "$MYUNIT" | wc -l)" -eq 2
-systemd-analyze fdstore "$MYUNIT" --json=short
-systemd-analyze fdstore "$MYUNIT" --json=short | grep -P '\[{"fdname":"quux","type":.*,"devno":\[.*\],"inode":.*,"rdevno":null,"path":"/tmp/.*","flags":"ro"}\]' >/dev/null
+    test "$(systemd-analyze fdstore "$MYUNIT" | wc -l)" -eq 2
+    systemd-analyze fdstore "$MYUNIT" --json=short
+    systemd-analyze fdstore "$MYUNIT" --json=short | grep -P '\[{"fdname":"quux","type":.*,"devno":\[.*\],"inode":.*,"rdevno":null,"path":"/tmp/.*","flags":"ro"}\]' >/dev/null
 
-systemctl stop "$MYUNIT"
+    # Leave a process behind so it can empty the store after the service has stopped.
+    MYPID="$(systemctl show "$MYUNIT" -P MainPID)"
+    test "$MYPID" -gt 1
+    systemctl stop "$MYUNIT"
+    assert_eq "$(systemctl show "$MYUNIT" -P SubState)" dead-resources-pinned
+    assert_eq "$(systemctl show "$MYUNIT" -P NFileDescriptorStore)" 1
+
+    NOTIFY_SOCKET=/run/systemd/notify systemd-notify --pid="$MYPID" "$request" FDNAME=quux
+    assert_eq "$(systemctl show "$MYUNIT" -P NFileDescriptorStore)" 0
+    assert_eq "$(systemctl show "$MYUNIT" -P SubState)" dead
+    kill "$MYPID"
+done
+
 rm "$MYSCRIPT"
 
 # Test fdstore pinning (this will pull in fdstore-pin.service fdstore-nopin.service)
@@ -200,10 +283,13 @@ journalctl -q -n 0 --cursor-file=/tmp/reload-nohandler-cursor
 (! systemctl start notify-reload-no-handler.service)
 assert_eq "$(systemctl show notify-reload-no-handler.service -P SubState)" "failed"
 assert_eq "$(systemctl show notify-reload-no-handler.service -P Result)" "protocol"
-# Verify error was logged about missing signal handler
+# Verify error was logged about missing signal handler. Note that we match on the message text (which
+# includes the unit name as prefix) rather than with -u: if PID 1's journal socket is congested (which might
+# happen as we run with debug logging), it falls back to logging to /dev/kmsg, in which case the
+# structured UNIT= field is lost, and hence a -u match would not find the message.
 journalctl --sync
-journalctl -u notify-reload-no-handler.service --cursor-file=/tmp/reload-nohandler-cursor \
-    --grep "lacks handler for reload signal" >/dev/null
+journalctl SYSLOG_IDENTIFIER=systemd --cursor-file=/tmp/reload-nohandler-cursor \
+    --grep "^notify-reload-no-handler\.service: .*lacks handler for reload signal" >/dev/null
 systemctl reset-failed notify-reload-no-handler.service
 rm -f /tmp/reload-nohandler-in /tmp/reload-nohandler-out
 
@@ -230,10 +316,10 @@ journalctl -q -n 0 --cursor-file=/tmp/reload-toggle-cursor
 systemctl reload --no-block notify-reload-toggle-handler.service
 # The service will die from SIGHUP since the handler is removed
 timeout 10 bash -c 'while systemctl is-active --quiet notify-reload-toggle-handler.service; do sleep .5; done'
-# Verify warning was logged
+# Verify warning was logged (see above regarding why we don't use -u here)
 journalctl --sync
-journalctl -u notify-reload-toggle-handler.service --cursor-file=/tmp/reload-toggle-cursor \
-    --grep "lacks handler for reload signal" >/dev/null
+journalctl SYSLOG_IDENTIFIER=systemd --cursor-file=/tmp/reload-toggle-cursor \
+    --grep "^notify-reload-toggle-handler\.service: .*lacks handler for reload signal" >/dev/null
 rm -f /tmp/reload-toggle-in /tmp/reload-toggle-out
 
 # Test 4: Well-behaved service with handler should work correctly

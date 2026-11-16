@@ -483,7 +483,7 @@ static int routing_policy_rule_acquire_priority(Manager *manager, RoutingPolicyR
                         continue;
                 if (tmp->priority == 0 || tmp->priority > 32765)
                         continue;
-                r = set_ensure_put(&priorities, NULL, UINT32_TO_PTR(tmp->priority));
+                r = set_ensure_put(&priorities, /* hash_ops= */ NULL, UINT32_TO_PTR(tmp->priority));
                 if (r < 0)
                         return r;
         }
@@ -498,7 +498,7 @@ static int routing_policy_rule_acquire_priority(Manager *manager, RoutingPolicyR
                         continue;
                 if (tmp->priority == 0 || tmp->priority > 32765)
                         continue;
-                r = set_ensure_put(&priorities, NULL, UINT32_TO_PTR(tmp->priority));
+                r = set_ensure_put(&priorities, /* hash_ops= */ NULL, UINT32_TO_PTR(tmp->priority));
                 if (r < 0)
                         return r;
         }
@@ -511,7 +511,7 @@ static int routing_policy_rule_acquire_priority(Manager *manager, RoutingPolicyR
                                 continue;
                         if (tmp->priority == 0 || tmp->priority > 32765)
                                 continue;
-                        r = set_ensure_put(&priorities, NULL, UINT32_TO_PTR(tmp->priority));
+                        r = set_ensure_put(&priorities, /* hash_ops= */ NULL, UINT32_TO_PTR(tmp->priority));
                         if (r < 0)
                                 return r;
                 }
@@ -564,7 +564,7 @@ static void routing_policy_rule_forget(Manager *manager, RoutingPolicyRule *rule
                 return;
 
         routing_policy_rule_enter_removed(rule);
-        log_routing_policy_rule_debug(rule, msg, NULL, manager);
+        log_routing_policy_rule_debug(rule, msg, /* link= */ NULL, manager);
         routing_policy_rule_detach(rule);
 }
 
@@ -749,7 +749,7 @@ static int routing_policy_rule_remove(RoutingPolicyRule *rule, Manager *manager)
         if (FLAGS_SET(rule->flags, FIB_RULE_PERMANENT))
                 return 0;
 
-        log_routing_policy_rule_debug(rule, "Removing", NULL, manager);
+        log_routing_policy_rule_debug(rule, "Removing", /* link= */ NULL, manager);
 
         r = sd_rtnl_message_new_routing_policy_rule(manager->rtnl, &m, RTM_DELRULE, rule->family);
         if (r < 0)
@@ -960,7 +960,7 @@ static int link_request_routing_policy_rule(Link *link, const RoutingPolicyRule 
         assert(rule->family == AF_UNSPEC || rule->family == family);
         assert(IN_SET(family, AF_INET, AF_INET6));
 
-        if (routing_policy_rule_get_request(link->manager, rule, family, NULL) >= 0)
+        if (routing_policy_rule_get_request(link->manager, rule, family, /* ret= */ NULL) >= 0)
                 return 0; /* already requested, skipping. */
 
         r = routing_policy_rule_dup(rule, family, &tmp);
@@ -1245,7 +1245,7 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, Man
                 if (rule)
                         routing_policy_rule_forget(m, rule, "Forgetting removed");
                 else
-                        log_routing_policy_rule_debug(tmp, "Kernel removed unknown", NULL, m);
+                        log_routing_policy_rule_debug(tmp, "Kernel removed unknown", /* link= */ NULL, m);
                 return 0;
         }
 
@@ -1256,7 +1256,7 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, Man
         if (!rule) {
                 if (!req && !m->manage_foreign_rules) {
                         routing_policy_rule_enter_configured(tmp);
-                        log_routing_policy_rule_debug(tmp, "Ignoring received", NULL, m);
+                        log_routing_policy_rule_debug(tmp, "Ignoring received", /* link= */ NULL, m);
                         return 0;
                 }
 
@@ -1291,7 +1291,7 @@ int manager_rtnl_process_rule(sd_netlink *rtnl, sd_netlink_message *message, Man
         if (req)
                 routing_policy_rule_enter_configured(req->userdata);
 
-        log_routing_policy_rule_debug(rule, is_new ? "Remembering" : "Received remembered", NULL, m);
+        log_routing_policy_rule_debug(rule, is_new ? "Remembering" : "Received remembered", /* link= */ NULL, m);
         return 1;
 }
 
@@ -1351,10 +1351,8 @@ static int config_parse_routing_policy_rule_priority(
         }
 
         r = safe_atou32(rvalue, &rule->priority);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse RPDB rule priority, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         rule->priority_set = true;
         return 1;
@@ -1380,10 +1378,8 @@ static int config_parse_routing_policy_rule_goto(
         assert(rvalue);
 
         r = safe_atou32(rvalue, &priority);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse %s=%s, ignoring assignment: %m", lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         if (priority <= 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid goto target priority, ignoring assignment.");
                 return 0;
@@ -1441,10 +1437,8 @@ static int config_parse_routing_policy_rule_fwmark(
         assert(rvalue);
 
         r = parse_fwmark_fwmask(rvalue, &rule->fwmark, &rule->fwmask);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse RPDB rule firewall mark or mask, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         return 1;
 }
@@ -1467,10 +1461,8 @@ static int config_parse_routing_policy_rule_port_range(
         assert(rvalue);
 
         r = parse_ip_port_range(rvalue, &p->start, &p->end, /* allow_zero= */ false);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse routing policy rule port range '%s'", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         return 1;
 }
@@ -1492,7 +1484,7 @@ static int config_parse_routing_policy_rule_uid_range(
 
         assert(rvalue);
 
-        if (get_user_creds(rvalue, /* flags= */ 0, NULL, &p->start, NULL, NULL, NULL) >= 0) {
+        if (get_user_creds(rvalue, /* flags= */ 0, /* ret_username= */ NULL, &p->start, /* ret_gid= */ NULL, /* ret_home= */ NULL, /* ret_shell= */ NULL) >= 0) {
                 p->end = p->start;
                 return 1;
         }
@@ -1530,11 +1522,8 @@ static int config_parse_routing_policy_rule_suppress(
         }
 
         r = safe_atoi32(rvalue, &val);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=%s, ignoring assignment: %m", lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         if (val < 0 || val > ltype) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Invalid value specified to %s=, ignoring assignment: %s", lvalue, rvalue);

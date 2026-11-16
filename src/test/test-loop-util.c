@@ -13,6 +13,7 @@
 #include "capability-util.h"
 #include "dissect-image.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "gpt.h"
 #include "loop-util.h"
 #include "mkfs-util.h"
@@ -69,9 +70,9 @@ static void* thread_func(void *ptr) {
 
                 log_notice("> Thread iteration #%u.", i);
 
-                ASSERT_OK(mkdtemp_malloc(NULL, &mounted));
+                ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &mounted));
 
-                ASSERT_OK(loop_device_make(fd, O_RDONLY, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
+                ASSERT_OK(loop_device_make(fd, O_RDONLY, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
                 ASSERT_NOT_NULL(loop->dev);
                 ASSERT_NOT_NULL(loop->backing_file);
 
@@ -173,7 +174,7 @@ static int intro(void) {
         if (!have_root_gpt_type())
                 return log_tests_skipped("No root partition GPT defined for this architecture");
 
-        r = find_executable("sfdisk", NULL);
+        r = find_executable("sfdisk", /* ret_filename= */ NULL);
         if (r < 0)
                 return log_tests_skipped_errno(r, "Could not find sfdisk command");
 
@@ -193,7 +194,8 @@ TEST(loop_block) {
         _cleanup_close_ int fd = -EBADF;
 
         ASSERT_OK(tempfn_random_child("/var/tmp", "sfdisk", &p));
-        fd = ASSERT_OK_ERRNO(open(p, O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC|O_NOFOLLOW, 0666));
+        fd = ASSERT_OK(xopenat_full(AT_FDCWD, p, O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW,
+                                    /* xopen_flags= */ 0, 0666));
         ASSERT_OK_ERRNO(ftruncate(fd, 256*1024*1024));
 
         cmd = ASSERT_NOT_NULL(strjoin("sfdisk ", p));
@@ -224,7 +226,7 @@ TEST(loop_block) {
                                   /* verity= */ NULL,
                                   /* mount_options= */ NULL,
                                   /* image_policy= */ NULL,
-                                  /* image_filter= */ NULL,
+                                  /* filter= */ NULL,
                                   /* flags= */ 0,
                                   &dissected));
         verify_dissected_image(dissected);
@@ -241,7 +243,7 @@ TEST(loop_block) {
                 return;
         }
 
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_EX, &loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, LO_FLAGS_PARTSCAN, LOCK_EX, &loop));
 
 #if HAVE_BLKID
         ASSERT_OK(dissect_loop_device(
@@ -262,16 +264,56 @@ TEST(loop_block) {
         }
 
         ASSERT_OK(sd_id128_randomize(&id));
-        ASSERT_OK(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL));
+        ASSERT_OK(
+                        make_filesystem(dissected->partitions[PARTITION_ESP].node,
+                                        "vfat",
+                                        "EFI",
+                                        /* root= */ NULL,
+                                        id,
+                                        MKFS_DISCARD,
+                                        /* sector_size= */ 0,
+                                        /* compression= */ NULL,
+                                        /* compression_level= */ NULL,
+                                        /* extra_mkfs_args= */ NULL));
 
         ASSERT_OK(sd_id128_randomize(&id));
-        ASSERT_OK(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL));
+        ASSERT_OK(
+                        make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node,
+                                        "vfat",
+                                        "xbootldr",
+                                        /* root= */ NULL,
+                                        id,
+                                        MKFS_DISCARD,
+                                        /* sector_size= */ 0,
+                                        /* compression= */ NULL,
+                                        /* compression_level= */ NULL,
+                                        /* extra_mkfs_args= */ NULL));
 
         ASSERT_OK(sd_id128_randomize(&id));
-        ASSERT_OK(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL));
+        ASSERT_OK(
+                        make_filesystem(dissected->partitions[PARTITION_ROOT].node,
+                                        "ext4",
+                                        "root",
+                                        /* root= */ NULL,
+                                        id,
+                                        MKFS_DISCARD,
+                                        /* sector_size= */ 0,
+                                        /* compression= */ NULL,
+                                        /* compression_level= */ NULL,
+                                        /* extra_mkfs_args= */ NULL));
 
         ASSERT_OK(sd_id128_randomize(&id));
-        ASSERT_OK(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL));
+        ASSERT_OK(
+                        make_filesystem(dissected->partitions[PARTITION_HOME].node,
+                                        "ext4",
+                                        "home",
+                                        /* root= */ NULL,
+                                        id,
+                                        MKFS_DISCARD,
+                                        /* sector_size= */ 0,
+                                        /* compression= */ NULL,
+                                        /* compression_level= */ NULL,
+                                        /* extra_mkfs_args= */ NULL));
 
         dissected = dissected_image_unref(dissected);
 
@@ -306,7 +348,7 @@ TEST(loop_block) {
                                   &dissected));
         verify_dissected_image_harder(dissected);
 
-        ASSERT_OK(mkdtemp_malloc(NULL, &mounted));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &mounted));
 
         /* We are particularly correct here, and now downgrade LOCK → LOCK_SH. That's because we are done
          * with formatting the file systems, so we don't need the exclusive lock anymore. From now on a
@@ -328,14 +370,14 @@ TEST(loop_block) {
                                   /* uid_shift= */ UID_INVALID,
                                   /* uid_range= */ UID_INVALID,
                                   /* userns_fd= */ -EBADF,
-                                  0));
+                                  /* flags= */ 0));
 
         /* Now we mounted everything, the partitions are pinned. Now it's fine to release the lock
          * fully. This means udev could now issue BLKRRPART again, but that's OK given this will fail because
          * we now mounted the device. */
         ASSERT_OK(loop_device_flock(loop, LOCK_UN));
 
-        ASSERT_OK(umount_recursive(mounted, 0));
+        ASSERT_OK(umount_recursive(mounted, /* flags= */ 0));
         loop = loop_device_unref(loop);
 
         log_notice("Threads are being started now");
@@ -376,7 +418,8 @@ static int make_test_image(int *ret_fd) {
         _cleanup_pclose_ FILE *sfdisk = NULL;
 
         ASSERT_OK(tempfn_random_child("/var/tmp", "sfdisk", &p));
-        int fd = ASSERT_OK_ERRNO(open(p, O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC|O_NOFOLLOW, 0666));
+        int fd = ASSERT_OK(xopenat_full(AT_FDCWD, p, O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW,
+                                        /* xopen_flags= */ 0, 0666));
         ASSERT_OK_ERRNO(ftruncate(fd, 256*1024*1024));
 
         cmd = ASSERT_NOT_NULL(strjoin("sfdisk ", p));
@@ -411,24 +454,45 @@ TEST(sector_size_regular_file) {
         ASSERT_OK(make_test_image(&fd));
 
         /* sector_size=0 on regular file: should default to 512 */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, 0, LOCK_EX, &loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, /* loop_flags= */ 0, LOCK_EX, &loop));
         ASSERT_EQ(loop->sector_size, 512u);
         loop = loop_device_unref(loop);
 
         /* sector_size=UINT32_MAX on regular file with GPT: should probe and find 512 */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, UINT32_MAX, 0, LOCK_EX, &loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, UINT32_MAX, /* loop_flags= */ 0, LOCK_EX, &loop));
         ASSERT_EQ(loop->sector_size, 512u);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size=512 on regular file */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 512, 0, LOCK_EX, &loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 512, /* loop_flags= */ 0, LOCK_EX, &loop));
         ASSERT_EQ(loop->sector_size, 512u);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size=4096 on regular file */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 4096, 0, LOCK_EX, &loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 4096, /* loop_flags= */ 0, LOCK_EX, &loop));
         ASSERT_EQ(loop->sector_size, 4096u);
         loop = loop_device_unref(loop);
+}
+
+TEST(make_by_path_at_fd) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop = NULL;
+        _cleanup_close_ int fd = -EBADF;
+
+        if (have_effective_cap(CAP_SYS_ADMIN) <= 0) {
+                log_tests_skipped("not running privileged");
+                return;
+        }
+
+        if (detect_container() != 0 || running_in_chroot() != 0) {
+                log_tests_skipped("Test not supported in a container/chroot");
+                return;
+        }
+
+        ASSERT_OK(make_test_image(&fd));
+
+        /* A NULL path attaches the image the fd refers to, as portable and mstack do */
+        ASSERT_OK(loop_device_make_by_path_at(fd, /* path= */ NULL, O_RDONLY, /* sector_size= */ UINT32_MAX,
+                                              /* loop_flags= */ 0, LOCK_SH, &loop));
 }
 
 TEST(sector_size_block_device) {
@@ -448,39 +512,39 @@ TEST(sector_size_block_device) {
         ASSERT_OK(make_test_image(&fd));
 
         /* Create a loop device to use as our block device */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_EX, &block_loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, LO_FLAGS_PARTSCAN, LOCK_EX, &block_loop));
         ASSERT_FALSE(LOOP_DEVICE_IS_FOREIGN(block_loop));
         ASSERT_OK(loop_device_flock(block_loop, LOCK_SH));
 
         uint32_t device_ssz = block_loop->sector_size;
 
         /* sector_size=0 on block device: should use device directly */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 0, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, device_ssz);
         loop = loop_device_unref(loop);
 
         /* sector_size=UINT32_MAX on block device: should probe, match device, use directly */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, UINT32_MAX, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, UINT32_MAX, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, device_ssz);
         loop = loop_device_unref(loop);
 
         /* sector_size=UINT32_MAX with LO_FLAGS_PARTSCAN: should probe, match, use directly */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, UINT32_MAX, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, UINT32_MAX, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, device_ssz);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size matching device: should use device directly */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, device_ssz, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, device_ssz, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, device_ssz);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size=4096 (differs from device 512): should create a real loop device */
         if (device_ssz != 4096) {
-                ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 4096, 0, LOCK_SH, &loop));
+                ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 4096, /* loop_flags= */ 0, LOCK_SH, &loop));
                 ASSERT_TRUE(loop->created);
                 ASSERT_EQ(loop->sector_size, 4096u);
                 loop = loop_device_unref(loop);
@@ -507,32 +571,32 @@ TEST(sector_size_mismatch) {
         ASSERT_OK(make_test_image(&fd));
 
         /* Create a loop device with 4096-byte sector size — GPT was written at 512 */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 4096, 0, LOCK_EX, &block_loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 4096, /* loop_flags= */ 0, LOCK_EX, &block_loop));
         ASSERT_TRUE(block_loop->created);
         ASSERT_EQ(block_loop->sector_size, 4096u);
         ASSERT_OK(loop_device_flock(block_loop, LOCK_SH));
 
         /* sector_size=0: no preference, should use block device directly despite GPT mismatch */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 0, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, 4096u);
         loop = loop_device_unref(loop);
 
         /* sector_size=UINT32_MAX: should probe GPT at 512, detect mismatch with device 4096,
          * and create a new loop device with 512-byte sectors */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, UINT32_MAX, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, UINT32_MAX, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_TRUE(loop->created);
         ASSERT_EQ(loop->sector_size, 512u);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size=512: differs from device 4096, should create a new loop device */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 512, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 512, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_TRUE(loop->created);
         ASSERT_EQ(loop->sector_size, 512u);
         loop = loop_device_unref(loop);
 
         /* Explicit sector_size=4096: matches device, should use directly */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 4096, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, 4096, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         ASSERT_EQ(loop->sector_size, 4096u);
         loop = loop_device_unref(loop);
@@ -555,18 +619,18 @@ TEST(partscan_required) {
         ASSERT_OK(make_test_image(&fd));
 
         /* Set up a backing loop device without LO_FLAGS_PARTSCAN. */
-        ASSERT_OK(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, 0, LOCK_EX, &block_loop));
+        ASSERT_OK(loop_device_make(fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, /* loop_flags= */ 0, LOCK_EX, &block_loop));
         ASSERT_TRUE(block_loop->created);
         ASSERT_OK(loop_device_flock(block_loop, LOCK_SH));
 
         /* Without LO_FLAGS_PARTSCAN: shortcut should be taken (reuse existing loop). */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 0, 0, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, /* loop_flags= */ 0, LOCK_SH, &loop));
         ASSERT_FALSE(loop->created);
         loop = loop_device_unref(loop);
 
         /* With LO_FLAGS_PARTSCAN: backing loop has partscan disabled, so a new loop device with
          * partscan must be created. */
-        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
+        ASSERT_OK(loop_device_make(block_loop->fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
         ASSERT_TRUE(loop->created);
         loop = loop_device_unref(loop);
 }
@@ -594,7 +658,8 @@ TEST(partscan_not_needed_without_partition_table) {
          * to expose a nested partition table though, so any device without one — here simply an empty device —
          * must take the shortcut. */
         ASSERT_OK(tempfn_random_child("/var/tmp", "loop-util", &p));
-        fd = ASSERT_OK_ERRNO(open(p, O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC|O_NOFOLLOW, 0666));
+        fd = ASSERT_OK(xopenat_full(AT_FDCWD, p, O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW,
+                                    /* xopen_flags= */ 0, 0666));
         ASSERT_OK_ERRNO(ftruncate(fd, 256*1024*1024));
         (void) unlink(p);
 
@@ -641,7 +706,8 @@ static void test_nested_partition_table_one(const char *nested_table) {
 
         /* Build an image with a single root partition spanning the whole disk. */
         ASSERT_OK(tempfn_random_child("/var/tmp", "sfdisk", &p));
-        fd = ASSERT_OK_ERRNO(open(p, O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC|O_NOFOLLOW, 0666));
+        fd = ASSERT_OK(xopenat_full(AT_FDCWD, p, O_CREAT|O_EXCL|O_RDWR|O_NOFOLLOW,
+                                    /* xopen_flags= */ 0, 0666));
         ASSERT_OK_ERRNO(ftruncate(fd, 256*1024*1024));
 
         cmd = ASSERT_NOT_NULL(strjoin("sfdisk ", p));
@@ -686,7 +752,7 @@ static void test_nested_partition_table_one(const char *nested_table) {
         /* The partition has partition scanning disabled but now carries a partition table, so the shortcut
          * must be refused and a real loop device with partition scanning allocated (even without
          * LOOP_DEVICE_MAY_POPULATE_PARTITION_TABLE, since there genuinely is a table to scan). */
-        part_fd = ASSERT_OK_ERRNO(open(node, O_RDWR|O_CLOEXEC|O_NOCTTY));
+        part_fd = ASSERT_OK(xopenat(AT_FDCWD, node, O_RDWR|O_NOCTTY));
         ASSERT_OK(loop_device_make(part_fd, O_RDWR, /* offset= */ 0, UINT64_MAX, /* sector_size= */ 0, LO_FLAGS_PARTSCAN, LOCK_SH, &loop));
         ASSERT_TRUE(loop->created);
 #else

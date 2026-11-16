@@ -14,6 +14,17 @@ custom_target(
         install : true,
         install_dir : zshcompletiondir)
 
+if want_ukify
+        custom_target(
+                'ukify-zsh-completion',
+                input : ukify,
+                output : '_ukify',
+                command : [python, '@INPUT@', 'completion', 'zsh'],
+                capture : true,
+                install : true,
+                install_dir : zshcompletiondir)
+endif
+
 foreach item : [
         ['_bootctl',                  ''],
         ['_busctl',                   ''],
@@ -26,6 +37,7 @@ foreach item : [
         ['_machinectl',               'ENABLE_MACHINED'],
         ['_networkctl',               'ENABLE_NETWORKD'],
         ['_oomctl',                   'ENABLE_OOMD'],
+        ['_ptyctl',                   ''],
         ['_resolvectl',               'ENABLE_RESOLVE'],
         ['_run0',                     ''],
         ['_sd_bus_address',           ''],
@@ -33,20 +45,26 @@ foreach item : [
         ['_sd_machines',              'ENABLE_MACHINED'],
         ['_sd_outputmodes',           ''],
         ['_sd_unit_files',            ''],
-        ['_storagectl',               ''],
+        ['_storagectl',               'ENABLE_STORAGE'],
         ['_systemd',                  ''],
         ['_systemd-analyze',          ''],
         ['_systemd-cryptenroll',      'HAVE_LIBCRYPTSETUP'],
         ['_systemd-delta',            ''],
+        ['_systemd-dissect',          'HAVE_BLKID'],
         ['_systemd-hwdb',             'ENABLE_HWDB'],
         ['_systemd-id128',            ''],
         ['_systemd-inhibit',          'ENABLE_LOGIND'],
+        ['_systemd-manifest',         ''],
         ['_systemd-nspawn',           ''],
         ['_systemd-path',             ''],
+        ['_systemd-pty-forward',      ''],
+        ['_systemd-repart',           'ENABLE_REPART'],
         ['_systemd-run',              ''],
         ['_systemd-sysinstall',       'ENABLE_SYSINSTALL'],
         ['_systemd-sysupdate',        'ENABLE_SYSUPDATE'],
         ['_systemd-tmpfiles',         'ENABLE_TMPFILES'],
+        ['_systemd-vmspawn',          'ENABLE_VMSPAWN'],
+        ['_systemd-vpick',            ''],
         ['_timedatectl',              'ENABLE_TIMEDATED'],
         ['_udevadm',                  ''],
         ['_updatectl',                'ENABLE_SYSUPDATED'],

@@ -182,7 +182,7 @@ static int dhcp4_find_gateway_for_destination(
         if (r < 0)
                 return r;
         if (r > 0) {
-                r = sd_dhcp_lease_get_prefix(link->dhcp_lease, NULL, &max_prefixlen);
+                r = sd_dhcp_lease_get_prefix(link->dhcp_lease, /* ret_prefix= */ NULL, &max_prefixlen);
                 if (r < 0)
                         return r;
 
@@ -514,7 +514,9 @@ static int dhcp4_request_route_auto(
                 route->nexthop.gw = IN_ADDR_NULL;
                 route->prefsrc = IN_ADDR_NULL;
 
-        } else if (in4_addr_equal(&route->dst.in, &address)) {
+        } else if (route->dst_prefixlen == 32 && in4_addr_equal(&route->dst.in, &address)) {
+                /* The destination is masked, hence a larger network also compares equal when the acquired
+                 * address has no host bits set, e.g. the lower address of a /31. See RFC 3021. */
                 if (in4_addr_is_set(gw))
                         log_link_debug(link, "DHCP: requested route destination "IPV4_ADDRESS_FMT_STR"/%u is equivalent to the acquired address, "
                                        "ignoring gateway address "IPV4_ADDRESS_FMT_STR,
@@ -621,7 +623,7 @@ static int dhcp4_request_default_gateway(Link *link) {
         /* According to RFC 3442: If the DHCP server returns both a Classless Static Routes option and
          * a Router option, the DHCP client MUST ignore the Router option. */
         if (link->network->dhcp_use_routes &&
-            dhcp4_get_classless_static_or_static_routes(link, NULL, NULL) > 0)
+            dhcp4_get_classless_static_or_static_routes(link, /* ret_routes= */ NULL, /* ret_num= */ NULL) > 0)
                 return 0;
 
         r = sd_dhcp_lease_get_address(link->dhcp_lease, &address);
@@ -687,7 +689,7 @@ static int dhcp4_request_semi_static_routes(Link *link) {
                         continue;
                 }
 
-                r = route_dup(rt, NULL, &route);
+                r = route_dup(rt, /* nh= */ NULL, &route);
                 if (r < 0)
                         return r;
 
@@ -865,7 +867,7 @@ static int dhcp_reset_hostname(Link *link) {
                 return 0;
 
         /* If a hostname was set due to the lease, then unset it now. */
-        r = manager_set_hostname(link->manager, NULL);
+        r = manager_set_hostname(link->manager, /* hostname= */ NULL);
         if (r < 0)
                 return log_link_error_errno(link, r, "DHCP error: Failed to reset transient hostname: %m");
 
@@ -898,11 +900,11 @@ int dhcp4_lease_lost(Link *link) {
         if (r < 0)
                 return r;
 
-        r = link_request_static_nexthops(link, true);
+        r = link_request_static_nexthops(link, /* only_ipv4= */ true);
         if (r < 0)
                 return r;
 
-        return link_request_static_routes(link, true);
+        return link_request_static_routes(link, /* only_ipv4= */ true);
 }
 
 static int dhcp4_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Request *req, Link *link, Address *address) {
@@ -939,7 +941,7 @@ static int dhcp4_request_address(Link *link, bool announce) {
         if (r < 0)
                 return log_link_warning_errno(link, r, "DHCP error: no address: %m");
 
-        r = sd_dhcp_lease_get_prefix(link->dhcp_lease, NULL, &prefixlen);
+        r = sd_dhcp_lease_get_prefix(link->dhcp_lease, /* ret_prefix= */ NULL, &prefixlen);
         if (r < 0)
                 return log_link_warning_errno(link, r, "DHCP error: no netmask: %m");
 
@@ -1015,7 +1017,7 @@ static int dhcp4_request_address(Link *link, bool announce) {
                 address_unmark(existing);
 
         r = link_request_address(link, addr, &link->dhcp4_messages,
-                                 dhcp4_address_handler, NULL);
+                                 dhcp4_address_handler, /* ret= */ NULL);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to request DHCPv4 address: %m");
 
@@ -1072,7 +1074,7 @@ static int dhcp_lease_renew(sd_dhcp_client *client, Link *link) {
                         dhcp4_pd_prefix_lost(link);
         }
 
-        return dhcp4_request_address_and_routes(link, false);
+        return dhcp4_request_address_and_routes(link, /* announce= */ false);
 }
 
 static int dhcp_lease_acquired(sd_dhcp_client *client, Link *link) {
@@ -1144,7 +1146,7 @@ static int dhcp_lease_acquired(sd_dhcp_client *client, Link *link) {
                         return log_link_warning_errno(link, r, "Failed to process 6rd option: %m");
         }
 
-        return dhcp4_request_address_and_routes(link, true);
+        return dhcp4_request_address_and_routes(link, /* announce= */ true);
 }
 
 static int dhcp_lease_ip_change(sd_dhcp_client *client, Link *link) {
@@ -1310,10 +1312,12 @@ static int dhcp4_set_hostname(Link *link) {
         }
 
         r = sd_dhcp_client_set_hostname(link->dhcp_client, hn);
-        if (r == -EINVAL && hostname)
-                /* Ignore error when the machine's hostname is not suitable to send in DHCP packet. */
+        if (r == -EINVAL && hostname) {
+                /* Ignore error when the machine's hostname is not suitable to send in DHCP packet, but
+                 * do not keep sending the previous hostname. */
                 log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set hostname from kernel hostname, ignoring: %m");
-        else if (r < 0)
+                (void) sd_dhcp_client_set_hostname(link->dhcp_client, /* hostname= */ NULL);
+        } else if (r < 0)
                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to set hostname: %m");
 
         return 0;
@@ -1358,7 +1362,7 @@ static int dhcp4_set_client_identifier(Link *link) {
                                 r = sd_dhcp_client_set_iaid_duid_raw(link->dhcp_client,
                                                                      link->network->dhcp_iaid_set,
                                                                      link->network->dhcp_iaid,
-                                                                     duid->type, NULL, 0);
+                                                                     duid->type, /* duid_data= */ NULL, /* duid_data_len= */ 0);
                         }
                 else
                         r = sd_dhcp_client_set_iaid_duid_raw(link->dhcp_client,
@@ -1509,7 +1513,7 @@ static int dhcp4_configure(Link *link) {
                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to %s sending release message on stop: %m",
                                             enable_disable(link->network->dhcp_send_release));
 
-        r = sd_dhcp_client_attach_event(link->dhcp_client, link->manager->event, 0);
+        r = sd_dhcp_client_attach_event(link->dhcp_client, link->manager->event, /* priority= */ 0);
         if (r < 0)
                 return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to attach event to DHCPv4 client: %m");
 
@@ -1731,6 +1735,60 @@ int dhcp4_update_mac(Link *link) {
         return 0;
 }
 
+static bool dhcp4_hostname_is_from_lease(Link *link) {
+        _cleanup_free_ char *hostname = NULL;
+        const char *dhcpname;
+
+        assert(link);
+        assert(link->manager);
+
+        if (!link->dhcp_lease)
+                return false;
+
+        if (sd_dhcp_lease_get_hostname(link->dhcp_lease, &dhcpname) < 0)
+                return false;
+
+        /* An overlong hostname in the lease is shortened when it is set as the system hostname. */
+        if (shorten_overlong(dhcpname, &hostname) < 0)
+                return false;
+
+        return streq_ptr(link->manager->kernel_hostname, hostname);
+}
+
+int dhcp4_update_hostname(Link *link) {
+        int r;
+
+        assert(link);
+
+        if (!link->dhcp_client || !link->network)
+                return 0;
+
+        /* No hostname is sent when disabled or anonymized, and an explicitly configured one does not
+         * follow the system hostname. */
+        if (!link->network->dhcp_send_hostname ||
+            !link->network->dhcp_send_hostname_updates ||
+            link->network->dhcp_anonymize ||
+            link->network->dhcp_hostname)
+                return 0;
+
+        r = dhcp4_set_hostname(link);
+        if (r < 0)
+                return r;
+
+        /* If the hostname was set from the current lease, the server already knows it. The new hostname
+         * will be sent on the next renewal. */
+        if (dhcp4_hostname_is_from_lease(link))
+                return 0;
+
+        /* Send the new hostname to the server now, rather than on the next renewal. If the client is not
+         * bound yet, this does nothing, and the new hostname will be sent in the next message anyway. */
+        r = sd_dhcp_client_send_renew(link->dhcp_client);
+        if (r < 0)
+                return log_link_debug_errno(link, r, "DHCPv4 CLIENT: Failed to renew lease after hostname change: %m");
+
+        return 0;
+}
+
 int dhcp4_update_ipv6_connectivity(Link *link) {
         int r;
 
@@ -1865,7 +1923,7 @@ int link_request_dhcp4_client(Link *link) {
         if (link->dhcp_client)
                 return 0;
 
-        r = link_queue_request(link, REQUEST_TYPE_DHCP4_CLIENT, dhcp4_process_request, NULL);
+        r = link_queue_request(link, REQUEST_TYPE_DHCP4_CLIENT, dhcp4_process_request, /* ret= */ NULL);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Failed to request configuring of the DHCPv4 client: %m");
 
@@ -1949,11 +2007,8 @@ int config_parse_dhcp_max_attempts(
         }
 
         r = safe_atou64(rvalue, &a);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse DHCP maximum attempts, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         if (a == 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
@@ -1993,8 +2048,7 @@ int config_parse_dhcp_ip_service_type(
         else if (streq(rvalue, "CS6"))
                 *tos = IPTOS_CLASS_CS6;
         else
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Failed to parse %s=, ignoring assignment: %s", lvalue, rvalue);
+                log_syntax_parse_error(unit, filename, line, 0, lvalue, rvalue);
 
         return 0;
 }
@@ -2022,11 +2076,8 @@ int config_parse_dhcp_socket_priority(
         }
 
         r = safe_atoi(rvalue, &a);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse socket priority, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         if (a < 0 || a > TC_PRIO_MAX) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Invalid socket priority, must be in 0…%i, ignoring: %i", TC_PRIO_MAX, a);

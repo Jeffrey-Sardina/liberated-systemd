@@ -26,7 +26,7 @@ int manager_parse_server_string(Manager *m, ServerType type, const char *string)
                 _cleanup_free_ char *word = NULL;
                 bool found = false;
 
-                r = extract_first_word(&string, &word, NULL, 0);
+                r = extract_first_word(&string, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse timesyncd server syntax \"%s\": %m", string);
                 if (r == 0)
@@ -50,7 +50,7 @@ int manager_parse_server_string(Manager *m, ServerType type, const char *string)
                 if (found)
                         continue;
 
-                r = server_name_new(m, NULL, type, word);
+                r = server_name_new(m, /* ret= */ NULL, type, word);
                 if (r < 0)
                         return r;
         }
@@ -95,11 +95,8 @@ int config_parse_servers(
         }
 
         r = manager_parse_server_string(m, ltype, rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse NTP server string '%s', ignoring: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         return 0;
 }

@@ -48,7 +48,9 @@
 #include "hostname-util.h"
 #include "id128-util.h"
 #include "initrd-cpio.h"
+#include "io-util.h"
 #include "kernel-image.h"
+#include "lock-util.h"
 #include "log.h"
 #include "machine-bind-user.h"
 #include "machine-credential.h"
@@ -68,6 +70,7 @@
 #include "polkit-agent.h"
 #include "pretty-print.h"
 #include "process-util.h"
+#include "ptybroker-client.h"
 #include "ptyfwd.h"
 #include "random-util.h"
 #include "rm-rf.h"
@@ -92,6 +95,7 @@
 #include "utf8.h"
 #include "verbs.h"
 #include "vmspawn-bind-volume.h"
+#include "vmspawn-memory.h"
 #include "vmspawn-mount.h"
 #include "vmspawn-qemu-config.h"
 #include "vmspawn-qmp.h"
@@ -169,6 +173,7 @@ static RuntimeMountContext arg_runtime_mounts = {};
 static char *arg_firmware = NULL;
 static Firmware arg_firmware_type = _FIRMWARE_INVALID;
 static bool arg_firmware_describe = false;
+static bool arg_firmware_list = false;
 static Set *arg_firmware_features_include = NULL;
 static Set *arg_firmware_features_exclude = NULL;
 static ConfidentialComputing arg_confidential_computing = COCO_NO;
@@ -289,6 +294,13 @@ static int parse_ram(const char *s) {
                 arg_ram_slots = 0;
 
         return 0;
+}
+
+/* Only valid once all options are parsed, --image-disk-type= may come after --extra-drive=. */
+static DiskType extra_drive_disk_type(const ExtraDrive *d) {
+        assert(d);
+
+        return d->disk_type >= 0 ? d->disk_type : arg_image_disk_type;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -523,32 +535,26 @@ static int parse_argv(int argc, char *argv[]) {
                         if (isempty(opts.arg) || streq(opts.arg, "auto")) {
                                 arg_firmware = mfree(arg_firmware);
                                 arg_firmware_type = _FIRMWARE_INVALID;
-                                arg_firmware_describe = false;
+                                arg_firmware_describe = arg_firmware_list = false;
                                 break;
                         }
 
+                        /* "list" and "describe" are handled after argument parsing so that the options
+                         * that narrow down the firmware search are taken into account. Both only look
+                         * for UEFI firmware. */
                         if (streq(opts.arg, "list")) {
-                                _cleanup_strv_free_ char **l = NULL;
-
-                                r = list_ovmf_config(&l);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to list firmwares: %m");
-
-                                bool nl = false;
-                                fputstrv(stdout, l, "\n", &nl);
-                                if (nl)
-                                        putchar('\n');
-
-                                return 0;
+                                arg_firmware = mfree(arg_firmware);
+                                arg_firmware_type = FIRMWARE_UEFI;
+                                arg_firmware_describe = false;
+                                arg_firmware_list = true;
+                                break;
                         }
 
                         if (streq(opts.arg, "describe")) {
-                                /* Handled after argument parsing so that --firmware-features= is
-                                 * taken into account. */
                                 arg_firmware = mfree(arg_firmware);
-                                /* We only look for UEFI firmware when "describe" is specified. */
                                 arg_firmware_type = FIRMWARE_UEFI;
                                 arg_firmware_describe = true;
+                                arg_firmware_list = false;
                                 break;
                         }
 
@@ -556,7 +562,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (f >= 0) {
                                 arg_firmware = mfree(arg_firmware);
                                 arg_firmware_type = f;
-                                arg_firmware_describe = false;
+                                arg_firmware_describe = arg_firmware_list = false;
                                 break;
                         }
 
@@ -570,7 +576,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
 
                         arg_firmware_type = FIRMWARE_UEFI;
-                        arg_firmware_describe = false;
+                        arg_firmware_describe = arg_firmware_list = false;
                         break;
                 }
 
@@ -673,7 +679,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (isempty(opts.arg))
                                 arg_machine = mfree(arg_machine);
                         else {
-                                if (!hostname_is_valid(opts.arg, 0))
+                                if (!hostname_is_valid(opts.arg, /* flags= */ 0))
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                                "Invalid machine name: %s", opts.arg);
 
@@ -741,12 +747,13 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                OPTION_LONG("extra-drive", "[FORMAT:][DISKTYPE:]PATH", "Adds an additional disk to the VM"): {
+                OPTION_LONG("extra-drive", "[FORMAT:][DISKTYPE:][ro:]PATH", "Adds an additional disk to the VM"): {
                         ImageFormat format = IMAGE_FORMAT_RAW;
                         DiskType extra_disk_type = _DISK_TYPE_INVALID;
+                        bool read_only = false;
                         _cleanup_free_ char *drive_path = NULL;
 
-                        r = parse_disk_spec(opts.arg, &format, &extra_disk_type, &drive_path);
+                        r = parse_disk_spec(opts.arg, &format, &extra_disk_type, &read_only, &drive_path);
                         if (r < 0)
                                 return r;
 
@@ -757,6 +764,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 .path = TAKE_PTR(drive_path),
                                 .format = format,
                                 .disk_type = extra_disk_type,
+                                .read_only = read_only,
                         };
                         break;
                 }
@@ -879,7 +887,7 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_GROUP("Input/Output"): {}
 
                 OPTION_LONG("console", "MODE",
-                            "Console mode (interactive, native, gui, read-only or headless)"):
+                            "Console mode (interactive, native, gui, read-only, headless, broker or broker-log)"):
                         arg_console_mode = console_mode_from_string(opts.arg);
                         if (arg_console_mode < 0)
                                 return log_error_errno(arg_console_mode, "Failed to parse specified console mode: %s", opts.arg);
@@ -942,8 +950,20 @@ static int parse_argv(int argc, char *argv[]) {
              arg_forward_journal_max_files != UINT64_MAX) && !arg_forward_journal)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--forward-journal-max-use=/--forward-journal-keep-free=/--forward-journal-max-file-size=/--forward-journal-max-files= require --forward-journal=.");
 
-        if (arg_ephemeral && arg_extra_drives.n_drives > 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot use --ephemeral with --extra-drive=");
+        /* QEMU refuses writes to a read-only NVMe drive, but does not tell the guest that it is read-only. */
+        FOREACH_ARRAY(d, arg_extra_drives.drives, arg_extra_drives.n_drives)
+                if (d->read_only && extra_drive_disk_type(d) == DISK_TYPE_NVME)
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "Read-only --extra-drive= is not supported with disk type nvme: '%s'.",
+                                               d->path);
+
+        /* Extra drives get no ephemeral overlay, so the guest must not be able to write to them. */
+        if (arg_ephemeral)
+                FOREACH_ARRAY(d, arg_extra_drives.drives, arg_extra_drives.n_drives)
+                        if (!d->read_only && !disk_type_is_read_only(extra_drive_disk_type(d)))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "--ephemeral only supports read-only --extra-drive= (prefix ro: or disk type scsi-cd), not '%s' with disk type %s.",
+                                                       d->path, disk_type_to_string(extra_drive_disk_type(d)));
 
         if (arg_uid_shift != UID_INVALID && !arg_directory)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--private-users= is only supported in combination with --directory=.");
@@ -1128,7 +1148,7 @@ static int vmspawn_dispatch_vsock_connections(sd_event_source *source, int fd, u
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate notify connection event source: %m");
 
-        r = sd_event_source_set_io_fd_own(s, true);
+        r = sd_event_source_set_io_fd_own(s, /* own= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to pass ownership of notify to event source: %m");
         TAKE_FD(conn_fd); /* conn_fd is now owned by the event loop so don't clean it up */
@@ -1276,7 +1296,26 @@ fallback:
                 }
         }
 
-        return sd_event_exit(sd_event_source_get_event(s), 0);
+        return sd_event_exit(sd_event_source_get_event(s), /* code= */ 0);
+}
+
+/* QEMU's stdio is the console PTY, which nothing reads before the PTY forwarder starts. When we fail before
+ * the guest runs, copy what QEMU wrote (e.g. why it refused to start) to stderr, so that error messages
+ * aren't lost. */
+static void flush_console_to_stderrp(int *master) {
+        char buf[4096];
+        ssize_t n;
+
+        assert(master);
+
+        if (*master < 0)
+                return;
+
+        /* The PTY master is non-blocking. It fails with EIO once QEMU has exited and the buffer is empty. */
+        while ((n = read(*master, buf, sizeof(buf))) > 0)
+                (void) loop_write(STDERR_FILENO, buf, n);
+        if (n < 0 && !IN_SET(errno, EAGAIN, EIO))
+                log_debug_errno(errno, "Failed to read QEMU console output, ignoring: %m");
 }
 
 static int on_child_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
@@ -1337,6 +1376,40 @@ static int add_vsock_credential(int vsock_fd) {
                 return -ENOMEM;
 
         return machine_credential_add(&arg_credentials, "vmm.notify_socket", value, SIZE_MAX);
+}
+
+static int append_credential(const char *id, const char *data) {
+        int r;
+
+        assert(id);
+        assert(data);
+
+        MachineCredential *existing = machine_credential_find(&arg_credentials, id);
+        if (!existing) {
+                r = machine_credential_add(&arg_credentials, id, data, SIZE_MAX);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add %s credential: %m", id);
+
+                return 0;
+        }
+
+        if (existing->size >= INT_MAX)
+                return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
+                                       "Existing %s credential is too large (%zu bytes).",
+                                       id, existing->size);
+
+        _cleanup_free_ char *combined = NULL;
+        if (existing->size > 0 && existing->data[existing->size - 1] != '\n')
+                r = asprintf(&combined, "%.*s\n%s", (int) existing->size, existing->data, data);
+        else
+                r = asprintf(&combined, "%.*s%s", (int) existing->size, existing->data, data);
+        if (r < 0)
+                return log_oom();
+
+        free_and_replace_full(existing->data, combined, erase_and_free);
+        existing->size = r;
+
+        return 0;
 }
 
 static int cmdline_add_kernel_cmdline(char ***cmdline, int smbios_dir_fd, const char *smbios_dir) {
@@ -1612,7 +1685,7 @@ static int discover_root(char **ret) {
                         /* verity= */ NULL,
                         /* mount_options= */ NULL,
                         /* image_policy= */ NULL,
-                        /* image_filter= */ NULL,
+                        /* filter= */ NULL,
                         /* flags= */ 0,
                         &image);
         if (r < 0)
@@ -1726,7 +1799,7 @@ static int start_virtiofsd(
                 if (userns_fd < 0)
                         return log_error_errno(userns_fd, "Failed to allocate user namespace for virtiofsd: %m");
 
-                _cleanup_close_ int directory_fd = open(directory, O_DIRECTORY|O_CLOEXEC|O_PATH);
+                _cleanup_close_ int directory_fd = xopenat(AT_FDCWD, directory, O_DIRECTORY|O_PATH);
                 if (directory_fd < 0)
                         return log_error_errno(directory_fd, "Failed to open '%s': %m", directory);
 
@@ -1734,7 +1807,8 @@ static int start_virtiofsd(
                 if (r < 0)
                         return r;
 
-        } else if (!IN_SET(source_uid, FOREIGN_UID_MIN, UID_INVALID) && target_uid != UID_INVALID && uid_range != UID_INVALID) {
+        } else if (!IN_SET(source_uid, FOREIGN_UID_MIN, UID_INVALID) && target_uid != UID_INVALID && uid_range != UID_INVALID &&
+                   source_uid != target_uid) {
                 r = strv_extend(&argv, "--translate-uid");
                 if (r < 0)
                         return log_oom();
@@ -1785,14 +1859,14 @@ static int start_virtiofsd(
                         _exit(EXIT_FAILURE);
                 }
 
-                r = fd_cloexec(sock, false);
+                r = fd_cloexec(sock, /* cloexec= */ false);
                 if (r < 0) {
                         log_error_errno(r, "Failed to disable cloexec on socket: %m");
                         _exit(EXIT_FAILURE);
                 }
 
-                invoke_callout_binary(argv[0], argv);
-                log_error_errno(errno, "Failed to execute '%s': %m", argv[0]);
+                r = invoke_callout_binary(argv[0], argv);
+                log_error_errno(r, "Failed to execute '%s': %m", argv[0]);
                 _exit(EXIT_FAILURE);
         }
 
@@ -1973,32 +2047,13 @@ static int merge_initrds(char **ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create temporary file: %m");
 
-        ofd = open(merged_initrd, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600);
+        ofd = xopenat_full(AT_FDCWD, merged_initrd, O_WRONLY|O_CREAT|O_EXCL, /* xopen_flags= */ 0, 0600);
         if (ofd < 0)
-                return log_error_errno(errno, "Failed to create regular file %s: %m", merged_initrd);
+                return log_error_errno(ofd, "Failed to create regular file %s: %m", merged_initrd);
 
-        STRV_FOREACH(i, arg_initrds) {
-                _cleanup_close_ int ifd = -EBADF;
-                off_t off, to_seek;
-
-                off = lseek(ofd, 0, SEEK_CUR);
-                if (off < 0)
-                        return log_error_errno(errno, "Failed to get file offset of %s: %m", merged_initrd);
-
-                to_seek = (4 - (off % 4)) % 4;
-
-                /* seek to assure 4 byte alignment for each initrd */
-                if (to_seek != 0 && lseek(ofd, to_seek, SEEK_CUR) < 0)
-                        return log_error_errno(errno, "Failed to seek %s: %m", merged_initrd);
-
-                ifd = open(*i, O_RDONLY|O_CLOEXEC);
-                if (ifd < 0)
-                        return log_error_errno(errno, "Failed to open %s: %m", *i);
-
-                r = copy_bytes(ifd, ofd, UINT64_MAX, /* copy_flags= */ 0);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to copy bytes from %s to %s: %m", *i, merged_initrd);
-        }
+        r = initrd_concatenate(arg_initrds, ofd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to merge initrds into %s: %m", merged_initrd);
 
         *ret = TAKE_PTR(merged_initrd);
         return 0;
@@ -2058,7 +2113,7 @@ static int grow_image(const char *path, uint64_t size) {
         if (size == 0)
                 return 0;
 
-        _cleanup_close_ int fd = xopenat_full(AT_FDCWD, path, O_RDWR|O_CLOEXEC, XO_REGULAR, /* mode= */ 0);
+        _cleanup_close_ int fd = xopenat_full(AT_FDCWD, path, O_RDWR, XO_REGULAR, /* mode= */ 0);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open image file '%s': %m", path);
 
@@ -2089,7 +2144,7 @@ static int on_request_stop(sd_bus_message *m, void *userdata, sd_bus_error *erro
         assert(m);
 
         log_info("VM termination requested. Exiting.");
-        sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), 0);
+        sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), /* code= */ 0);
 
         return 0;
 }
@@ -2143,14 +2198,111 @@ static int disk_serial(const char *filename, size_t max_len, char **ret) {
         return 0;
 }
 
-static int cmdline_add_ovmf(FILE *config_file, const OvmfConfig *ovmf_config, char **ret_ovmf_vars) {
+/* Instantiate the EFI variable store from the template: either persistently at the --efi-nvram-state=
+ * path (which defaults to the image path plus sidecar_suffix), or as an unlinked temporary copy. Returns
+ * an fd to the store, opened for reading and writing. */
+static int prepare_efi_variable_store(const char *template, const char *sidecar_suffix, int *ret_fd) {
+        int r;
+
+        assert(template);
+        assert(sidecar_suffix);
+        assert(ret_fd);
+
+        if (arg_efi_nvram_state_mode == STATE_AUTO && !arg_ephemeral) {
+                assert(!arg_efi_nvram_state_path);
+
+                r = make_sidecar_path(sidecar_suffix, &arg_efi_nvram_state_path);
+                if (r < 0)
+                        return r;
+
+                log_debug("Storing EFI variables persistently under '%s'.", arg_efi_nvram_state_path);
+        }
+
+        _cleanup_close_ int target_fd = -EBADF;
+        _cleanup_(unlink_and_freep) char *destroy_path = NULL;
+        bool newly_created;
+        if (arg_efi_nvram_state_path) {
+                _cleanup_free_ char *d = strdup(arg_efi_nvram_state_path);
+                if (!d)
+                        return log_oom();
+
+                target_fd = openat_report_new(AT_FDCWD, arg_efi_nvram_state_path, O_RDWR|O_CREAT, 0600, &newly_created);
+                if (target_fd < 0)
+                        return log_error_errno(target_fd, "Failed to open EFI variable store at %s: %m", arg_efi_nvram_state_path);
+
+                if (newly_created)
+                        destroy_path = TAKE_PTR(d);
+                else {
+                        r = fd_verify_regular(target_fd);
+                        if (r < 0)
+                                return log_error_errno(r, "EFI variable store at %s is not a regular file: %m", arg_efi_nvram_state_path);
+                }
+        } else {
+                target_fd = open_tmpfile_unlinkable(/* directory= */ NULL, O_RDWR);
+                if (target_fd < 0)
+                        return log_error_errno(target_fd, "Failed to create temporary EFI variable store: %m");
+
+                newly_created = true;
+        }
+
+        if (newly_created) {
+                _cleanup_close_ int source_fd = xopenat(AT_FDCWD, template, O_RDONLY);
+                if (source_fd < 0)
+                        return log_error_errno(source_fd, "Failed to open EFI variable store template %s: %m", template);
+
+                r = copy_bytes(source_fd, target_fd, UINT64_MAX, /* copy_flags= */ 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to copy EFI variable store template %s: %m", template);
+
+                /* This isn't always available so don't raise an error if it fails */
+                (void) copy_times(source_fd, target_fd, /* flags= */ 0);
+        }
+
+        destroy_path = mfree(destroy_path); /* disarm auto-destroy */
+
+        *ret_fd = TAKE_FD(target_fd);
+        return 0;
+}
+
+/* Passes an fd to QEMU in the given fdset on its command line. The caller keeps owning the fd. */
+static int cmdline_add_fdset(char ***cmdline, int **pass_fds, size_t *n_pass_fds, QemuFdset fdset, int fd, const char *opaque) {
+        int r;
+
+        assert(cmdline);
+        assert(pass_fds);
+        assert(n_pass_fds);
+        assert(fd >= 0);
+        assert(opaque);
+
+        r = strv_extend(cmdline, "--add-fd");
+        if (r < 0)
+                return log_oom();
+
+        r = strv_extendf(cmdline, "fd=%d,set=%i,opaque=%s", fd, fdset, opaque);
+        if (r < 0)
+                return log_oom();
+
+        if (!GREEDY_REALLOC(*pass_fds, *n_pass_fds + 1))
+                return log_oom();
+
+        (*pass_fds)[(*n_pass_fds)++] = fd;
+        return 0;
+}
+
+static int cmdline_add_ovmf(
+                FILE *config_file,
+                char ***cmdline,
+                int **pass_fds,
+                size_t *n_pass_fds,
+                const OvmfConfig *ovmf_config,
+                int ret_vars_fds[static 2]) {
         int r;
 
         assert(config_file);
-        assert(ret_ovmf_vars);
+        assert(ret_vars_fds);
 
         if (!ovmf_config) {
-                *ret_ovmf_vars = NULL;
+                ret_vars_fds[0] = ret_vars_fds[1] = -EBADF;
                 return 0;
         }
 
@@ -2162,77 +2314,34 @@ static int cmdline_add_ovmf(FILE *config_file, const OvmfConfig *ovmf_config, ch
         if (r < 0)
                 return r;
 
-        if (!ovmf_config->vars && !arg_efi_nvram_template) {
-                *ret_ovmf_vars = NULL;
+        /* Firmware with a host-side variable store doesn't use pflash for it, see cmdline_add_uefi_vars(). */
+        if (ovmf_config_has_host_uefi_vars(ovmf_config) || (!ovmf_config->vars && !arg_efi_nvram_template)) {
+                ret_vars_fds[0] = ret_vars_fds[1] = -EBADF;
                 return 0;
         }
 
-        if (arg_efi_nvram_state_mode == STATE_AUTO && !arg_ephemeral) {
-                assert(!arg_efi_nvram_state_path);
+        _cleanup_close_pair_ int vars_fds[2] = EBADF_PAIR;
+        r = prepare_efi_variable_store(arg_efi_nvram_template ?: ovmf_config->vars, ".efinvramstate", &vars_fds[0]);
+        if (r < 0)
+                return r;
 
-                r = make_sidecar_path(".efinvramstate", &arg_efi_nvram_state_path);
+        /* QEMU's block layer opens the drive read-only first, so it needs a matching fd in the fdset. */
+        vars_fds[1] = fd_reopen(vars_fds[0], O_RDONLY);
+        if (vars_fds[1] < 0)
+                return log_error_errno(vars_fds[1], "Failed to reopen EFI variable store read-only: %m");
+
+        FOREACH_ELEMENT(fd, vars_fds) {
+                r = cmdline_add_fdset(cmdline, pass_fds, n_pass_fds, QEMU_FDSET_EFI_VARS, *fd, "efi-vars");
                 if (r < 0)
                         return r;
-
-                log_debug("Storing EFI NVRAM state persistently under '%s'.", arg_efi_nvram_state_path);
         }
-
-        const char *vars_source = arg_efi_nvram_template ?: ovmf_config->vars;
-        _cleanup_close_ int target_fd = -EBADF;
-        _cleanup_(unlink_and_freep) char *destroy_path = NULL;
-        bool newly_created;
-        const char *state;
-        if (arg_efi_nvram_state_path) {
-                _cleanup_free_ char *d = strdup(arg_efi_nvram_state_path);
-                if (!d)
-                        return log_oom();
-
-                target_fd = openat_report_new(AT_FDCWD, arg_efi_nvram_state_path, O_WRONLY|O_CREAT|O_CLOEXEC, 0600, &newly_created);
-                if (target_fd < 0)
-                        return log_error_errno(target_fd, "Failed to open file for OVMF vars at %s: %m", arg_efi_nvram_state_path);
-
-                if (newly_created)
-                        destroy_path = TAKE_PTR(d);
-
-                r = fd_verify_regular(target_fd);
-                if (r < 0)
-                        return log_error_errno(r, "Not a regular file for OVMF variables at %s: %m", arg_efi_nvram_state_path);
-
-                state = arg_efi_nvram_state_path;
-        } else {
-                _cleanup_free_ char *t = NULL;
-                r = tempfn_random_child(/* p= */ NULL, "vmspawn-", &t);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to create temporary filename: %m");
-
-                target_fd = open(t, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600);
-                if (target_fd < 0)
-                        return log_error_errno(errno, "Failed to create regular file for OVMF vars at %s: %m", t);
-
-                newly_created = true;
-                state = *ret_ovmf_vars = TAKE_PTR(t);
-        }
-
-        if (newly_created) {
-                _cleanup_close_ int source_fd = open(vars_source, O_RDONLY|O_CLOEXEC);
-                if (source_fd < 0)
-                        return log_error_errno(errno, "Failed to open OVMF vars file %s: %m", vars_source);
-
-                r = copy_bytes(source_fd, target_fd, UINT64_MAX, /* copy_flags= */ 0);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to copy bytes from %s to %s: %m", vars_source, state);
-
-                /* This isn't always available so don't raise an error if it fails */
-                (void) copy_times(source_fd, target_fd, 0);
-        }
-
-        destroy_path = mfree(destroy_path); /* disarm auto-destroy */
 
         /* Mark the UEFI variable store pflash as requiring SMM access. This
          * prevents the guest OS from writing to pflash directly, ensuring all
          * variable updates go through the firmware's validation checks. Without
-         * this, secure boot keys could be overwritten by the OS. */
-        if (ARCHITECTURE_SUPPORTS_SMM) {
+         * this, secure boot keys could be overwritten by the OS. Firmware built
+         * without SMM support could not write its variables at all then. */
+        if (ARCHITECTURE_SUPPORTS_SMM && ovmf_config_has_feature(ovmf_config, "requires-smm")) {
                 r = qemu_config_section(config_file, "global", /* id= */ NULL,
                                         "driver", "cfi.pflash01",
                                         "property", "secure",
@@ -2242,12 +2351,67 @@ static int cmdline_add_ovmf(FILE *config_file, const OvmfConfig *ovmf_config, ch
         }
 
         r = qemu_config_section(config_file, "drive", "ovmf-vars",
-                                "file", state,
+                                "file", FORMAT_QEMU_FDSET_PATH(QEMU_FDSET_EFI_VARS),
                                 "if", "pflash",
                                 "format", ovmf_config_format(ovmf_config));
         if (r < 0)
                 return r;
 
+        ret_vars_fds[0] = TAKE_FD(vars_fds[0]);
+        ret_vars_fds[1] = TAKE_FD(vars_fds[1]);
+        return 0;
+}
+
+static int cmdline_add_uefi_vars(
+                FILE *config_file,
+                char ***cmdline,
+                int **pass_fds,
+                size_t *n_pass_fds,
+                const OvmfConfig *ovmf_config,
+                int *ret_fd) {
+        int r;
+
+        assert(config_file);
+        assert(ret_fd);
+
+        if (!ovmf_config || !ovmf_config_has_host_uefi_vars(ovmf_config)) {
+                *ret_fd = -EBADF;
+                return 0;
+        }
+
+        /* Firmware with the "host-uefi-vars" feature keeps its UEFI variables in a QEMU device instead of
+         * pflash. QEMU persists them as JSON, so keep that apart from pflash NVRAM state files. The
+         * firmware needs the device from its first instruction, so it can't be hotplugged via QMP. */
+        const char *device = QEMU_UEFI_VARS_DEVICE;
+        assert(device); /* checked when selecting the firmware */
+
+        _cleanup_close_ int fd = -EBADF;
+        r = prepare_efi_variable_store(
+                        ASSERT_PTR(arg_efi_nvram_template ?: ovmf_config->uefi_vars_template),
+                        ".efivarstate.json",
+                        &fd);
+        if (r < 0)
+                return r;
+
+        /* Unlike pflash drives, QEMU doesn't lock the JSON file, so VMs sharing it would overwrite each
+         * other's variables. Lock it for as long as the VM runs, QEMU shares the lock through its fd. */
+        r = lock_generic(fd, LOCK_BSD, LOCK_EX|LOCK_NB);
+        if (r == -EWOULDBLOCK)
+                return log_error_errno(r, "EFI variable store %s is in use by another VM.", arg_efi_nvram_state_path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to lock EFI variable store: %m");
+
+        r = cmdline_add_fdset(cmdline, pass_fds, n_pass_fds, QEMU_FDSET_EFI_VARS, fd, "efi-vars");
+        if (r < 0)
+                return r;
+
+        r = qemu_config_section(config_file, "device", "uefi-vars",
+                                "driver", device,
+                                "jsonfile", FORMAT_QEMU_FDSET_PATH(QEMU_FDSET_EFI_VARS));
+        if (r < 0)
+                return r;
+
+        *ret_fd = TAKE_FD(fd);
         return 0;
 }
 
@@ -2295,18 +2459,18 @@ static int resolve_disk_driver(DiskType dt, const char *filename, DriveInfo *inf
                 serial_max = DISK_SERIAL_MAX_LEN_VIRTIO_BLK;
                 break;
         case DISK_TYPE_VIRTIO_SCSI:
+        case DISK_TYPE_VIRTIO_SCSI_CDROM:
                 serial_max = DISK_SERIAL_MAX_LEN_SCSI;
                 break;
         case DISK_TYPE_NVME:
                 serial_max = DISK_SERIAL_MAX_LEN_NVME;
                 break;
-        case DISK_TYPE_VIRTIO_SCSI_CDROM:
-                serial_max = DISK_SERIAL_MAX_LEN_SCSI;
-                info->flags |= QMP_DRIVE_READ_ONLY;
-                break;
         default:
                 assert_not_reached();
         }
+
+        if (disk_type_is_read_only(dt))
+                info->flags |= QMP_DRIVE_READ_ONLY;
 
         info->disk_driver = strdup(ASSERT_PTR(qemu_device_driver_to_string(dt)));
         if (!info->disk_driver)
@@ -2340,11 +2504,11 @@ static int prepare_primary_drive(DriveInfos *drives) {
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve disk driver for '%s': %m", image_fn);
 
-        int open_flags = ((arg_ephemeral || FLAGS_SET(d->flags, QMP_DRIVE_READ_ONLY)) ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOCTTY;
+        int open_flags = ((arg_ephemeral || FLAGS_SET(d->flags, QMP_DRIVE_READ_ONLY)) ? O_RDONLY : O_RDWR) | O_NOCTTY;
 
-        _cleanup_close_ int image_fd = open(arg_image, open_flags);
+        _cleanup_close_ int image_fd = xopenat(AT_FDCWD, arg_image, open_flags);
         if (image_fd < 0)
-                return log_error_errno(errno, "Failed to open '%s': %m", arg_image);
+                return log_error_errno(image_fd, "Failed to open '%s': %m", arg_image);
 
         struct stat st;
         if (fstat(image_fd, &st) < 0)
@@ -2387,7 +2551,7 @@ static int prepare_primary_drive(DriveInfos *drives) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to extract directory from '%s': %m", image_path);
 
-                        overlay_fd = open_tmpfile_unlinkable(image_dir, O_RDWR|O_CLOEXEC);
+                        overlay_fd = open_tmpfile_unlinkable(image_dir, O_RDWR);
                         if (overlay_fd < 0)
                                 log_debug_errno(overlay_fd,
                                                 "Failed to create ephemeral overlay in '%s', using the directory for large temporary files instead: %m",
@@ -2401,7 +2565,7 @@ static int prepare_primary_drive(DriveInfos *drives) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to determine directory for large temporary files: %m");
 
-                        overlay_fd = open_tmpfile_unlinkable(overlay_dir, O_RDWR|O_CLOEXEC);
+                        overlay_fd = open_tmpfile_unlinkable(overlay_dir, O_RDWR);
                         if (overlay_fd < 0)
                                 return log_error_errno(overlay_fd, "Failed to create ephemeral overlay in '%s': %m", overlay_dir);
                 }
@@ -2434,19 +2598,19 @@ static int prepare_extra_drives(DriveInfos *drives) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract filename from path '%s': %m", drive->path);
 
-                DiskType dt = drive->disk_type >= 0 ? drive->disk_type : arg_image_disk_type;
-
                 _cleanup_(drive_info_unrefp) DriveInfo *d = drive_info_new();
                 if (!d)
                         return log_oom();
 
-                r = resolve_disk_driver(dt, drive_fn, d);
+                r = resolve_disk_driver(extra_drive_disk_type(drive), drive_fn, d);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve disk driver for '%s': %m", drive_fn);
+                if (drive->read_only)
+                        d->flags |= QMP_DRIVE_READ_ONLY;
 
-                _cleanup_close_ int drive_fd = open(drive->path, (FLAGS_SET(d->flags, QMP_DRIVE_READ_ONLY) ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOCTTY);
+                _cleanup_close_ int drive_fd = xopenat(AT_FDCWD, drive->path, (FLAGS_SET(d->flags, QMP_DRIVE_READ_ONLY) ? O_RDONLY : O_RDWR) | O_NOCTTY);
                 if (drive_fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", drive->path);
+                        return log_error_errno(drive_fd, "Failed to open '%s': %m", drive->path);
 
                 struct stat drive_st;
                 if (fstat(drive_fd, &drive_st) < 0)
@@ -2553,10 +2717,12 @@ static const char* const coco_firmware_feature_table[_COCO_MAX] = {
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(coco_firmware_feature, ConfidentialComputing);
 
-static int discover_ovmf_config(OvmfConfig **ret, sd_json_variant **ret_firmware_json) {
+/* Adds what the other options require of the firmware to the requested firmware features, and
+ * returns the matching search flags. */
+static int ovmf_search_criteria(FindOvmfConfigFlags *ret_flags) {
         int r;
 
-        assert(ret);
+        assert(ret_flags);
 
         const char *coco_feature = coco_firmware_feature_to_string(arg_confidential_computing);
         if (coco_feature) {
@@ -2573,17 +2739,56 @@ static int discover_ovmf_config(OvmfConfig **ret, sd_json_variant **ret_firmware
                 }
         }
 
-        FindOvmfConfigFlags flags =
-                arg_confidential_computing != COCO_NO ? FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW :
-                                                        0;
+        *ret_flags = arg_confidential_computing != COCO_NO ? FIND_OVMF_STATELESS|FIND_OVMF_REQUIRE_RAW : 0;
+        return 0;
+}
 
-        r = find_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, flags, ret, ret_firmware_json);
-        if (r == -ENOENT && coco_feature)
-                return log_error_errno(r, "No suitable firmware descriptor found for --coco=%s "
-                                       "(requires stateless firmware in raw format with the '%s' firmware feature). "
-                                       "Install a suitable firmware, select a firmware descriptor with --firmware=, or "
-                                       "opt in with --secure-boot=yes if the installed firmware enforces Secure Boot.",
-                                       confidential_computing_to_string(arg_confidential_computing), coco_feature);
+static int list_firmware(void) {
+        _cleanup_strv_free_ char **l = NULL;
+        FindOvmfConfigFlags flags = 0;
+        int r;
+
+        r = ovmf_search_criteria(&flags);
+        if (r < 0)
+                return r;
+
+        r = list_eligible_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, flags,
+                                      &l, /* ret_first= */ NULL, /* ret_first_json= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to list firmwares: %m");
+
+        bool nl = false;
+        fputstrv(stdout, l, "\n", &nl);
+        if (nl)
+                putchar('\n');
+
+        return 0;
+}
+
+/* The coco firmware features only declare that firmware can run in a confidential VM, not that it is a
+ * build whose measurements can be relied upon: generic OVMF builds declare them too, but don't verify the
+ * kernel hashes under SEV-SNP, and carry a TPM driver that may divert measurements away from the RTMRs
+ * under TDX. Since the descriptors can't tell these apart, leave the choice to the user rather than
+ * guessing. */
+static int log_coco_requires_firmware(void) {
+        const char *coco = confidential_computing_to_string(arg_confidential_computing);
+
+        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                               "--coco=%s requires a firmware descriptor selected with --firmware=PATH, "
+                               "as firmware descriptors don't declare whether a firmware build is suitable for attestation. "
+                               "Use --coco=%s --firmware=list to list candidates.",
+                               coco, coco);
+}
+
+static int discover_ovmf_config(OvmfConfig **ret, sd_json_variant **ret_firmware_json) {
+        int r;
+
+        assert(ret);
+
+        if (arg_confidential_computing != COCO_NO)
+                return log_coco_requires_firmware();
+
+        r = find_ovmf_config(arg_firmware_features_include, arg_firmware_features_exclude, /* flags= */ 0, ret, ret_firmware_json);
         if (r < 0)
                 return log_error_errno(r, "Failed to find OVMF config: %m");
 
@@ -2611,6 +2816,8 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
         sd_event_source **children = NULL;
         size_t n_children = 0, n_pass_fds = 0;
+        bool balloon = arg_confidential_computing == COCO_NO;
+        uint64_t ram;
         int r;
 
         CLEANUP_ARRAY(children, n_children, fork_notify_terminate_many);
@@ -2680,6 +2887,23 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                                                "Firmware descriptor '%s' declares flash mode 'combined', which is not supported.",
                                                arg_firmware ?: ovmf_config->path);
 
+                if (ovmf_config_has_host_uefi_vars(ovmf_config)) {
+                        if (!QEMU_UEFI_VARS_DEVICE)
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                                       "Firmware descriptor '%s' requires a host-side UEFI variable store, which QEMU doesn't provide on %s.",
+                                                       arg_firmware ?: ovmf_config->path, architecture_to_string(native_architecture()));
+                        if (!arg_efi_nvram_template && !ovmf_config->uefi_vars_template)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Firmware descriptor '%s' requires a host-side UEFI variable store, but declares no template for it. "
+                                                       "Specify one with --efi-nvram-template=.",
+                                                       arg_firmware ?: ovmf_config->path);
+                }
+
+                bool sb = ovmf_config_has_feature(ovmf_config, "secure-boot");
+                if (set_contains(arg_firmware_features_include, "secure-boot") && !sb)
+                        return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
+                                               "Secure Boot requested, but selected OVMF firmware doesn't support it.");
+
                 if (arg_confidential_computing != COCO_NO) {
                         const char *coco_feature = coco_firmware_feature_to_string(arg_confidential_computing);
 
@@ -2701,12 +2925,15 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                                                        "but --coco=%s requires a raw image.",
                                                        ovmf_config->path, ovmf_config_format(ovmf_config),
                                                        confidential_computing_to_string(arg_confidential_computing));
+                        /* Secure Boot keys can't be enrolled at runtime, see ovmf_search_criteria(). */
+                        if (set_contains(arg_firmware_features_include, "secure-boot") &&
+                            !ovmf_config_has_feature(ovmf_config, "enrolled-keys"))
+                                return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
+                                                       "Secure Boot requested, but firmware descriptor '%s' does not declare the 'enrolled-keys' feature, "
+                                                       "which --coco=%s requires as keys cannot be enrolled at runtime in stateless firmware.",
+                                                       arg_firmware ?: ovmf_config->path,
+                                                       confidential_computing_to_string(arg_confidential_computing));
                 }
-
-                bool sb = ovmf_config_has_feature(ovmf_config, "secure-boot");
-                if (set_contains(arg_firmware_features_include, "secure-boot") && !sb)
-                        return log_error_errno(SYNTHETIC_ERRNO(EMEDIUMTYPE),
-                                               "Secure Boot requested, but selected OVMF firmware doesn't support it.");
 
                 log_debug("Using OVMF firmware %s Secure Boot support.", sb ? "with" : "without");
         }
@@ -2733,7 +2960,8 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (r < 0)
                 return log_error_errno(r, "Failed to find QEMU binary: %m");
 
-        if (asprintf(&mem, "%" PRIu64 "M", DIV_ROUND_UP(arg_ram, U64_MB)) < 0)
+        ram = DIV_ROUND_UP(arg_ram, U64_MB) * U64_MB;
+        if (asprintf(&mem, "%" PRIu64 "M", ram / U64_MB) < 0)
                 return log_oom();
 
         /* Create our runtime directory. We need this for the QMP varlink control socket, the QEMU
@@ -2770,8 +2998,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         if (ovmf_config && ARCHITECTURE_SUPPORTS_SMM && arg_confidential_computing == COCO_NO) {
-                bool sb = ovmf_config_has_feature(ovmf_config, "secure-boot");
-                r = qemu_config_key(config_file, "smm", on_off(sb));
+                r = qemu_config_key(config_file, "smm", on_off(ovmf_config_has_feature(ovmf_config, "requires-smm")));
                 if (r < 0)
                         return r;
         }
@@ -2836,9 +3063,10 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (r < 0)
                 return r;
 
-        if (arg_confidential_computing == COCO_NO) {
+        if (balloon) {
                 r = qemu_config_section(config_file, "device", "balloon0",
                                         "driver", "virtio-balloon",
+                                        "deflate-on-oom", "on",
                                         "free-page-reporting", "on");
                 if (r < 0)
                         return r;
@@ -2921,7 +3149,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         (void) net_shorten_ifname(tap_name, /* check_naming_scheme= */ false);
 
                         if (ether_addr_is_null(&arg_network_provided_mac)) {
-                                r = net_generate_mac(arg_machine, &mac_vm, VM_TAP_HASH_KEY, 0);
+                                r = net_generate_mac(arg_machine, &mac_vm, VM_TAP_HASH_KEY, /* idx= */ 0);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to generate predictable MAC address for VM side: %m");
                         } else
@@ -2971,22 +3199,13 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         if (use_kvm && kvm_device_fd >= 0) {
-                r = strv_extend(&cmdline, "--add-fd");
+                r = cmdline_add_fdset(&cmdline, &pass_fds, &n_pass_fds, QEMU_FDSET_KVM, kvm_device_fd, "/dev/kvm");
                 if (r < 0)
-                        return log_oom();
-
-                r = strv_extendf(&cmdline, "fd=%d,set=1,opaque=/dev/kvm", kvm_device_fd);
-                if (r < 0)
-                        return log_oom();
-
-                if (!GREEDY_REALLOC(pass_fds, n_pass_fds + 1))
-                        return log_oom();
-
-                pass_fds[n_pass_fds++] = kvm_device_fd;
+                        return r;
 
                 r = qemu_config_section(config_file, "accel", /* id= */ NULL,
                                         "accel", "kvm",
-                                        "device", "/dev/fdset/1");
+                                        "device", FORMAT_QEMU_FDSET_PATH(QEMU_FDSET_KVM));
                 if (r < 0)
                         return r;
         } else {
@@ -3052,9 +3271,9 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 config.vsock.fd = TAKE_FD(vhost_device_fd);
 
                 if (config.vsock.fd < 0) {
-                        config.vsock.fd = open("/dev/vhost-vsock", O_RDWR|O_CLOEXEC);
+                        config.vsock.fd = xopenat(AT_FDCWD, "/dev/vhost-vsock", O_RDWR);
                         if (config.vsock.fd < 0)
-                                return log_error_errno(errno, "Failed to open /dev/vhost-vsock as read/write: %m");
+                                return log_error_errno(config.vsock.fd, "Failed to open /dev/vhost-vsock as read/write: %m");
                 }
 
                 r = vsock_fix_child_cid(config.vsock.fd, &child_cid, arg_machine);
@@ -3080,7 +3299,8 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (r < 0)
                 return log_oom();
 
-        _cleanup_close_ int master = -EBADF;
+        _cleanup_close_ int master = -EBADF, console_backend_fd = -EBADF;
+        _cleanup_free_ char *console_pty_name = NULL;
         PTYForwardFlags ptyfwd_flags = 0;
         switch (arg_console_mode) {
 
@@ -3127,6 +3347,51 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
                 break;
         }
+
+        case CONSOLE_BROKER:
+        case CONSOLE_BROKER_LOG:
+                /* In broker mode ptybrokerd owns the frontend (the "master" side) of the pseudo TTY and
+                 * takes care of its output itself — discarding it, or, for broker-log, additionally writing
+                 * it to the logs. It hands us a monitor connection which we forward the local terminal to
+                 * (used as PTY forwarder "master"), plus the backend (the "slave" side) which we pass on to
+                 * QEMU as its console. */
+                /* The broker's operations are gated by polkit, hence make sure an authentication agent is
+                 * around in case we need to authenticate interactively. */
+                (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
+
+                r = pty_broker_acquire_pty(
+                                arg_runtime_scope,
+                                arg_console_mode == CONSOLE_BROKER_LOG ? "log" : "null",
+                                /* name= */ NULL,
+                                arg_ask_password,
+                                &master,
+                                &console_backend_fd,
+                                &console_pty_name);
+                if (r < 0)
+                        return r;
+
+                if (!arg_quiet && !isempty(console_pty_name))
+                        log_info("Broker registered console pseudo TTY under name '%s'.", console_pty_name);
+
+                r = strv_extend_many(&cmdline, "-nographic", "-nodefaults");
+                if (r < 0)
+                        return log_oom();
+
+                /* Hand QEMU the already-open backend (slave) fd rather than a filesystem path: register it
+                 * in an fd set and point the chardev at it. The fd survives the fork because it's added to
+                 * pass_fds (QEMU is forked with FORK_CLOEXEC_OFF). */
+                r = cmdline_add_fdset(&cmdline, &pass_fds, &n_pass_fds, QEMU_FDSET_CONSOLE, console_backend_fd, "/dev/console");
+                if (r < 0)
+                        return r;
+
+                r = qemu_config_section(config_file, "chardev", "console",
+                                        "backend", "serial",
+                                        "path", FORMAT_QEMU_FDSET_PATH(QEMU_FDSET_CONSOLE),
+                                        "mux", "off");
+                if (r < 0)
+                        return r;
+
+                break;
 
         case CONSOLE_GUI:
                 /* -vga is a convenience option, keep on cmdline */
@@ -3215,16 +3480,21 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
 
         /* Memory-mapped firmware asks for -bios loading by definition. Under
          * confidential computing -bios is used even for (stateless) flash firmware. */
-        _cleanup_(unlink_and_freep) char *ovmf_vars = NULL;
+        _cleanup_close_pair_ int ovmf_vars_fds[2] = EBADF_PAIR;
         if (ovmf_config && (arg_confidential_computing != COCO_NO || streq_ptr(ovmf_config->device, "memory"))) {
                 r = strv_extend_many(&cmdline, "-bios", ovmf_config->path);
                 if (r < 0)
                         return r;
         } else {
-                r = cmdline_add_ovmf(config_file, ovmf_config, &ovmf_vars);
+                r = cmdline_add_ovmf(config_file, &cmdline, &pass_fds, &n_pass_fds, ovmf_config, ovmf_vars_fds);
                 if (r < 0)
                         return r;
         }
+
+        _cleanup_close_ int uefi_vars_fd = -EBADF;
+        r = cmdline_add_uefi_vars(config_file, &cmdline, &pass_fds, &n_pass_fds, ovmf_config, &uefi_vars_fd);
+        if (r < 0)
+                return r;
 
         if (arg_linux) {
                 r = strv_extend_many(&cmdline, "-kernel", arg_linux);
@@ -3251,8 +3521,8 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                                                        arg_image);
                 }
 
-                if (arg_image_disk_type == DISK_TYPE_VIRTIO_SCSI_CDROM) {
-                        /* CD-ROMs are read-only, so override any "rw" on the kernel command line. */
+                if (disk_type_is_read_only(arg_image_disk_type)) {
+                        /* Override any "rw" on the kernel command line. */
                         if (strv_contains(arg_kernel_cmdline_extra, "rw") &&
                             strv_extend(&arg_kernel_cmdline_extra, "ro") < 0)
                                 return log_oom();
@@ -3292,7 +3562,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 if (arg_ephemeral) {
                         r = create_ephemeral_snapshot(arg_directory,
                                                       arg_runtime_scope,
-                                                      /* read-only */ false,
+                                                      /* read_only= */ false,
                                                       &tree_global_lock,
                                                       &tree_local_lock,
                                                       &snapshot_directory);
@@ -3369,7 +3639,7 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 }
         }
 
-        _cleanup_free_ char *fstab_extra = NULL;
+        _cleanup_free_ char *fstab_extra = NULL, *fstab_extra_initrd = NULL;
 
         for (size_t j = 0; j < arg_runtime_mounts.n_mounts; j++) {
                 RuntimeMount *m = arg_runtime_mounts.mounts + j;
@@ -3410,8 +3680,24 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 if (!escaped_target)
                         return log_oom();
 
-                if (strextendf(&fstab_extra, "%s %s virtiofs %s,x-initrd.mount\n",
+                /* switch-root moves the initrd's /run onto /sysroot/run. The moved /run hides any mount that
+                 * the initrd placed below /sysroot/run. We therefore mount targets below /run at /run in the
+                 * initrd. switch-root then moves the mount together with /run. fstab-generator reads
+                 * fstab.extra.initrd only in the initrd. The fstab.extra entry without x-initrd.mount mounts
+                 * the target when the VM boots without an initrd. A target such as /run/x/../../srv resolves
+                 * to /srv. An fstab.extra.initrd entry for that target would mount over /srv in the initrd.
+                 * path_startswith() doesn't check the components after the prefix. path_is_safe() therefore
+                 * refuses every ".." component in the target. */
+                bool below_run = path_is_safe(m->target) && !isempty(path_startswith(m->target, "/run"));
+
+                if (below_run &&
+                    strextendf(&fstab_extra_initrd, "%s %s virtiofs %s\n",
                                id, escaped_target, m->read_only ? "ro" : "rw") < 0)
+                        return log_oom();
+
+                if (strextendf(&fstab_extra, "%s %s virtiofs %s%s\n",
+                               id, escaped_target, m->read_only ? "ro" : "rw",
+                               below_run ? "" : ",x-initrd.mount") < 0)
                         return log_oom();
 
                 if (!GREEDY_REALLOC(config.virtiofs.entries, config.virtiofs.n_entries + 1))
@@ -3425,31 +3711,15 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         if (fstab_extra) {
-                /* If the user already specified a fstab.extra credential, combine it with ours */
-                MachineCredential *existing = machine_credential_find(&arg_credentials, "fstab.extra");
-                if (existing) {
-                        _cleanup_free_ char *combined = NULL;
+                r = append_credential("fstab.extra", fstab_extra);
+                if (r < 0)
+                        return r;
+        }
 
-                        if (existing->size >= INT_MAX)
-                                return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
-                                                       "Existing fstab.extra credential is too large (%zu bytes).",
-                                                       existing->size);
-
-                        if (existing->size > 0 && existing->data[existing->size - 1] != '\n')
-                                r = asprintf(&combined, "%.*s\n%s", (int) existing->size, existing->data, fstab_extra);
-                        else
-                                r = asprintf(&combined, "%.*s%s", (int) existing->size, existing->data, fstab_extra);
-                        if (r < 0)
-                                return log_oom();
-
-                        erase_and_free(existing->data);
-                        existing->data = TAKE_PTR(combined);
-                        existing->size = r;
-                } else {
-                        r = machine_credential_add(&arg_credentials, "fstab.extra", fstab_extra, SIZE_MAX);
-                        if (r < 0)
-                                return r;
-                }
+        if (fstab_extra_initrd) {
+                r = append_credential("fstab.extra.initrd", fstab_extra_initrd);
+                if (r < 0)
+                        return r;
         }
 
         _cleanup_(rm_rf_physical_and_freep) char *smbios_dir = NULL;
@@ -3646,12 +3916,18 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
          * not covered by the launch measurement and are silently discarded by the guest PID1 in
          * confidential VMs. Instead, package credentials into a cpio archive appended to the initrd
          * (mirroring what systemd-stub does for ESP credentials) so they enter the launch measurement
-         * via QEMU's "kernel-hashes=on". The new initrd path requires a guest PID1 that knows about
-         * /.extra/system_credentials/, so we keep this scoped to SNP for now. Non-SNP guests
-         * continue to use the SMBIOS path below, which works with older systemd versions too.
+         * via QEMU's "kernel-hashes=on".
+         * Under --coco=tdx the guest PID1 accepts SMBIOS credentials only if systemd-stub or systemd-boot
+         * measured the SMBIOS table (the firmware's own SMBIOS measurement zeroes the OEM strings), so
+         * direct linux boot uses the cpio as well. The Linux EFI stub measures the initrd into RTMR 2
+         * there.
+         * The initrd path requires a guest PID1 that knows about /.extra/system_credentials/, so it stays
+         * limited to these cases and everything else continues to use the SMBIOS path below, which works
+         * with older systemd versions too.
          * Must run after all credential-mutating calls above so the cpio captures the complete set. */
-        bool use_initrd_cpio = arg_confidential_computing == COCO_SEV_SNP &&
-                               arg_credentials.n_credentials > 0;
+        bool use_initrd_cpio = arg_credentials.n_credentials > 0 &&
+                               (arg_confidential_computing == COCO_SEV_SNP ||
+                                (arg_confidential_computing == COCO_TDX && arg_linux && arg_linux_image_type != KERNEL_IMAGE_TYPE_UKI));
 
         _cleanup_(unlink_and_freep) char *credentials_cpio_path = NULL;
         if (use_initrd_cpio) {
@@ -3683,8 +3959,8 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                         return log_oom();
         }
 
-        /* Under SNP, credentials flow via the initrd cpio above. For everyone else, use the
-         * SMBIOS/fw_cfg/cmdline path. */
+        /* Where the initrd cpio carries the credentials (see above), skip the host channels. For
+         * everyone else, use the SMBIOS/fw_cfg/cmdline path. */
         if (!use_initrd_cpio) {
                 r = cmdline_add_credentials(&cmdline, smbios_dir_fd, smbios_dir);
                 if (r < 0)
@@ -3715,11 +3991,9 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 size_t n_drive_ports = 0;
                 if (!IN_SET(arg_image_disk_type, DISK_TYPE_VIRTIO_SCSI, DISK_TYPE_VIRTIO_SCSI_CDROM))
                         n_drive_ports++;
-                FOREACH_ARRAY(d, arg_extra_drives.drives, arg_extra_drives.n_drives) {
-                        DiskType dt = d->disk_type >= 0 ? d->disk_type : arg_image_disk_type;
-                        if (!IN_SET(dt, DISK_TYPE_VIRTIO_SCSI, DISK_TYPE_VIRTIO_SCSI_CDROM))
+                FOREACH_ARRAY(d, arg_extra_drives.drives, arg_extra_drives.n_drives)
+                        if (!IN_SET(extra_drive_disk_type(d), DISK_TYPE_VIRTIO_SCSI, DISK_TYPE_VIRTIO_SCSI_CDROM))
                                 n_drive_ports++;
-                }
                 FOREACH_ARRAY(bv, arg_bind_volumes.items, arg_bind_volumes.n_items) {
                         DiskType dt = disk_type_from_bind_volume_config((*bv)->config);
                         if (dt < 0)
@@ -3824,8 +4098,16 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         }
 
         _cleanup_close_ int child_pty = -EBADF;
-        if (master >= 0) {
-                child_pty = pty_open_peer(master, O_RDWR|O_CLOEXEC|O_NOCTTY);
+        if (console_backend_fd >= 0) {
+                /* Broker mode: QEMU's stdio should be the broker-provided backend (slave), not derived from
+                 * the monitor connection (which is 'master' here). Reopen it to get an independent open file
+                 * description, so FORK_REARRANGE_STDIO can move it onto stdin/stdout/stderr without disturbing
+                 * the fd we hand QEMU's console chardev via the fd set. */
+                child_pty = fd_reopen(console_backend_fd, O_RDWR|O_NOCTTY);
+                if (child_pty < 0)
+                        return log_error_errno(child_pty, "Failed to reopen PTY backend: %m");
+        } else if (master >= 0) {
+                child_pty = pty_open_peer(master, O_RDWR|O_NOCTTY);
                 if (child_pty < 0)
                         return log_error_errno(child_pty, "Failed to open PTY slave: %m");
         }
@@ -3853,9 +4135,19 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 _exit(EXIT_FAILURE);
         }
 
+        /* Not owned. Disarmed once the guest runs, as then the console has its output instead of QEMU's. In
+         * broker mode 'master' is the monitor connection to ptybrokerd rather than a non-blocking PTY master:
+         * it is blocking and never hits EOF/EIO, hence don't try to flush it. */
+        _cleanup_(flush_console_to_stderrp) int early_console =
+                IN_SET(arg_console_mode, CONSOLE_BROKER, CONSOLE_BROKER_LOG) ? -EBADF : master;
+
         /* Close QEMU's end of the QMP socketpair in the parent. We don't need it anymore. */
         child_pty = safe_close(child_pty);
         bridge_fds[1] = safe_close(bridge_fds[1]);
+
+        /* In broker mode QEMU has inherited the console backend (slave) fd via the fd set; release our copy
+         * so we don't keep the pseudo TTY's backend side pinned open for the VM's entire lifetime. */
+        console_backend_fd = safe_close(console_backend_fd);
 
         r = prepare_device_info(&config);
         if (r < 0)
@@ -3891,10 +4183,20 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         if (r < 0)
                 return r;
 
-        /* Resume vCPUs and switch to async event processing */
-        r = vmspawn_qmp_start(bridge);
+        r = vmspawn_memory_setup(bridge, ram, balloon);
         if (r < 0)
                 return r;
+
+        /* Resume vCPUs and switch to async event processing. The reset is only needed to power the
+         * PCIe root port slots of boot-time devices. QEMU can only reset confidential guests if it can
+         * rebuild their protected state, older versions shut them down instead. They only exist on x86,
+         * where q35's default ACPI hotplug does not need the reset. */
+        r = vmspawn_qmp_start(bridge, /* reset_machine= */ ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS &&
+                                                           arg_confidential_computing == COCO_NO);
+        if (r < 0)
+                return r;
+
+        early_console = -EBADF;
 
         /* Varlink server for VM control */
         _cleanup_(vmspawn_varlink_context_freep) VmspawnVarlinkContext *varlink_ctx = NULL;
@@ -3942,9 +4244,9 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 scope_allocated = true;
         } else {
                 if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)
-                        r = cg_pid_get_unit(0, &unit);
+                        r = cg_pid_get_unit(/* pid= */ 0, &unit);
                 else
-                        r = cg_pid_get_user_unit(0, &unit);
+                        r = cg_pid_get_user_unit(/* pid= */ 0, &unit);
                 if (r < 0)
                         return log_error_errno(r, "Failed to get our own unit: %m");
         }
@@ -3998,13 +4300,13 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *notify_event_source = NULL;
 
         if (system_bus) {
-                r = sd_bus_attach_event(system_bus, event, 0);
+                r = sd_bus_attach_event(system_bus, event, /* priority= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach system bus to event loop: %m");
         }
 
         if (user_bus) {
-                r = sd_bus_attach_event(user_bus, event, 0);
+                r = sd_bus_attach_event(user_bus, event, /* priority= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach user bus to event loop: %m");
         }
@@ -4027,13 +4329,13 @@ static int run_virtual_machine(int kvm_device_fd, int vhost_device_fd) {
                 .pidref = &child_pidref,
         };
 
-        (void) sd_event_add_signal(event, NULL, SIGINT | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
-        (void) sd_event_add_signal(event, NULL, SIGTERM | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
-        (void) sd_event_add_signal(event, NULL, (SIGRTMIN+4) | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGINT | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGTERM | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
+        (void) sd_event_add_signal(event, /* ret= */ NULL, (SIGRTMIN+4) | SD_EVENT_SIGNAL_PROCMASK, shutdown_vm_graceful, &shutdown_info);
 
-        (void) sd_event_add_signal(event, NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, NULL);
+        (void) sd_event_add_signal(event, /* ret= */ NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
 
-        r = sd_event_add_memory_pressure(event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
@@ -4167,7 +4469,7 @@ static int determine_names(void) {
                                 return log_oom();
 
                 hostname_cleanup(arg_machine);
-                if (!hostname_is_valid(arg_machine, 0))
+                if (!hostname_is_valid(arg_machine, /* flags= */ 0))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to determine machine name automatically, please use -M.");
         }
 
@@ -4231,13 +4533,15 @@ static int verify_arguments(void) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--firmware=none requires --linux= to be specified.");
 
-        if (arg_image_disk_type == DISK_TYPE_VIRTIO_SCSI_CDROM) {
+        if (disk_type_is_read_only(arg_image_disk_type)) {
+                const char *disk_type = disk_type_to_string(arg_image_disk_type);
+
                 if (arg_ephemeral)
-                        log_warning("--ephemeral has no effect with --image-disk-type=scsi-cd (CD-ROMs are read-only).");
+                        log_warning("--ephemeral has no effect with read-only --image-disk-type=%s.", disk_type);
                 if (arg_discard_disk)
-                        log_warning("--discard-disk has no effect with --image-disk-type=scsi-cd (CD-ROMs are read-only).");
+                        log_warning("--discard-disk has no effect with read-only --image-disk-type=%s.", disk_type);
                 if (arg_grow_image)
-                        log_warning("--grow-image has no effect with --image-disk-type=scsi-cd (CD-ROMs are read-only).");
+                        log_warning("--grow-image has no effect with read-only --image-disk-type=%s.", disk_type);
         }
 
         /* In ephemeral mode the size is picked when creating the qcow2 overlay, so the base image format
@@ -4247,6 +4551,9 @@ static int verify_arguments(void) {
                                        "--grow-image is not supported for qcow2 images, use 'qemu-img resize FILE SIZE'.");
 
         if (arg_confidential_computing != COCO_NO) {
+                if (arg_firmware_type == FIRMWARE_UEFI && !arg_firmware)
+                        return log_coco_requires_firmware();
+
                 /* Confidential computing firmware is stateless, there is no NVRAM to instantiate from a
                  * template or to persist. */
                 if (arg_efi_nvram_template)
@@ -4257,6 +4564,15 @@ static int verify_arguments(void) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "An explicit --efi-nvram-state= path cannot be used with --coco=, "
                                                "confidential computing firmware is stateless. Use 'off' or 'auto'.");
+
+                /* A TPM emulated by the host is under the host's control and adds no trust to a confidential
+                 * VM: attestation rests on the launch measurement and the VM's measurement registers, and
+                 * whatever the guest measures into or seals with such a TPM is open to the host. Hence only
+                 * attach one if explicitly requested. */
+                if (arg_tpm > 0)
+                        log_warning("A TPM attached with --tpm=yes is under the host's control and can't be trusted by the confidential VM.");
+                else
+                        arg_tpm = false;
         }
 
         if (arg_confidential_computing == COCO_SEV_SNP) {
@@ -4270,8 +4586,6 @@ static int verify_arguments(void) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "--coco=sev-snp can't be used with %s firmware",
                                                firmware_to_string(arg_firmware_type));
-                if (arg_tpm > 0)
-                        log_warning("TPM can't be trusted by the confidential computing guest");
                 /* kernel-hashes=on only covers what QEMU itself loads via -kernel/-initrd/-append.
                  * Without --linux= the kernel and initrd come off disk via OVMF and aren't part
                  * of the launch measurement, leaving the guest unattestable in any meaningful
@@ -4293,8 +4607,6 @@ static int verify_arguments(void) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "--coco=tdx can't be used with %s firmware",
                                                firmware_to_string(arg_firmware_type));
-                if (arg_tpm > 0)
-                        log_warning("TPM can't be trusted by the confidential computing guest");
         }
 
         return 0;
@@ -4318,6 +4630,9 @@ static int run(int argc, char *argv[]) {
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        if (arg_firmware_list)
+                return list_firmware();
 
         if (arg_firmware_describe) {
                 _cleanup_(ovmf_config_freep) OvmfConfig *ovmf_config = NULL;
@@ -4354,7 +4669,7 @@ static int run(int argc, char *argv[]) {
                 log_info("%s %sSpawning VM %s on %s.%s",
                          glyph(GLYPH_LIGHT_SHADE), ansi_grey(), arg_machine, u ?: vm_path, ansi_normal());
 
-                if (arg_console_mode == CONSOLE_INTERACTIVE)
+                if (IN_SET(arg_console_mode, CONSOLE_INTERACTIVE, CONSOLE_BROKER, CONSOLE_BROKER_LOG))
                         log_info("%s %sPress %sCtrl-]%s three times within 1s to kill VM.%s",
                                  glyph(GLYPH_LIGHT_SHADE), ansi_grey(), ansi_highlight(), ansi_grey(), ansi_normal());
                 else if (arg_console_mode == CONSOLE_NATIVE)
@@ -4362,7 +4677,7 @@ static int run(int argc, char *argv[]) {
                                  glyph(GLYPH_LIGHT_SHADE), ansi_grey(), ansi_highlight(), ansi_grey(), ansi_normal());
         }
 
-        int n = sd_listen_fds_with_names(true, &names);
+        int n = sd_listen_fds_with_names(/* unset_environment= */ true, &names);
         if (n < 0)
                 return log_error_errno(n, "Failed to get passed file descriptors: %m");
 

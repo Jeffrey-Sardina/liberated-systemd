@@ -6,7 +6,7 @@
 # shellcheck disable=SC2034
 [[ -e /var/tmp/.systemd_reboot_count ]] && REBOOT_COUNT="$(</var/tmp/.systemd_reboot_count)" || REBOOT_COUNT=0
 
-assert_ok() {(
+assert_ok() (
     set +ex
 
     local rc
@@ -17,9 +17,9 @@ assert_ok() {(
         echo "FAIL: command '$*' failed with exit code $rc" >&2
         exit 1
     fi
-)}
+)
 
-assert_fail() {(
+assert_fail() (
     set +ex
 
     local rc
@@ -28,45 +28,81 @@ assert_fail() {(
         echo "FAIL: command '$*' unexpectedly succeeded" >&2
         exit 1
     fi
-)}
+)
 
-assert_eq() {(
+assert_eq() (
     set +ex
 
     if [[ "${1?}" != "${2?}" ]]; then
         echo "FAIL: expected: '$2' actual: '$1'" >&2
         exit 1
     fi
-)}
+)
 
-assert_neq() {(
+assert_neq() (
     set +ex
 
     if [[ "${1?}" = "${2?}" ]]; then
         echo "FAIL: not expected: '$2' actual: '$1'" >&2
         exit 1
     fi
-)}
+)
 
-assert_le() {(
+assert_empty() (
+    set +ex
+
+    if [[ -n "${1?}" ]]; then
+        echo "FAIL: expected an empty string, actual: '$1'" >&2
+        exit 1
+    fi
+)
+
+assert_not_empty() (
+    set +ex
+
+    if [[ -z "${1?}" ]]; then
+        echo "FAIL: expected a non-empty string" >&2
+        exit 1
+    fi
+)
+
+assert_lt() (
+    set +ex
+
+    if [[ "${1:?}" -ge "${2:?}" ]]; then
+        echo "FAIL: '$1' >= '$2'" >&2
+        exit 1
+    fi
+)
+
+assert_le() (
     set +ex
 
     if [[ "${1:?}" -gt "${2:?}" ]]; then
         echo "FAIL: '$1' > '$2'" >&2
         exit 1
     fi
-)}
+)
 
-assert_ge() {(
+assert_gt() (
+    set +ex
+
+    if [[ "${1:?}" -le "${2:?}" ]]; then
+        echo "FAIL: '$1' <= '$2'" >&2
+        exit 1
+    fi
+)
+
+assert_ge() (
     set +ex
 
     if [[ "${1:?}" -lt "${2:?}" ]]; then
         echo "FAIL: '$1' < '$2'" >&2
         exit 1
     fi
-)}
+)
 
-assert_in() {(
+assert_in() (
     set +ex
 
     if ! [[ "${2?}" =~ ${1?} ]]; then
@@ -74,9 +110,9 @@ assert_in() {(
         echo "$2" >&2
         exit 1
     fi
-)}
+)
 
-assert_not_in() {(
+assert_not_in() (
     set +ex
 
     if [[ "${2?}" =~ ${1?} ]]; then
@@ -84,9 +120,9 @@ assert_not_in() {(
         echo "$2" >&2
         exit 1
     fi
-)}
+)
 
-assert_rc() {(
+assert_rc() (
     set +ex
 
     local rc exp="${1?}"
@@ -95,14 +131,14 @@ assert_rc() {(
     "$@"
     rc=$?
     assert_eq "$rc" "$exp"
-)}
+)
 
 assert_not_reached() {
     echo >&2 "Code should not be reached at ${BASH_SOURCE[1]}:${BASH_LINENO[1]}, function ${FUNCNAME[1]}()"
     exit 1
 }
 
-run_and_grep() {(
+run_and_grep() (
     set +ex
 
     local expression
@@ -139,7 +175,7 @@ run_and_grep() {(
     fi
 
     rm -f "$log"
-)}
+)
 
 get_cgroup_hierarchy() {
     case "$(stat -c '%T' -f /sys/fs/cgroup)" in
@@ -179,6 +215,17 @@ coverage_create_nspawn_dropin() {
     container="$(basename "$root")"
     mkdir -p "/run/systemd/nspawn"
     echo -ne "[Files]\nBind=$COVERAGE_BUILD_DIR\n" >"/run/systemd/nspawn/${container:?}.nspawn"
+}
+
+dummy_container_has() {
+    local binary="${1:?}"
+
+    if [[ ! -f "/usr/share/TEST-13-NSPAWN-container-template/$binary" ]]; then
+        echo "No $binary in the container template" >>/skipped
+        return 1
+    fi
+
+    return 0
 }
 
 create_dummy_container() {
@@ -306,7 +353,10 @@ kernel_supports_lsm() {
 machine_supports_verity_keyring() {
     # Requires kernel built with certain kconfigs, as listed in README:
     # https://oracle.github.io/kconfigs/?config=UTS_RELEASE&config=DM_VERITY_VERIFY_ROOTHASH_SIG&config=DM_VERITY_VERIFY_ROOTHASH_SIG_SECONDARY_KEYRING&config=DM_VERITY_VERIFY_ROOTHASH_SIG_PLATFORM_KEYRING&config=IMA_ARCH_POLICY&config=INTEGRITY_MACHINE_KEYRING
-    if grep -q "$(openssl x509 -noout -subject -in /usr/share/mkosi.crt | sed 's/^.*CN=//')" /proc/keys && \
+    # Only the keyrings dm-verity consults count, .fs-verity holds the same certificate without implying
+    # verity signature support
+    if { keyctl list %:.dm-verity; keyctl list %:.platform; keyctl list %:.machine; keyctl list %:.secondary_trusted_keys; :; } 2>/dev/null |
+            grep -F "$(openssl x509 -noout -subject -in /usr/share/mkosi.crt | sed 's/^.*CN=//')" >/dev/null && \
             ( . /etc/os-release; [ "$ID" != "centos" ] || systemd-analyze compare-versions "$VERSION_ID" ge 10 ) && \
             ( . /etc/os-release; [ "$ID" != "debian" ] || [ -z "${VERSION_ID:-}" ] || systemd-analyze compare-versions "$VERSION_ID" ge 13 ) && \
             ( . /etc/os-release; [ "$ID" != "ubuntu" ] || systemd-analyze compare-versions "$VERSION_ID" ge 24.04 ) && \
@@ -688,4 +738,61 @@ device_get_udev_db() {
 
     id=$(udevadm info "$dev" | awk '/^J:/ { print $2 }')
     echo /run/udev/data/"$id"
+}
+
+# Waits until no PTY registered with systemd-ptybrokerd carries the specified string in any column of
+# "ptyctl list" anymore (i.e. as its name, or as its description for PTYs acquired by the service manager on
+# behalf of a unit). Deregistration happens asynchronously, hence poll for it. A failing "ptyctl list" is
+# fatal here, rather than being mistaken for the entry being gone.
+wait_for_pty_deregistration() {
+    local name="${1:?}" listing
+
+    for _ in {1..20}; do
+        listing="$(ptyctl list)"
+        if ! tr -s ' ' '\n' <<<"$listing" | grep -Fx "$name" >/dev/null; then
+            return 0
+        fi
+        sleep .5
+    done
+
+    echo >&2 "PTY '$name' was not deregistered in time:"
+    echo >&2 "$listing"
+    return 1
+}
+
+# Prints the io.systemd.MachineInstance varlink address machined reports for MACHINE.
+# Returns 1 if the machine is unknown or has no control address.
+machine_control_address() {
+    local machine="${1:?}" address
+    address="$(varlinkctl call /run/systemd/machine/io.systemd.Machine \
+        io.systemd.Machine.List "{\"name\":\"$machine\"}" | jq -r '.controlAddress')"
+    [[ -n "$address" && "$address" != null ]] || return 1
+    echo "$address"
+}
+
+# Prints the directory with the built guest image, kernel and initrd from /work/vm-images for
+# tests declaring 'vm-images'. Returns 1 if any file is missing.
+vmspawn_images_dir() {
+    local dir=/work/vm-images f
+    for f in image.raw image.vmlinuz image.initrd; do
+        [[ -f "$dir/$f" ]] || return 1
+    done
+    echo "$dir"
+}
+
+# Prerequisites for launching any guest with systemd-vmspawn in the test environment.
+# Prints the reason and returns 1 if one is missing, so callers can put it in their skip message.
+can_run_vmspawn() {
+    if [[ -v ASAN_OPTIONS ]]; then
+        echo "vmspawn launches QEMU which doesn't work under ASan"
+        return 1
+    fi
+    if ! command -v systemd-vmspawn >/dev/null 2>&1; then
+        echo "systemd-vmspawn not found"
+        return 1
+    fi
+    if ! find_qemu_binary; then
+        echo "QEMU not found"
+        return 1
+    fi
 }

@@ -31,6 +31,7 @@ DLSYM_PROTOTYPE(bpf_map__name) = NULL;
 DLSYM_PROTOTYPE(bpf_map__set_inner_map_fd) = NULL;
 DLSYM_PROTOTYPE(bpf_map__set_max_entries) = NULL;
 DLSYM_PROTOTYPE(bpf_map__set_pin_path) = NULL;
+DLSYM_PROTOTYPE(bpf_map__set_type) = NULL;
 DLSYM_PROTOTYPE(bpf_map_create) = NULL;
 DLSYM_PROTOTYPE(bpf_map_delete_elem) = NULL;
 DLSYM_PROTOTYPE(bpf_map_get_fd_by_id) = NULL;
@@ -48,6 +49,7 @@ DLSYM_PROTOTYPE(bpf_object__pin_maps) = NULL;
 DLSYM_PROTOTYPE(bpf_program__attach) = NULL;
 DLSYM_PROTOTYPE(bpf_program__attach_cgroup) = NULL;
 DLSYM_PROTOTYPE(bpf_program__attach_lsm) = NULL;
+DLSYM_PROTOTYPE(bpf_program__fd) = NULL;
 DLSYM_PROTOTYPE(bpf_program__name) = NULL;
 DLSYM_PROTOTYPE(bpf_program__set_autoload) = NULL;
 static int missing_bpf_token_create(int bpffs_fd, struct bpf_token_create_opts *opts) {
@@ -57,6 +59,7 @@ DLSYM_PROTOTYPE(bpf_token_create) = missing_bpf_token_create;
 DLSYM_PROTOTYPE(btf__find_by_name_kind) = NULL;
 DLSYM_PROTOTYPE(btf__free) = NULL;
 DLSYM_PROTOTYPE(btf__load_vmlinux_btf) = NULL;
+DLSYM_PROTOTYPE(btf__type_by_id) = NULL;
 DLSYM_PROTOTYPE(libbpf_set_print) = NULL;
 DLSYM_PROTOTYPE(ring_buffer__epoll_fd) = NULL;
 DLSYM_PROTOTYPE(ring_buffer__free) = NULL;
@@ -74,7 +77,7 @@ static int bpf_print_func(enum libbpf_print_level level, const char *fmt, va_lis
 
         /* errno is used here, on the assumption that if the log message uses %m, errno will be set to
          * something useful. Otherwise, it shouldn't matter, we may pass 0 or some bogus value. */
-        return log_internalv(LOG_DEBUG, errno, NULL, 0, NULL, fmt, ap);
+        return log_internalv(LOG_DEBUG, errno, /* file= */ NULL, /* line= */ 0, /* func= */ NULL, fmt, ap);
 }
 
 #endif
@@ -107,6 +110,7 @@ int dlopen_bpf(int log_level) {
                                 DLSYM_ARG(bpf_map__set_inner_map_fd),
                                 DLSYM_ARG(bpf_map__set_max_entries),
                                 DLSYM_ARG(bpf_map__set_pin_path),
+                                DLSYM_ARG(bpf_map__set_type),
                                 DLSYM_ARG(bpf_map_delete_elem),
                                 DLSYM_ARG(bpf_map_get_fd_by_id),
                                 DLSYM_ARG(bpf_map_lookup_elem),
@@ -129,6 +133,7 @@ int dlopen_bpf(int log_level) {
                                 DLSYM_ARG_FORCE(bpf_program__attach_cgroup),
                                 DLSYM_ARG_FORCE(bpf_program__attach_lsm),
 #endif
+                                DLSYM_ARG(bpf_program__fd),
                                 DLSYM_ARG(bpf_program__name),
                                 DLSYM_ARG(bpf_program__set_autoload),
                                 DLSYM_ARG(libbpf_get_error),
@@ -147,10 +152,10 @@ int dlopen_bpf(int log_level) {
 
         /* Version-specific symbols: bpf_create_map exists only in libbpf < 1.0; bpf_map_create and
          * bpf_object__next_map only in 0.7+. bpf_token_create only in 1.5+. btf__load_vmlinux_btf only in
-         * 0.5+; its two btf__* companions are older, but keep the whole probe trio optional so a missing
-         * symbol degrades bpf_kernel_has_kfunc() instead of failing dlopen_bpf() entirely. Unresolved
-         * prototypes keep their initializers (NULL, or a fallback returning -ENOSYS for
-         * bpf_token_create). */
+         * 0.5+. The other btf__* symbols are older, but we keep all of them optional. Callers that inspect
+         * the kernel BTF, such as bpf_kernel_has_kfunc() and nsresourced, then report the feature as
+         * missing instead of failing dlopen_bpf() entirely. Unresolved prototypes keep their initializers
+         * (NULL, or a fallback returning -ENOSYS for bpf_token_create). */
         DLSYM_OPTIONAL(bpf_dl, bpf_create_map);
         DLSYM_OPTIONAL(bpf_dl, bpf_map_create);
         DLSYM_OPTIONAL(bpf_dl, bpf_object__next_map);
@@ -158,6 +163,7 @@ int dlopen_bpf(int log_level) {
         DLSYM_OPTIONAL(bpf_dl, btf__find_by_name_kind);
         DLSYM_OPTIONAL(bpf_dl, btf__free);
         DLSYM_OPTIONAL(bpf_dl, btf__load_vmlinux_btf);
+        DLSYM_OPTIONAL(bpf_dl, btf__type_by_id);
 
         /* We set the print helper unconditionally. Otherwise libbpf will emit not useful log messages. */
         (void) sym_libbpf_set_print(bpf_print_func);
@@ -186,8 +192,6 @@ int bpf_get_error_translated(const void *ptr) {
                 return r;
         }
 }
-
-DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(struct btf *, sym_btf__free, NULL);
 
 bool bpf_kernel_has_kfunc(const char *name) {
         _cleanup_(sym_btf__freep) struct btf *btf = NULL;

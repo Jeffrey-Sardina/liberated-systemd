@@ -154,7 +154,7 @@ int id128_get_machine_at(int rfd, sd_id128_t *ret) {
                 return sd_id128_get_machine(ret);
 
         _cleanup_close_ int fd =
-                chase_and_openat(rfd, rfd, "/etc/machine-id", CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
+                chase_and_openat(rfd, rfd, "/etc/machine-id", CHASE_MUST_BE_REGULAR, O_RDONLY|O_NOCTTY, /* ret_path= */ NULL);
         if (fd < 0)
                 return fd;
 
@@ -166,7 +166,7 @@ int id128_get_machine(const char *root, sd_id128_t *ret) {
                 return sd_id128_get_machine(ret);
 
         _cleanup_close_ int fd =
-                chase_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT|CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
+                chase_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT|CHASE_MUST_BE_REGULAR, O_RDONLY|O_NOCTTY, /* ret_path= */ NULL);
         if (fd < 0)
                 return fd;
 
@@ -214,7 +214,7 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
 
         assert(ret);
 
-        key = request_key("user", "invocation_id", NULL, 0);
+        key = request_key("user", "invocation_id", /* callout_info= */ NULL, /* destringid= */ 0);
         if (key == -1) {
                 /* Keyring support not available? Keyring access locked down? No invocation key stored? */
                 if (ERRNO_IS_NOT_SUPPORTED(errno) ||

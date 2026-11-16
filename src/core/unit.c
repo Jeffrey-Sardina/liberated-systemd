@@ -206,7 +206,7 @@ static void unit_init(Unit *u) {
                         /* User manager might have its umask redefined by PAM or UMask=. In this
                          * case let the units it manages inherit this value by default. They can
                          * still tune this value through their own unit file */
-                        (void) get_process_umask(0, &ec->umask);
+                        (void) get_process_umask(/* pid= */ 0, &ec->umask);
                 }
         }
 
@@ -538,7 +538,8 @@ void unit_add_to_dbus_queue(Unit *u) {
         /* Shortcut things if nobody cares */
         if (sd_bus_track_count(u->manager->subscribed) <= 0 &&
             sd_bus_track_count(u->bus_track) <= 0 &&
-            set_isempty(u->manager->private_buses)) {
+            set_isempty(u->manager->private_buses) &&
+            !u->varlink_unit_change) {
                 u->sent_dbus_new_signal = true;
                 return;
         }
@@ -572,7 +573,7 @@ void unit_submit_to_start_when_upheld_queue(Unit *u) {
         if (!UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(u)))
                 return;
 
-        if (!unit_has_dependency(u, UNIT_ATOM_START_STEADILY, NULL))
+        if (!unit_has_dependency(u, UNIT_ATOM_START_STEADILY, /* other= */ NULL))
                 return;
 
         LIST_PREPEND(start_when_upheld_queue, u->manager->start_when_upheld_queue, u);
@@ -588,7 +589,7 @@ void unit_submit_to_stop_when_bound_queue(Unit *u) {
         if (!UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u)))
                 return;
 
-        if (!unit_has_dependency(u, UNIT_ATOM_CANNOT_BE_ACTIVE_WITHOUT, NULL))
+        if (!unit_has_dependency(u, UNIT_ATOM_CANNOT_BE_ACTIVE_WITHOUT, /* other= */ NULL))
                 return;
 
         LIST_PREPEND(stop_when_bound_queue, u->manager->stop_when_bound_queue, u);
@@ -793,7 +794,6 @@ Unit* unit_free(Unit *u) {
 
         u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
         u->bus_track = sd_bus_track_unref(u->bus_track);
-        u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
         u->deserialized_refs = strv_free(u->deserialized_refs);
         u->pending_freezer_invocation = sd_bus_message_unref(u->pending_freezer_invocation);
 
@@ -819,6 +819,9 @@ Unit* unit_free(Unit *u) {
                 job_free(j);
         }
 
+        /* Only after the jobs are gone, as across a reload they stash whether this subscription is theirs */
+        u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
+
         /* A unit is being dropped from the tree, make sure our family is realized properly. Do this after we
          * detach the unit from slice tree in order to eliminate its effect on controller masks. */
         slice = UNIT_GET_SLICE(u);
@@ -834,9 +837,9 @@ Unit* unit_free(Unit *u) {
         if (!MANAGER_IS_RELOADING(u->manager))
                 unit_unlink_state_files(u);
 
-        unit_unref_uid_gid(u, false);
+        unit_unref_uid_gid(u, /* destroy_now= */ false);
 
-        (void) manager_update_failed_units(u->manager, u, false);
+        (void) manager_update_failed_units(u->manager, u, /* failed= */ false);
         set_remove(u->manager->startup_units, u);
 
         unit_unwatch_all_pids(u);
@@ -971,7 +974,7 @@ static int unit_reserve_dependencies(Unit *u, Unit *other) {
 
         n_reserve = MIN(hashmap_size(other->dependencies), LESS_BY((size_t) _UNIT_DEPENDENCY_MAX, hashmap_size(u->dependencies)));
         if (n_reserve > 0) {
-                r = hashmap_ensure_allocated(&u->dependencies, NULL);
+                r = hashmap_ensure_allocated(&u->dependencies, /* hash_ops= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -1315,7 +1318,7 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
         if (c->directories[EXEC_DIRECTORY_STATE].n_items > 0 ||
             c->directories[EXEC_DIRECTORY_CACHE].n_items > 0 ||
             c->directories[EXEC_DIRECTORY_LOGS].n_items > 0) {
-                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, true, UNIT_DEPENDENCY_FILE);
+                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
         }
@@ -1342,7 +1345,7 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
         }
 
         if (c->private_tmp == PRIVATE_TMP_CONNECTED || c->private_var_tmp == PRIVATE_TMP_CONNECTED) {
-                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_TMPFILES_SETUP_SERVICE, true, UNIT_DEPENDENCY_FILE);
+                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_TMPFILES_SETUP_SERVICE, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
         }
@@ -1351,7 +1354,7 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
                 /* We need to wait for /dev/loopX to appear when doing RootImage=, hence let's add an
                  * implicit dependency on udev. (And for RootMStack= we might need it) */
 
-                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_UDEVD_SERVICE, true, UNIT_DEPENDENCY_FILE);
+                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_UDEVD_SERVICE, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
         }
@@ -1375,7 +1378,7 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
                         if (r < 0)
                                 return r;
 
-                        r = unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_REQUIRES, unit, true, UNIT_DEPENDENCY_FILE);
+                        r = unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_REQUIRES, unit, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                         if (r < 0)
                                 return r;
                 }
@@ -1384,7 +1387,16 @@ int unit_add_exec_dependencies(Unit *u, ExecContext *c) {
                    IN_SET(c->std_error,  EXEC_OUTPUT_JOURNAL, EXEC_OUTPUT_JOURNAL_AND_CONSOLE,
                                          EXEC_OUTPUT_KMSG, EXEC_OUTPUT_KMSG_AND_CONSOLE)) {
 
-                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_JOURNALD_SOCKET, true, UNIT_DEPENDENCY_FILE);
+                r = unit_add_dependency_by_name(u, UNIT_AFTER, SPECIAL_JOURNALD_SOCKET, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
+                if (r < 0)
+                        return r;
+        }
+
+        /* If any of the standard streams is connected to a pseudo TTY allocated by ptybrokerd, make sure the
+         * broker's socket is pulled in and around first, so that the broker is activated on demand even if
+         * the socket isn't enabled statically. */
+        if (exec_context_has_broker(c)) {
+                r = unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, SPECIAL_PTYBROKERD_SOCKET, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
         }
@@ -1511,7 +1523,7 @@ int unit_add_default_target_dependency(Unit *u, Unit *target) {
         if (unit_has_dependency(target, UNIT_ATOM_BEFORE, u))
                 return 0;
 
-        return unit_add_dependency(target, UNIT_AFTER, u, true, UNIT_DEPENDENCY_DEFAULT);
+        return unit_add_dependency(target, UNIT_AFTER, u, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int unit_add_slice_dependencies(Unit *u) {
@@ -1532,13 +1544,13 @@ static int unit_add_slice_dependencies(Unit *u) {
                 if (!IN_SET(slice->freezer_state, FREEZER_RUNNING, FREEZER_THAWING))
                         u->freezer_state = FREEZER_FROZEN_BY_PARENT;
 
-                return unit_add_two_dependencies(u, UNIT_AFTER, UNIT_REQUIRES, slice, true, mask);
+                return unit_add_two_dependencies(u, UNIT_AFTER, UNIT_REQUIRES, slice, /* add_reference= */ true, mask);
         }
 
         if (unit_has_name(u, SPECIAL_ROOT_SLICE))
                 return 0;
 
-        return unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_REQUIRES, SPECIAL_ROOT_SLICE, true, mask);
+        return unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_REQUIRES, SPECIAL_ROOT_SLICE, /* add_reference= */ true, mask);
 }
 
 static int unit_add_mount_dependencies(Unit *u) {
@@ -1640,14 +1652,14 @@ static int unit_add_oomd_dependencies(Unit *u) {
         if (!FLAGS_SET(mask, CGROUP_MASK_MEMORY))
                 return 0;
 
-        return unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, "systemd-oomd.service", true, UNIT_DEPENDENCY_FILE);
+        return unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, "systemd-oomd.service", /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
 }
 
 static int unit_add_startup_units(Unit *u) {
         if (!unit_has_startup_cgroup_constraints(u))
                 return 0;
 
-        return set_ensure_put(&u->manager->startup_units, NULL, u);
+        return set_ensure_put(&u->manager->startup_units, /* hash_ops= */ NULL, u);
 }
 
 static const struct {
@@ -1817,6 +1829,7 @@ static bool unit_test_condition(Unit *u) {
                 u->condition_result = condition_test_list(
                                 u->conditions,
                                 env,
+                                u->manager->runtime_scope,
                                 condition_type_to_string,
                                 log_unit_internal,
                                 u) > 0;
@@ -1841,6 +1854,7 @@ static bool unit_test_assert(Unit *u) {
                 u->assert_result = condition_test_list(
                                 u->asserts,
                                 env,
+                                u->manager->runtime_scope,
                                 assert_type_to_string,
                                 log_unit_internal,
                                 u) > 0;
@@ -2182,7 +2196,7 @@ bool unit_can_reload(Unit *u) {
         if (UNIT_VTABLE(u)->can_reload)
                 return UNIT_VTABLE(u)->can_reload(u);
 
-        if (unit_has_dependency(u, UNIT_ATOM_PROPAGATES_RELOAD_TO, NULL))
+        if (unit_has_dependency(u, UNIT_ATOM_PROPAGATES_RELOAD_TO, /* other= */ NULL))
                 return true;
 
         return UNIT_VTABLE(u)->reload;
@@ -3079,11 +3093,11 @@ static Hashmap *unit_get_dependency_hashmap_per_type(Unit *u, UnitDependency d) 
         if (!deps) {
                 _cleanup_hashmap_free_ Hashmap *h = NULL;
 
-                h = hashmap_new(NULL);
+                h = hashmap_new(/* hash_ops= */ NULL);
                 if (!h)
                         return NULL;
 
-                if (hashmap_ensure_put(&u->dependencies, NULL, UNIT_DEPENDENCY_TO_PTR(d), h) < 0)
+                if (hashmap_ensure_put(&u->dependencies, /* hash_ops= */ NULL, UNIT_DEPENDENCY_TO_PTR(d), h) < 0)
                         return NULL;
 
                 deps = TAKE_PTR(h);
@@ -3353,7 +3367,7 @@ int unit_add_dependency_by_name(Unit *u, UnitDependency d, const char *name, boo
         if (u->manager && FLAGS_SET(u->manager->test_run_flags, MANAGER_TEST_RUN_IGNORE_DEPENDENCIES))
                 return 0;
 
-        r = manager_load_unit(u->manager, name, NULL, NULL, &other);
+        r = manager_load_unit(u->manager, name, /* path= */ NULL, NULL, &other);
         if (r < 0)
                 return r;
 
@@ -3375,7 +3389,7 @@ int unit_add_two_dependencies_by_name(Unit *u, UnitDependency d, UnitDependency 
         if (u->manager && FLAGS_SET(u->manager->test_run_flags, MANAGER_TEST_RUN_IGNORE_DEPENDENCIES))
                 return 0;
 
-        r = manager_load_unit(u->manager, name, NULL, NULL, &other);
+        r = manager_load_unit(u->manager, name, /* path= */ NULL, NULL, &other);
         if (r < 0)
                 return r;
 
@@ -3490,7 +3504,7 @@ int unit_set_slice(Unit *u, Unit *slice) {
         if (UNIT_GET_SLICE(u))
                 unit_remove_dependencies(u, UNIT_DEPENDENCY_SLICE_PROPERTY);
 
-        r = unit_add_dependency(u, UNIT_IN_SLICE, slice, true, UNIT_DEPENDENCY_SLICE_PROPERTY);
+        r = unit_add_dependency(u, UNIT_IN_SLICE, slice, /* add_reference= */ true, UNIT_DEPENDENCY_SLICE_PROPERTY);
         if (r < 0)
                 return r;
 
@@ -3542,7 +3556,7 @@ int unit_set_default_slice(Unit *u) {
         else
                 slice_name = SPECIAL_APP_SLICE;
 
-        r = manager_load_unit(u->manager, slice_name, NULL, NULL, &slice);
+        r = manager_load_unit(u->manager, slice_name, /* path= */ NULL, NULL, &slice);
         if (r < 0)
                 return r;
 
@@ -3574,7 +3588,7 @@ int unit_load_related_unit(Unit *u, const char *type, Unit **_found) {
         if (unit_has_name(u, t))
                 return -EINVAL;
 
-        r = manager_load_unit(u->manager, t, NULL, NULL, _found);
+        r = manager_load_unit(u->manager, t, /* path= */ NULL, NULL, _found);
         assert(r < 0 || *_found != u);
         return r;
 }
@@ -3738,7 +3752,7 @@ int unit_watch_bus_name(Unit *u, const char *name) {
         /* Watch a specific name on the bus. We only support one unit
          * watching each name for now. */
 
-        if (u->manager->api_bus) {
+        if (u->manager->api_bus_ready) {
                 /* If the bus is already available, install the match directly.
                  * Otherwise, just put the name in the list. bus_setup_api() will take care later. */
                 r = unit_install_bus_match(u, u->manager->api_bus, name);
@@ -3787,7 +3801,7 @@ int unit_add_node_dependency(Unit *u, const char *what, UnitDependency dep, Unit
         if (r < 0)
                 return r;
 
-        r = manager_load_unit(u->manager, e, NULL, NULL, &device);
+        r = manager_load_unit(u->manager, e, /* path= */ NULL, NULL, &device);
         if (r < 0)
                 return r;
 
@@ -3796,7 +3810,7 @@ int unit_add_node_dependency(Unit *u, const char *what, UnitDependency dep, Unit
 
         return unit_add_two_dependencies(u, UNIT_AFTER,
                                          MANAGER_IS_SYSTEM(u->manager) ? dep : UNIT_WANTS,
-                                         device, true, mask);
+                                         device, /* add_reference= */ true, mask);
 }
 
 int unit_add_blockdev_dependency(Unit *u, const char *what, UnitDependencyMask mask) {
@@ -3823,7 +3837,7 @@ int unit_add_blockdev_dependency(Unit *u, const char *what, UnitDependencyMask m
         if (r < 0)
                 return r;
 
-        return unit_add_dependency_by_name(u, UNIT_AFTER, target, true, mask);
+        return unit_add_dependency_by_name(u, UNIT_AFTER, target, /* add_reference= */ true, mask);
 }
 
 int unit_coldplug(Unit *u) {
@@ -3900,7 +3914,7 @@ bool unit_need_daemon_reload(Unit *u) {
                 return true;
 
         /* Source paths should not be masked… */
-        if (fragment_mtime_newer(u->source_path, u->source_mtime, false))
+        if (fragment_mtime_newer(u->source_path, u->source_mtime, /* path_masked= */ false))
                 return true;
 
         if (u->load_state == UNIT_LOADED) {
@@ -3913,7 +3927,7 @@ bool unit_need_daemon_reload(Unit *u) {
 
                 /* … any drop-ins that are masked are simply omitted from the list. */
                 STRV_FOREACH(path, u->dropin_paths)
-                        if (fragment_mtime_newer(*path, u->dropin_mtime, false))
+                        if (fragment_mtime_newer(*path, u->dropin_mtime, /* path_masked= */ false))
                                 return true;
         }
 
@@ -4016,7 +4030,7 @@ static int unit_pid_set(Unit *u, Set **pid_set) {
         PidRef *pid;
         FOREACH_ARGUMENT(pid, unit_main_pid(u), unit_control_pid(u))
                 if (pidref_is_set(pid)) {
-                        r = set_ensure_put(pid_set, NULL, PID_TO_PTR(pid->pid));
+                        r = set_ensure_put(pid_set, /* hash_ops= */ NULL, PID_TO_PTR(pid->pid));
                         if (r < 0)
                                 return r;
                 }
@@ -4337,7 +4351,7 @@ static int user_from_unit_name(Unit *u, char **ret) {
         if (r < 0)
                 return r;
 
-        if (valid_user_group_name(n, 0)) {
+        if (valid_user_group_name(n, /* flags= */ 0)) {
                 *ret = TAKE_PTR(n);
                 return 0;
         }
@@ -4377,6 +4391,20 @@ static int unit_verify_contexts(const Unit *u) {
 
         if (ec->private_pids != PRIVATE_PIDS_NO && ec->pam_name)
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "PAM is not supported under PrivatePIDs=. Refusing.");
+
+        if (exec_context_has_broker(ec)) {
+                /* If any of the standard streams is connected to a ptybrokerd-allocated PTY, all
+                 * terminal-type streams must be: the broker PTY has no configurable device path, hence
+                 * TTYPath= and the classic TTY stream types cannot be combined with it. */
+
+                if (ec->tty_path)
+                        return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "TTYPath= is not supported in combination with broker standard input/output/error. Refusing.");
+
+                if ((exec_input_is_terminal(ec->std_input) && !exec_input_is_broker(ec->std_input)) ||
+                    ec->std_output == EXEC_OUTPUT_TTY ||
+                    ec->std_error == EXEC_OUTPUT_TTY)
+                        return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOEXEC), "TTY standard input/output/error may not be combined with broker standard input/output/error. Refusing.");
+        }
 
         const KillContext *kc = unit_get_kill_context(u);
 
@@ -4575,7 +4603,7 @@ int unit_patch_contexts(Unit *u) {
                                 /* Make sure "block-loop" can be resolved, i.e. make sure "loop" shows up in /proc/devices.
                                 * Same for mapper and verity. */
                                 FOREACH_STRING(p, "modprobe@loop.service", "modprobe@dm_mod.service", "modprobe@dm_verity.service") {
-                                        r = unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, p, true, UNIT_DEPENDENCY_FILE);
+                                        r = unit_add_two_dependencies_by_name(u, UNIT_AFTER, UNIT_WANTS, p, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
                                         if (r < 0)
                                                 return r;
                                 }
@@ -5249,7 +5277,7 @@ int unit_add_mounts_for(Unit *u, const char *path, UnitDependencyMask mask, Unit
                         if (!q)
                                 return -ENOMEM;
 
-                        x = set_new(NULL);
+                        x = set_new(/* hash_ops= */ NULL);
                         if (!x)
                                 return -ENOMEM;
 
@@ -5295,7 +5323,7 @@ int unit_setup_exec_runtime(Unit *u) {
 
         /* Try to get it from somebody else */
         SET_FOREACH(other, units) {
-                r = exec_shared_runtime_acquire(u->manager, NULL, other->id, false, &esr);
+                r = exec_shared_runtime_acquire(u->manager, NULL, other->id, /* create= */ false, &esr);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -5303,7 +5331,7 @@ int unit_setup_exec_runtime(Unit *u) {
         }
 
         if (!esr) {
-                r = exec_shared_runtime_acquire(u->manager, ec, u->id, true, &esr);
+                r = exec_shared_runtime_acquire(u->manager, ec, u->id, /* create= */ true, &esr);
                 if (r < 0)
                         return r;
         }
@@ -5605,7 +5633,7 @@ static int unit_ref_uid_gid_internal(Unit *u, uid_t uid, gid_t gid, bool clean_i
                 q = unit_ref_gid(u, gid, clean_ipc);
                 if (q < 0) {
                         if (r > 0)
-                                unit_unref_uid(u, false);
+                                unit_unref_uid(u, /* destroy_now= */ false);
 
                         return q;
                 }
@@ -5756,7 +5784,7 @@ int unit_fork_helper_process_full(Unit *u, const char *name, bool into_cgroup, F
         (void) ignore_signals(SIGPIPE);
 
         if (crt && crt->cgroup_path) {
-                r = cg_attach(crt->cgroup_path, 0);
+                r = cg_attach(crt->cgroup_path, /* pid= */ 0);
                 if (r < 0) {
                         log_unit_error_errno(u, r, "Failed to join unit cgroup %s: %m", empty_to_root(crt->cgroup_path));
                         _exit(EXIT_CGROUP);
@@ -5882,11 +5910,11 @@ static int unit_get_invocation_path(Unit *u, char **ret) {
         assert(ret);
 
         if (MANAGER_IS_SYSTEM(u->manager))
-                p = strjoin("/run/systemd/units/invocation:", u->id);
+                p = strjoin(UNIT_INVOCATION_PATH ":", u->id);
         else {
                 _cleanup_free_ char *user_path = NULL;
 
-                r = xdg_user_runtime_dir("/systemd/units/invocation:", &user_path);
+                r = xdg_user_runtime_dir(UNIT_INVOCATION_PARTIAL_PATH ":", &user_path);
                 if (r < 0)
                         return r;
 
@@ -5944,7 +5972,7 @@ static int unit_export_log_level_max(Unit *u, int log_level_max, bool overwrite)
         buf[0] = '0' + log_level_max;
         buf[1] = 0;
 
-        p = strjoina("/run/systemd/units/log-level-max:", u->id);
+        p = strjoina(UNIT_LOG_LEVEL_MAX_PATH ":", u->id);
         r = symlink_atomic(buf, p);
         if (r < 0)
                 return log_unit_debug_errno(u, r, "Failed to create maximum log level symlink %s: %m", p);
@@ -5974,7 +6002,7 @@ static int unit_export_log_extra_fields(Unit *u, const ExecContext *c) {
                 iovec[i*2+1] = c->log_extra_fields[i];
         }
 
-        const char *p = strjoina("/run/systemd/units/log-extra-fields:", u->id);
+        const char *p = strjoina(UNIT_LOG_EXTRA_FIELDS_PATH ":", u->id);
         char *pattern = strjoina(p, ".XXXXXX");
 
         _cleanup_close_ int fd = mkostemp_safe(pattern);
@@ -6013,7 +6041,7 @@ static int unit_export_log_ratelimit_interval(Unit *u, const ExecContext *c) {
         if (c->log_ratelimit.interval == 0)
                 return 0;
 
-        const char *p = strjoina("/run/systemd/units/log-rate-limit-interval:", u->id);
+        const char *p = strjoina(UNIT_LOG_RATE_LIMIT_INTERVAL_PATH ":", u->id);
 
         char buf[DECIMAL_STR_MAX(c->log_ratelimit.interval)];
         xsprintf(buf, "%" PRIu64, c->log_ratelimit.interval);
@@ -6038,7 +6066,7 @@ static int unit_export_log_ratelimit_burst(Unit *u, const ExecContext *c) {
         if (c->log_ratelimit.burst == 0)
                 return 0;
 
-        const char *p = strjoina("/run/systemd/units/log-rate-limit-burst:", u->id);
+        const char *p = strjoina(UNIT_LOG_RATE_LIMIT_BURST_PATH ":", u->id);
 
         char buf[DECIMAL_STR_MAX(c->log_ratelimit.burst)];
         xsprintf(buf, "%u", c->log_ratelimit.burst);
@@ -6112,28 +6140,28 @@ void unit_unlink_state_files(Unit *u) {
                 return;
 
         if (u->exported_log_level_max) {
-                p = strjoina("/run/systemd/units/log-level-max:", u->id);
+                p = strjoina(UNIT_LOG_LEVEL_MAX_PATH ":", u->id);
                 (void) unlink(p);
 
                 u->exported_log_level_max = false;
         }
 
         if (u->exported_log_extra_fields) {
-                p = strjoina("/run/systemd/units/extra-fields:", u->id);
+                p = strjoina(UNIT_LOG_EXTRA_FIELDS_PATH ":", u->id);
                 (void) unlink(p);
 
                 u->exported_log_extra_fields = false;
         }
 
         if (u->exported_log_ratelimit_interval) {
-                p = strjoina("/run/systemd/units/log-rate-limit-interval:", u->id);
+                p = strjoina(UNIT_LOG_RATE_LIMIT_INTERVAL_PATH ":", u->id);
                 (void) unlink(p);
 
                 u->exported_log_ratelimit_interval = false;
         }
 
         if (u->exported_log_ratelimit_burst) {
-                p = strjoina("/run/systemd/units/log-rate-limit-burst:", u->id);
+                p = strjoina(UNIT_LOG_RATE_LIMIT_BURST_PATH ":", u->id);
                 (void) unlink(p);
 
                 u->exported_log_ratelimit_burst = false;
@@ -6838,12 +6866,12 @@ int unit_get_transitive_dependency_set(Unit *u, UnitDependencyAtom atom, Set **r
 
         do {
                 UNIT_FOREACH_DEPENDENCY(other, u, atom) {
-                        r = set_ensure_put(&units, NULL, other);
+                        r = set_ensure_put(&units, /* hash_ops= */ NULL, other);
                         if (r < 0)
                                 return r;
                         if (r == 0)
                                 continue;
-                        r = set_ensure_put(&queue, NULL, other);
+                        r = set_ensure_put(&queue, /* hash_ops= */ NULL, other);
                         if (r < 0)
                                 return r;
                 }
@@ -6954,9 +6982,9 @@ int unit_get_exec_quota_stats(Unit *u, ExecContext *c, ExecDirectoryType dt, uin
         }
 
         const char *target_dir = pp ?: p;
-        fd = open(target_dir, O_PATH | O_CLOEXEC | O_DIRECTORY);
+        fd = xopenat(AT_FDCWD, target_dir, O_PATH | O_DIRECTORY);
         if (fd < 0)
-                return log_unit_debug_errno(u, errno, "Failed to get exec quota stats: %m");
+                return log_unit_debug_errno(u, fd, "Failed to get exec quota stats: %m");
 
         uint32_t proj_id;
         r = read_fs_xattr_fd(fd, /* ret_xflags= */ NULL, &proj_id);

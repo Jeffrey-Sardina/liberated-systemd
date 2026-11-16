@@ -4,6 +4,7 @@
 #include "dissect-image.h"
 #include "extract-word.h"
 #include "image-policy.h"
+#include "json-util.h"
 #include "log.h"
 #include "logarithm.h"
 #include "sort-util.h"
@@ -149,9 +150,12 @@ PartitionPolicyFlags image_policy_get(const ImagePolicy *policy, PartitionDesign
                 if (!(data_flags & PARTITION_POLICY_SIGNED))
                         return _PARTITION_POLICY_FLAGS_INVALID;
 
+                /* If the data partition may be used with Verity alone, then the signature partition is
+                 * optional. */
                 return partition_policy_normalized_flags(
                                 &(const PartitionPolicy) {
                                         .flags = PARTITION_POLICY_UNPROTECTED | (data_flags & (PARTITION_POLICY_UNUSED|PARTITION_POLICY_ABSENT)) |
+                                                 (data_flags & PARTITION_POLICY_VERITY ? PARTITION_POLICY_ABSENT : 0) |
                                                  (data_flags & _PARTITION_POLICY_PFLAGS_MASK),
                                         .designator = designator,
                                 });
@@ -315,7 +319,7 @@ ImagePolicy* image_policy_new_from_dissected(const DissectedImage *image, const 
                                         f |= PARTITION_POLICY_VERITY;
                         }
 
-                        if (!image->single_file_system) {
+                        if (image->partition_table_type != PARTITION_BARE) {
                                 if (image->partitions[pd].growfs)
                                         f |= PARTITION_POLICY_GROWFS_ON;
                                 else
@@ -372,7 +376,7 @@ int image_policy_from_string(const char *s, bool graceful, ImagePolicy **ret) {
                 if (!ret)
                         return 0;
 
-                p = image_policy_new(0);
+                p = image_policy_new(/* n_policies= */ 0);
                 if (!p)
                         return -ENOMEM;
 
@@ -796,7 +800,7 @@ int config_parse_image_policy(
                 return 0;
         }
 
-        r = image_policy_from_string(rvalue, /* graceful */ true, &np);
+        r = image_policy_from_string(rvalue, /* graceful= */ true, &np);
         if (r == -ENOTUNIQ)
                 return log_syntax(unit, LOG_ERR, filename, line, r, "Duplicate rule in image policy, refusing: %s", rvalue);
         if (r == -EBADSLT)
@@ -804,7 +808,7 @@ int config_parse_image_policy(
         if (r == -EBADRQC)
                 return log_syntax(unit, LOG_ERR, filename, line, r, "Unknown partition policy flag in image policy, refusing: %s", rvalue);
         if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse image policy, refusing: %s", rvalue);
+                return log_syntax_parse_error_full(unit, filename, line, r, /* critical= */ true, lvalue, rvalue);
 
         return free_and_replace_full(*p, np, image_policy_free);
 }
@@ -1108,3 +1112,25 @@ const ImagePolicy image_policy_service = {
         },
         .default_flags = PARTITION_POLICY_IGNORE,
 };
+
+int json_dispatch_image_policy(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        _cleanup_(image_policy_freep) ImagePolicy *q = NULL;
+        ImagePolicy **p = ASSERT_PTR(userdata);
+        int r;
+
+        if (sd_json_variant_is_null(variant)) {
+                *p = image_policy_free(*p);
+                return 0;
+        }
+
+        if (!sd_json_variant_is_string(variant))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(name));
+
+        r = image_policy_from_string(sd_json_variant_string(variant), /* graceful= */ false, &q);
+        if (r < 0)
+                return json_log(variant, flags, r, "JSON field '%s' is not a valid image policy.", strna(name));
+
+        image_policy_free(*p);
+        *p = TAKE_PTR(q);
+        return 0;
+}

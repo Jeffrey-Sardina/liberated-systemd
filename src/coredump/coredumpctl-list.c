@@ -24,26 +24,32 @@ int verb_dump_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r < 0)
                 return r;
 
-        /* The coredumps are likely compressed, and for just listing them we don't need to decompress them,
-         * so let's pick a fairly low data threshold here */
-        (void) sd_journal_set_data_threshold(j, 4096);
-
         if (!verb_is_info && !arg_field) {
-                t = table_new("time", "pid", "uid", "gid", "sig", "corefile", "exe", "size");
+                t = table_new("id", "time", "pid", "uid", "gid", "sig", "corefile", "exe", "size");
                 if (!t)
                         return log_oom();
 
-                (void) table_set_align_percent(t, TABLE_HEADER_CELL(1), 100);
+                if (arg_full)
+                        table_set_width(t, /* width= */ 0);
+
+                (void) table_set_ellipsize_percent(t, TABLE_HEADER_CELL(1), 100);
+
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(2), 100);
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(3), 100);
-                (void) table_set_align_percent(t, TABLE_HEADER_CELL(7), 100);
+                (void) table_set_align_percent(t, TABLE_HEADER_CELL(4), 100);
+                (void) table_set_align_percent(t, TABLE_HEADER_CELL(8), 100);
 
                 table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
         } else if (!sd_json_format_enabled(arg_json_format_flags))
                 pager_open(arg_pager_flags);
 
         /* "info" without pattern implies "-1" */
-        if ((arg_rows_max == 1 && arg_reverse) || (verb_is_info && argc == 1)) {
+        if (verb_is_info && argc == 1) {
+                arg_rows_max = 1;
+                arg_reverse = true;
+        }
+
+        if (arg_rows_max == 1 && arg_reverse) {
                 r = focus(j);
                 if (r < 0)
                         return r;

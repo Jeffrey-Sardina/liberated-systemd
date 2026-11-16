@@ -276,6 +276,7 @@ static int manager_open_journal(
                 int open_flags,
                 bool seal,
                 JournalMetrics *metrics,
+                const sd_id128_t *seqnum_id,
                 JournalFile **ret) {
 
         _cleanup_(journal_file_offline_closep) JournalFile *f = NULL;
@@ -299,9 +300,10 @@ static int manager_open_journal(
                                 m->config.compress.threshold_bytes,
                                 metrics,
                                 m->mmap,
+                                seqnum_id,
                                 &f);
         else
-                r = journal_file_open(
+                r = journal_file_open_full(
                                 /* fd= */ -EBADF,
                                 fname,
                                 open_flags,
@@ -311,6 +313,7 @@ static int manager_open_journal(
                                 metrics,
                                 m->mmap,
                                 /* template= */ NULL,
+                                seqnum_id,
                                 &f);
         if (r < 0)
                 return r;
@@ -373,6 +376,12 @@ static int manager_system_journal_open(
 
                 (void) mkdir(m->system_storage.path, 0755);
 
+                /* manager_flush_to_var() runs after the system journal is opened if the runtime journal
+                 * is open. It resets the sequence number data and copies the entries of the runtime journal
+                 * with new sequence numbers. The copies must not use the sequence number ID of the runtime
+                 * journal. A new system journal therefore uses its file ID as sequence number ID. */
+                bool flush = m->runtime_journal && !m->namespace;
+
                 fn = strjoina(m->system_storage.path, "/system.journal");
                 r = manager_open_journal(
                                 m,
@@ -381,9 +390,10 @@ static int manager_system_journal_open(
                                 O_RDWR|O_CREAT,
                                 m->config.seal,
                                 &m->system_storage.metrics,
+                                flush ? NULL : &m->seqnum->id,
                                 &m->system_journal);
                 if (r >= 0) {
-                        manager_add_acls(m->system_journal, 0);
+                        manager_add_acls(m->system_journal, /* uid= */ 0);
                         (void) cache_space_refresh(m, &m->system_storage);
                         patch_min_use(&m->system_storage);
                 } else {
@@ -401,7 +411,7 @@ static int manager_system_journal_open(
                  * journal is back.
                  */
                 if (!flush_requested)
-                        (void) manager_flush_to_var(m, true);
+                        (void) manager_flush_to_var(m, /* require_flag_file= */ true);
         }
 
         if (!m->runtime_journal &&
@@ -423,6 +433,7 @@ static int manager_system_journal_open(
                                         O_RDWR|O_CREAT,
                                         /* seal= */ false,
                                         &m->runtime_storage.metrics,
+                                        &m->seqnum->id,
                                         &m->runtime_journal);
                         if (r < 0)
                                 return log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
@@ -439,6 +450,7 @@ static int manager_system_journal_open(
                                         O_RDWR,
                                         /* seal= */ false,
                                         &m->runtime_storage.metrics,
+                                        &m->seqnum->id,
                                         &m->runtime_journal);
                         if (r < 0) {
                                 if (r != -ENOENT)
@@ -450,7 +462,7 @@ static int manager_system_journal_open(
                 }
 
                 if (m->runtime_journal) {
-                        manager_add_acls(m->runtime_journal, 0);
+                        manager_add_acls(m->runtime_journal, /* uid= */ 0);
                         (void) cache_space_refresh(m, &m->runtime_storage);
                         patch_min_use(&m->runtime_storage);
                         manager_drop_flushed_flag(m);
@@ -491,6 +503,7 @@ static int manager_find_user_journal(Manager *m, uid_t uid, JournalFile **ret) {
                         O_RDWR|O_CREAT,
                         m->config.seal,
                         &m->system_storage.metrics,
+                        &m->seqnum->id,
                         &f);
         if (r < 0)
                 return r;
@@ -564,7 +577,13 @@ static int manager_do_rotate(
 
         log_debug("Rotating journal file %s.", (*f)->path);
 
-        r = journal_file_rotate(f, m->mmap, manager_get_file_flags(m, seal), m->config.compress.threshold_bytes, m->deferred_closes);
+        r = journal_file_rotate(
+                        f,
+                        m->mmap,
+                        manager_get_file_flags(m, seal),
+                        m->config.compress.threshold_bytes,
+                        &m->seqnum->id,
+                        m->deferred_closes);
         if (r < 0) {
                 if (*f)
                         return log_ratelimit_error_errno(r, JOURNAL_LOG_RATELIMIT,
@@ -658,10 +677,10 @@ static int manager_archive_offline_user_journals(Manager *m) {
                 if (!full)
                         return log_oom();
 
-                fd = openat(dirfd(d), de->d_name, O_RDWR|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK);
+                fd = xopenat(dirfd(d), de->d_name, O_RDWR|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK);
                 if (fd < 0) {
-                        log_ratelimit_full_errno(IN_SET(errno, ELOOP, ENOENT) ? LOG_DEBUG : LOG_WARNING,
-                                                 errno, JOURNAL_LOG_RATELIMIT,
+                        log_ratelimit_full_errno(IN_SET(fd, -ELOOP, -ENOENT) ? LOG_DEBUG : LOG_WARNING,
+                                                 fd, JOURNAL_LOG_RATELIMIT,
                                                  "Failed to open journal file '%s' for rotation: %m", full);
                         continue;
                 }
@@ -703,7 +722,7 @@ static int manager_archive_offline_user_journals(Manager *m) {
                 if (r < 0)
                         log_debug_errno(r, "Failed to append tag when closing journal, ignoring: %m");
 
-                r = journal_file_archive(f, NULL);
+                r = journal_file_archive(f, /* ret_previous_path= */ NULL);
                 if (r < 0)
                         log_debug_errno(r, "Failed to archive journal file '%s', ignoring: %m", full);
 
@@ -1226,7 +1245,7 @@ void manager_driver_message_internal(Manager *m, pid_t object_pid, const char *f
 
         va_start(ap, format);
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        r = log_format_iovec(iovec, mm, &n, false, 0, format, ap);
+        r = log_format_iovec(iovec, mm, &n, /* newline_separator= */ false, /* error= */ 0, format, ap);
         REENABLE_WARNING;
         /* Error handling below */
         va_end(ap);
@@ -1343,8 +1362,6 @@ int manager_flush_to_var(Manager *m, bool require_flag_file) {
                 log_ratelimit_error_errno(r, JOURNAL_LOG_RATELIMIT, "Failed to read runtime journal: %m");
                 goto finish;
         }
-
-        sd_journal_set_data_threshold(j, 0);
 
         SD_JOURNAL_FOREACH(j) {
                 Object *o = NULL;
@@ -1540,7 +1557,7 @@ int manager_process_datagram(
 
         iovec = IOVEC_MAKE(m->buffer, MALLOC_ELEMENTSOF(m->buffer) - 1); /* Leave room for trailing NUL we add later */
 
-        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
         if (ERRNO_IS_NEG_TRANSIENT(n))
                 return 0;
         if (n == -ECHRNG) {
@@ -1626,11 +1643,11 @@ int manager_process_datagram(
 void manager_full_flush(Manager *m) {
         assert(m);
 
-        (void) manager_flush_to_var(m, false);
+        (void) manager_flush_to_var(m, /* require_flag_file= */ false);
         manager_sync(m, /* wait= */ false);
-        manager_vacuum(m, false);
+        manager_vacuum(m, /* verbose= */ false);
 
-        manager_space_usage_message(m, NULL);
+        manager_space_usage_message(m, /* storage= */ NULL);
 
         manager_refresh_idle_timer(m);
 }
@@ -1662,7 +1679,7 @@ void manager_full_rotate(Manager *m) {
         assert(m);
 
         manager_rotate(m);
-        manager_vacuum(m, true);
+        manager_vacuum(m, /* verbose= */ true);
 
         if (m->system_journal)
                 patch_min_use(&m->system_storage);
@@ -1717,7 +1734,7 @@ static int dispatch_sigterm(sd_event_source *es, const struct signalfd_siginfo *
          * start up next – unless we are going down for the final system shutdown, in which case everything
          * is lost. */
 
-        r = sd_event_add_defer(m->event, &news, NULL, NULL); /* NULL handler means → exit when triggered */
+        r = sd_event_add_defer(m->event, &news, /* callback= */ NULL, /* userdata= */ NULL); /* NULL handler means → exit when triggered */
         if (r < 0) {
                 log_error_errno(r, "Failed to allocate exit idle event handler: %m");
                 goto fail;
@@ -1741,7 +1758,7 @@ static int dispatch_sigterm(sd_event_source *es, const struct signalfd_siginfo *
 
         news = sd_event_source_unref(news);
 
-        r = sd_event_add_time_relative(m->event, &news, CLOCK_MONOTONIC, 10 * USEC_PER_SEC, 0, NULL, NULL);
+        r = sd_event_add_time_relative(m->event, &news, CLOCK_MONOTONIC, 10 * USEC_PER_SEC, /* accuracy= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0) {
                 log_error_errno(r, "Failed to allocate exit timeout event handler: %m");
                 goto fail;
@@ -1767,7 +1784,7 @@ static int dispatch_sigterm(sd_event_source *es, const struct signalfd_siginfo *
         return 0;
 
 fail:
-        sd_event_exit(m->event, 0);
+        sd_event_exit(m->event, /* code= */ 0);
         return 0;
 }
 
@@ -1849,7 +1866,7 @@ static int manager_setup_signals(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGHUP|SD_EVENT_SIGNAL_PROCMASK, manager_dispatch_reload_signal, m);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, SIGHUP|SD_EVENT_SIGNAL_PROCMASK, manager_dispatch_reload_signal, m);
         if (r < 0)
                 return r;
 
@@ -1890,7 +1907,7 @@ static int manager_schedule_sync(Manager *m, int priority) {
                                         m->event,
                                         &m->sync_event_source,
                                         CLOCK_MONOTONIC,
-                                        m->config.sync_interval_usec, 0,
+                                        m->config.sync_interval_usec, /* accuracy= */ 0,
                                         manager_dispatch_sync, m);
                         if (r < 0)
                                 return r;
@@ -1924,12 +1941,11 @@ static int manager_open_hostname(Manager *m) {
 
         assert(m);
 
-        m->hostname_fd = open("/proc/sys/kernel/hostname",
-                              O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        m->hostname_fd = xopenat(AT_FDCWD, "/proc/sys/kernel/hostname", O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (m->hostname_fd < 0)
-                return log_error_errno(errno, "Failed to open %s: %m", "/proc/sys/kernel/hostname");
+                return log_error_errno(m->hostname_fd, "Failed to open %s: %m", "/proc/sys/kernel/hostname");
 
-        r = sd_event_add_io(m->event, &m->hostname_event_source, m->hostname_fd, 0, dispatch_hostname_change, m);
+        r = sd_event_add_io(m->event, &m->hostname_event_source, m->hostname_fd, /* events= */ 0, dispatch_hostname_change, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to register hostname fd in event loop: %m");
 
@@ -2060,7 +2076,7 @@ static int manager_connect_notify(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to watch notification socket: %m");
 
-        if (sd_watchdog_enabled(false, &m->watchdog_usec) > 0) {
+        if (sd_watchdog_enabled(/* unset_environment= */ false, &m->watchdog_usec) > 0) {
                 m->send_watchdog = true;
 
                 r = sd_event_add_time_relative(m->event, &m->watchdog_event_source, CLOCK_MONOTONIC, m->watchdog_usec/2, m->watchdog_usec/4, dispatch_watchdog, m);
@@ -2093,9 +2109,9 @@ int manager_map_seqnum_file(
         if (!fn)
                 return -ENOMEM;
 
-        fd = open(fn, O_RDWR|O_CREAT|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0644);
+        fd = xopenat_full(AT_FDCWD, fn, O_RDWR|O_CREAT|O_NOCTTY|O_NOFOLLOW, /* xopen_flags= */ 0, 0644);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         r = posix_fallocate_loop(fd, /* offset= */ 0, size);
         if (r < 0)
@@ -2152,7 +2168,7 @@ static int manager_idle_handler(sd_event_source *source, uint64_t usec, void *us
         assert(source);
 
         log_debug("Manager is idle, exiting.");
-        sd_event_exit(m->event, 0);
+        sd_event_exit(m->event, /* code= */ 0);
         return 0;
 }
 
@@ -2171,7 +2187,7 @@ int manager_start_or_stop_idle_timer(Manager *m) {
         if (m->idle_event_source)
                 return 1;
 
-        r = sd_event_add_time_relative(m->event, &source, CLOCK_MONOTONIC, IDLE_TIMEOUT_USEC, 0, manager_idle_handler, m);
+        r = sd_event_add_time_relative(m->event, &source, CLOCK_MONOTONIC, IDLE_TIMEOUT_USEC, /* accuracy= */ 0, manager_idle_handler, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate idle timer: %m");
 
@@ -2248,7 +2264,7 @@ static int manager_setup_memory_pressure(Manager *m) {
 
         assert(m);
 
-        r = sd_event_add_memory_pressure(m->event, NULL, manager_memory_pressure, m);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, manager_memory_pressure, m);
         if (r < 0)
                 log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || (r == -EHOSTDOWN) ? LOG_DEBUG : LOG_NOTICE, r,
                                "Failed to install memory pressure event source, ignoring: %m");
@@ -2369,7 +2385,7 @@ int manager_init(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create event loop: %m");
 
-        n = sd_listen_fds(true);
+        n = sd_listen_fds(/* unset_environment= */ true);
         if (n < 0)
                 return log_error_errno(n, "Failed to read listening file descriptors from environment: %m");
 
@@ -2380,7 +2396,7 @@ int manager_init(Manager *m) {
 
         for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++)
 
-                if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, native_socket, 0) > 0) {
+                if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, native_socket, /* length= */ 0) > 0) {
 
                         if (m->native_fd >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -2388,7 +2404,7 @@ int manager_init(Manager *m) {
 
                         m->native_fd = fd;
 
-                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, stdout_socket, 0) > 0) {
+                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, stdout_socket, /* length= */ 0) > 0) {
 
                         if (m->stdout_fd >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -2396,7 +2412,7 @@ int manager_init(Manager *m) {
 
                         m->stdout_fd = fd;
 
-                } else if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, syslog_socket, 0) > 0) {
+                } else if (sd_is_socket_unix(fd, SOCK_DGRAM, -1, syslog_socket, /* length= */ 0) > 0) {
 
                         if (m->syslog_fd >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -2404,14 +2420,14 @@ int manager_init(Manager *m) {
 
                         m->syslog_fd = fd;
 
-                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, varlink_socket, 0) > 0) {
+                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, varlink_socket, /* length= */ 0) > 0) {
 
                         if (varlink_fd >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Too many varlink sockets passed.");
 
                         varlink_fd = fd;
-                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, JOURNALD_METRICS_SOCKET, 0) > 0) {
+                } else if (sd_is_socket_unix(fd, SOCK_STREAM, 1, JOURNALD_METRICS_SOCKET, /* length= */ 0) > 0) {
 
                         if (metrics_fd >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),

@@ -84,6 +84,11 @@ char16_t *strcpy16(char16_t * restrict dest, const char16_t * restrict src);
 char* strchr8(const char *s, char c);
 char16_t *strchr16(const char16_t *s, char16_t c);
 
+const char16_t* path_filename16(const char16_t *path);
+
+char* strstr8(const char *haystack, const char *needle);
+char16_t *strstr16(const char16_t *haystack, const char16_t *needle);
+
 char* xstrndup8(const char *s, size_t n);
 char16_t *xstrndup16(const char16_t *s, size_t n);
 
@@ -119,7 +124,7 @@ bool parse_boolean(const char *v, bool *ret);
 
 char* line_get_key_value(char *s, const char *sep, size_t *pos, char **ret_key, char **ret_value);
 
-char16_t *hexdump(const void *data, size_t size);
+char16_t *hexdump16(const void *data, size_t size);
 
 #ifdef __clang__
 #  define _gnu_printf_(a, b) _printf_(a, b)

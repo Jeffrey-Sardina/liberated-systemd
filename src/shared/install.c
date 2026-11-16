@@ -12,6 +12,7 @@
 #include "conf-parser.h"
 #include "constants.h"
 #include "dirent-util.h"
+#include "dropin.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -72,6 +73,96 @@ static bool install_info_has_also(const InstallInfo *i) {
         assert(i);
 
         return !strv_isempty(i->also);
+}
+
+static int dependency_dir_is_named(
+                RuntimeScope scope,
+                const InstallInfo *info,
+                char **targets,
+                const char *suffix,
+                const char *dir) {
+
+        int r;
+
+        assert(info);
+        assert(suffix);
+        assert(dir);
+
+        STRV_FOREACH(target, targets) {
+                _cleanup_free_ char *dst = NULL;
+
+                r = install_name_printf(scope, info, *target, &dst);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to resolve specifiers in '%s', ignoring: %m", *target);
+                        continue;
+                }
+
+                if (streq_ptr(startswith(dir, dst), suffix))
+                        return true;
+        }
+
+        return false;
+}
+
+/* remote-cryptsetup.target declares WantedBy=multi-user.target but is also installed under
+ * initrd-root-device.target.wants/. Disabling must preserve that static dependency. */
+static int dependency_is_enablement(
+                RuntimeScope scope,
+                const InstallInfo *info,
+                const char *dir,
+                const char *entry) {
+
+        _cleanup_free_ char *path = NULL;
+        int r;
+
+        assert(info);
+        assert(dir);
+        assert(entry);
+
+        /* install_name_printf() expands a specifier such as %i from the name of the unit. For a template
+         * the symlink is named after an instance, so the specifiers are expanded from the entry name. */
+        const InstallInfo instance = {
+                .name = (char*) entry,
+                .root = info->root,
+        };
+
+        r = dependency_dir_is_named(scope, &instance, info->wanted_by, ".wants", dir);
+        if (r != 0)
+                return r;
+
+        r = dependency_dir_is_named(scope, &instance, info->required_by, ".requires", dir);
+        if (r != 0)
+                return r;
+
+        r = dependency_dir_is_named(scope, &instance, info->upheld_by, ".upholds", dir);
+        if (r != 0)
+                return r;
+
+        path = path_join(dir, entry);
+        if (!path)
+                return -ENOMEM;
+
+        STRV_FOREACH(alias, info->aliases) {
+                _cleanup_free_ char *dst = NULL, *updated = NULL;
+
+                r = install_name_printf(scope, &instance, *alias, &dst);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0)
+                        continue;
+                if (!path_equal(dst, path))
+                        continue;
+
+                r = unit_file_verify_alias(&instance, dst, &updated, /* changes= */ NULL, /* n_changes= */ NULL);
+                if (r == -ENOMEM)
+                        return r;
+                if (r >= 0)
+                        return true;
+        }
+
+        return false;
 }
 
 static void unit_file_preset_rule_done(UnitFilePresetRule *rule) {
@@ -249,35 +340,149 @@ static int path_is_runtime(const LookupPaths *lp, const char *path, bool check_p
                            lp->runtime_control);
 }
 
-static int path_is_vendor_or_generator(const LookupPaths *lp, const char *path) {
+/* Unit directories below /usr/, i.e. the ones holding vendor supplied units and vendor supplied enablement.
+ * PID 1 acts on dependency symlinks in these just like on the ones in /etc/, but they are off limits when we
+ * enable or disable a unit on behalf of the administrator. */
+static bool path_is_vendor(const LookupPaths *lp, const char *path) {
         const char *rpath;
-        int r;
 
         assert(lp);
         assert(path);
 
         rpath = skip_root(lp->root_dir, path);
         if (!rpath)
+                return false;
+
+        if ((lp->vendor_config && path_equal(path, lp->vendor_config)) || path_startswith(rpath, "/usr"))
+                return true;
+
+        return PATH_IN_SET(rpath, SYSTEM_DATA_UNIT_DIR, USER_DATA_UNIT_DIR);
+}
+
+/* file-hierarchy(7) reserves /usr/local/ for software installed by the administrator. */
+static bool path_is_usr_local(const LookupPaths *lp, const char *path) {
+        const char *rpath;
+
+        assert(lp);
+        assert(path);
+
+        rpath = skip_root(lp->root_dir, path);
+        if (!rpath)
+                return false;
+
+        return path_startswith(rpath, "/usr/local");
+}
+
+static int path_is_vendor_or_generator(const LookupPaths *lp, const char *path) {
+        assert(lp);
+        assert(path);
+
+        if (!skip_root(lp->root_dir, path))
                 return 0;
 
-        if (path_startswith(rpath, "/usr"))
+        if (path_is_vendor(lp, path))
                 return true;
 
         /* The lookup paths are root prefixed, so we have to pass in a root prefixed path. */
-        r = path_is_generator(lp, path);
-        if (r != 0)
-                return r;
-
-        return path_equal(rpath, SYSTEM_DATA_UNIT_DIR);
+        return path_is_generator(lp, path);
 }
 
-static const char* config_path_from_flags(const LookupPaths *lp, UnitFileFlags flags) {
+static const char* dependency_dir_suffix(const char *dir) {
+        assert(dir);
+
+        return ENDSWITH_SET(dir, ".wants", ".requires", ".upholds");
+}
+
+static bool set_contains_symlink(
+                Set *set,
+                const char *name,
+                const char *template,
+                const char *dest,
+                const char *dest_name) {
+
+        assert(name);
+
+        return set_contains(set, name) ||
+               (template && set_contains(set, template)) ||
+               (dest && set_contains(set, dest)) ||
+               (dest_name && set_contains(set, dest_name));
+}
+
+/* Distributions install compatibility symlinks such as default.target without corresponding [Install]
+ * rules. Vendor removal must preserve names that enabling would not create. */
+typedef struct VendorSymlinks {
+        InstallContext loaded;
+        Hashmap *units;
+        Set *own_names;
+} VendorSymlinks;
+
+static const InstallInfo* vendor_symlinks_find_unit(
+                const VendorSymlinks *v,
+                const char *name,
+                const char *template,
+                const char *dest_name) {
+
+        const InstallInfo *i;
+
+        assert(v);
+        assert(name);
+
+        i = hashmap_get(v->units, name);
+        if (!i && template)
+                i = hashmap_get(v->units, template);
+        if (!i && dest_name)
+                i = hashmap_get(v->units, dest_name);
+
+        return i;
+}
+
+static int path_is_mask(const LookupPaths *lp, const char *path) {
+        int r;
+
         assert(lp);
+        assert(path);
+
+        /* Disabling a unit must still remove dangling or self-referential dependency symlinks. */
+        r = null_or_empty_path_with_root(path, lp->root_dir);
+        if (IN_SET(r, -ENOENT, -ENOTDIR, -ELOOP))
+                return false;
+
+        return r;
+}
+
+static int config_path_from_flags(LookupPaths *lp, UnitFileFlags flags, const char **ret) {
+        assert(lp);
+        assert(ret);
+
+        if (FLAGS_SET(flags, UNIT_FILE_VENDOR)) {
+                if (!lp->vendor_config)
+                        return -EOPNOTSUPP;
+
+                if (lp->root_dir) {
+                        _cleanup_free_ char *resolved = NULL;
+                        int r;
+
+                        r = chase(lp->vendor_config, lp->root_dir, CHASE_NONEXISTENT,
+                                  &resolved, /* ret_fd= */ NULL);
+                        if (r < 0)
+                                return r;
+
+                        free_and_replace(lp->vendor_config, resolved);
+                }
+
+                *ret = lp->vendor_config;
+                return 0;
+        }
 
         if (FLAGS_SET(flags, UNIT_FILE_PORTABLE))
-                return FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_attached : lp->persistent_attached;
+                *ret = FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_attached : lp->persistent_attached;
         else
-                return FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_config : lp->persistent_config;
+                *ret = FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_config : lp->persistent_config;
+
+        if (!*ret)
+                return -ENXIO;
+
+        return 0;
 }
 
 InstallChangeType install_changes_add(
@@ -343,6 +548,12 @@ void install_change_dump_success(const InstallChange *change) {
 
         case INSTALL_CHANGE_UNLINK:
                 return log_info("Removed '%s'.", change->path);
+
+        case INSTALL_CHANGE_MASK_DEPENDENCY:
+                return log_info("Masked dependency '%s'.", change->path);
+
+        case INSTALL_CHANGE_UNMASK_DEPENDENCY:
+                return log_info("Unmasked dependency '%s'.", change->path);
 
         case INSTALL_CHANGE_IS_MASKED:
                 return log_info("Unit %s is masked, ignoring.", change->path);
@@ -553,7 +764,7 @@ static int chroot_unit_symlinks_equivalent(
         if (!a || !b)
                 return log_oom();
 
-        r = path_equal_or_inode_same(a, b, 0);
+        r = path_equal_or_inode_same(a, b, /* flags= */ 0);
         if (r != 0)
                 return r;
 
@@ -578,7 +789,7 @@ static int create_symlink(
                 InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_free_ char *dest = NULL;
+        _cleanup_free_ char *dest = NULL, *resolved = NULL;
         const char *rp;
         int r;
 
@@ -596,6 +807,15 @@ static int create_symlink(
          * right place, or negative on error.
          */
 
+        if (lp->root_dir) {
+                r = chase(new_path, lp->root_dir, CHASE_NOFOLLOW|CHASE_NONEXISTENT,
+                          &resolved, /* ret_fd= */ NULL);
+                if (r < 0)
+                        return install_changes_add(changes, n_changes, r, new_path, /* source= */ NULL);
+
+                new_path = resolved;
+        }
+
         (void) mkdir_parents_label(new_path, 0755);
 
         if (symlink(old_path, new_path) >= 0) {
@@ -606,7 +826,7 @@ static int create_symlink(
         }
 
         if (errno != EEXIST)
-                return install_changes_add(changes, n_changes, -errno, new_path, NULL);
+                return install_changes_add(changes, n_changes, -errno, new_path, /* source= */ NULL);
 
         r = readlink_malloc(new_path, &dest);
         if (r < 0) {
@@ -614,7 +834,7 @@ static int create_symlink(
                 if (r == -EINVAL)
                         r = -EEXIST;
 
-                return install_changes_add(changes, n_changes, r, new_path, NULL);
+                return install_changes_add(changes, n_changes, r, new_path, /* source= */ NULL);
         }
 
         if (chroot_unit_symlinks_equivalent(lp, new_path, dest, old_path)) {
@@ -628,9 +848,9 @@ static int create_symlink(
 
         r = symlink_atomic(old_path, new_path);
         if (r < 0)
-                return install_changes_add(changes, n_changes, r, new_path, NULL);
+                return install_changes_add(changes, n_changes, r, new_path, /* source= */ NULL);
 
-        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, new_path, NULL);
+        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, new_path, /* source= */ NULL);
         if (r < 0)
                 return r;
         r = install_changes_add(changes, n_changes, INSTALL_CHANGE_SYMLINK, new_path, old_path);
@@ -667,10 +887,14 @@ static int mark_symlink_for_removal(
         return 1;
 }
 
+static int dependency_name_matches(const InstallInfo *info, const char *name);
+
 static int remove_marked_symlinks_fd(
                 Set *remove_symlinks_to,
+                const VendorSymlinks *vendor,
                 int fd,
                 const char *path,
+                const char *dependency_dir,
                 const char *config_path,
                 const LookupPaths *lp,
                 bool dry_run,
@@ -697,24 +921,32 @@ static int remove_marked_symlinks_fd(
         rewinddir(d);
 
         FOREACH_DIRENT(de, d, return -errno)
-                if (de->d_type == DT_DIR) {
+                if (de->d_type == DT_DIR ||
+                    (vendor && !dependency_dir && path_equal(path, config_path) &&
+                     de->d_type == DT_LNK && dependency_dir_suffix(de->d_name))) {
                         _cleanup_close_ int nfd = -EBADF;
-                        _cleanup_free_ char *p = NULL;
-
-                        nfd = RET_NERRNO(openat(fd, de->d_name, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
-                        if (nfd < 0) {
-                                if (nfd != -ENOENT)
-                                        RET_GATHER(ret, nfd);
-                                continue;
-                        }
+                        _cleanup_free_ char *p = NULL, *resolved = NULL;
 
                         p = path_make_absolute(de->d_name, path);
                         if (!p)
                                 return -ENOMEM;
 
+                        if (de->d_type == DT_LNK)
+                                nfd = chase_and_open(p, lp->root_dir, CHASE_MUST_BE_DIRECTORY|CHASE_SAFE,
+                                                     O_RDONLY|O_NONBLOCK|O_DIRECTORY, &resolved);
+                        else
+                                nfd = xopenat(fd, de->d_name, O_DIRECTORY|O_NOFOLLOW);
+                        if (nfd < 0) {
+                                if (!IN_SET(nfd, -ENOENT, -ENOTDIR, -ELOOP))
+                                        RET_GATHER(ret, nfd);
+                                continue;
+                        }
+
                         /* This will close nfd, regardless whether it succeeds or not */
                         RET_GATHER(ret, remove_marked_symlinks_fd(remove_symlinks_to,
-                                                                  TAKE_FD(nfd), p,
+                                                                  vendor,
+                                                                  TAKE_FD(nfd), resolved ?: p,
+                                                                  dependency_dir_suffix(de->d_name) ? de->d_name : NULL,
                                                                   config_path, lp,
                                                                   dry_run,
                                                                   restart,
@@ -736,27 +968,22 @@ static int remove_marked_symlinks_fd(
                          * files sharing the same name as a file that is marked, and files sharing the same
                          * name after the instance has been removed. Do path chasing only if we don't already
                          * know that we want to remove the symlink. */
-                        found = set_contains(remove_symlinks_to, de->d_name);
+                        _cleanup_free_ char *template = NULL, *dest = NULL, *dest_name = NULL;
+
+                        r = unit_name_template(de->d_name, &template);
+                        if (r < 0 && r != -EINVAL)
+                                return r;
+
+                        found = set_contains_symlink(remove_symlinks_to, de->d_name, template,
+                                                     /* dest= */ NULL, /* dest_name= */ NULL);
 
                         if (!found) {
-                                _cleanup_free_ char *template = NULL;
-
-                                r = unit_name_template(de->d_name, &template);
-                                if (r < 0 && r != -EINVAL)
-                                        return r;
-                                if (r >= 0)
-                                        found = set_contains(remove_symlinks_to, template);
-                        }
-
-                        if (!found) {
-                                _cleanup_free_ char *dest = NULL, *dest_name = NULL;
-
-                                r = chase(p, lp->root_dir, CHASE_NONEXISTENT, &dest, NULL);
+                                r = chase(p, lp->root_dir, CHASE_NONEXISTENT, &dest, /* ret_fd= */ NULL);
                                 if (r == -ENOENT)
                                         continue;
                                 if (r < 0) {
                                         log_debug_errno(r, "Failed to resolve symlink \"%s\": %m", p);
-                                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, p, NULL));
+                                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, p, /* source= */ NULL));
                                         continue;
                                 }
 
@@ -764,23 +991,57 @@ static int remove_marked_symlinks_fd(
                                 if (r < 0)
                                         return r;
 
-                                found = set_contains(remove_symlinks_to, dest) ||
-                                        set_contains(remove_symlinks_to, dest_name);
+                                found = set_contains_symlink(remove_symlinks_to, de->d_name, template,
+                                                             dest, dest_name);
                         }
 
                         if (!found)
                                 continue;
 
+                        /* Disabling must not remove masks. Removing a dependency mask enables the unit
+                         * again, and removing a unit mask unmasks the unit. The template match above finds
+                         * a foo@bar.service mask when foo@.service is disabled. */
+                        r = path_is_mask(lp, p);
+                        if (r < 0)
+                                return r;
+                        if (r > 0)
+                                continue;
+
+                        if (vendor && dependency_dir) {
+                                const InstallInfo *info;
+
+                                info = vendor_symlinks_find_unit(vendor, de->d_name, template, dest_name);
+                                if (info) {
+                                        r = dependency_name_matches(info, de->d_name);
+                                        if (r < 0)
+                                                return r;
+                                        if (r == 0)
+                                                continue;
+
+                                        r = dependency_is_enablement(vendor->loaded.scope, info, dependency_dir, de->d_name);
+                                        if (r < 0)
+                                                return r;
+                                        if (r == 0)
+                                                continue;
+                                }
+
+                        } else if (vendor) {
+                                if (!set_contains_symlink(vendor->own_names, de->d_name, template,
+                                                          /* dest= */ NULL, /* dest_name= */ NULL))
+                                        continue;
+                        }
+
                         if (!dry_run) {
                                 if (unlinkat(fd, de->d_name, 0) < 0 && errno != ENOENT) {
-                                        RET_GATHER(ret, install_changes_add(changes, n_changes, -errno, p, NULL));
+                                        RET_GATHER(ret, install_changes_add(changes, n_changes, -errno, p, /* source= */ NULL));
                                         continue;
                                 }
 
-                                (void) rmdir_parents(p, config_path);
+                                if (path_startswith(p, config_path))
+                                        (void) rmdir_parents(p, config_path);
                         }
 
-                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, p, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, p, /* source= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -800,6 +1061,7 @@ static int remove_marked_symlinks_fd(
 
 static int remove_marked_symlinks(
                 Set *remove_symlinks_to,
+                const VendorSymlinks *vendor,
                 const char *config_path,
                 const LookupPaths *lp,
                 bool dry_run,
@@ -816,9 +1078,12 @@ static int remove_marked_symlinks(
         if (set_isempty(remove_symlinks_to))
                 return 0;
 
-        fd = open(config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC);
+        if (vendor && !path_is_vendor(lp, config_path))
+                vendor = NULL;
+
+        fd = xopenat(AT_FDCWD, config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY);
         if (fd < 0)
-                return errno == ENOENT ? 0 : -errno;
+                return fd == -ENOENT ? 0 : fd;
 
         do {
                 int cfd;
@@ -830,7 +1095,8 @@ static int remove_marked_symlinks(
 
                 /* This takes possession of cfd and closes it */
                 RET_GATHER(r, remove_marked_symlinks_fd(remove_symlinks_to,
-                                                        cfd, config_path,
+                                                        vendor,
+                                                        cfd, config_path, /* dependency_dir= */ NULL,
                                                         config_path, lp,
                                                         dry_run,
                                                         &restart,
@@ -868,16 +1134,297 @@ static int is_symlink_with_known_name(const InstallInfo *i, const char *name) {
         return false;
 }
 
+static int dependency_entry_is_symlink(const LookupPaths *lp, const char *path) {
+        DependencyEntryType type;
+
+        assert(lp);
+        assert(path);
+
+        type = unit_file_classify_dependency_entry(path, lp->root_dir, /* ret_name= */ NULL);
+        if (type == -ENOMEM)
+                return type;
+        if (type < 0) {
+                log_debug_errno(type, "Failed to look at '%s', ignoring: %m", path);
+                return false;
+        }
+
+        return type == DEPENDENCY_ENTRY_SYMLINK;
+}
+
+/* PID 1 looks up an entry name in the dependency directories of a unit in all unit directories, and uses
+ * only the entry in the directory with the highest priority. PID 1 ignores that entry if it is a mask, if
+ * it is not a symlink, or if it is not named after a unit. */
+static int dependency_entry_is_used(
+                const LookupPaths *lp,
+                char **search_path,
+                const char *dir_path,
+                const char *name) {
+
+        _cleanup_free_ char *dir = NULL, *path = NULL, *unit = NULL, *winner = NULL;
+        const char *suffix;
+        int r;
+
+        assert(lp);
+        assert(dir_path);
+        assert(name);
+
+        path = path_join(dir_path, name);
+        if (!path)
+                return -ENOMEM;
+
+        /* If path is a mask, a symlink with the same name in a higher priority directory can hide path.
+         * PID 1 then adds the dependency from that symlink. If we only checked winner, the caller would
+         * report the unit as enabled in the directory of path, for example as enabled instead of
+         * enabled-runtime. */
+        r = dependency_entry_is_symlink(lp, path);
+        if (r <= 0)
+                return r;
+
+        r = path_extract_filename(dir_path, &dir);
+        if (r < 0)
+                return r;
+
+        suffix = ASSERT_PTR(dependency_dir_suffix(dir));
+
+        unit = strndup(dir, suffix - dir);
+        if (!unit)
+                return -ENOMEM;
+
+        /* PID 1 applies the entries in a directory such as target.wants/ to every unit of that type. The
+         * directory name contains no unit name to look up, so only the entry itself is checked. */
+        if (unit_name_is_valid(unit, UNIT_NAME_ANY)) {
+                r = unit_file_find_dropin_entry(lp->root_dir, search_path, suffix, unit,
+                                                /* aliases= */ NULL, name, /* ret_lookup_path= */ NULL, &winner);
+                if (r <= 0)
+                        return r;
+
+                /* The directory part of winner has its symlinks resolved, but the directory part of path
+                 * is the search path as configured. A symlinked /etc/systemd/system/ makes them differ. */
+                if (!path_equal_or_inode_same(winner, path, AT_SYMLINK_NOFOLLOW))
+                        /* PID 1 ignores path and uses winner instead. If winner is a symlink, PID 1 adds the
+                         * dependency that path would add, so the unit is enabled either way. */
+                        return dependency_entry_is_symlink(lp, winner);
+        }
+
+        return true;
+}
+
+static int dependency_name_matches(const InstallInfo *info, const char *name) {
+        _cleanup_free_ char *template = NULL;
+        int r;
+
+        assert(info);
+        assert(name);
+
+        if (streq(name, info->name))
+                return true;
+
+        /* Covers DefaultInstance= too: that is just one particular instance of the template. */
+        r = unit_name_template(name, &template);
+        if (r == -EINVAL)
+                return false;
+        if (r < 0)
+                return r;
+
+        return streq(template, info->name);
+}
+
+static int dependency_symlinks_list(
+                const char *path,
+                const char *root,
+                bool follow_symlinks,
+                char ***ret) {
+
+        _cleanup_strv_free_ char **l = NULL;
+        _cleanup_closedir_ DIR *dir = NULL;
+        int r;
+
+        assert(path);
+        assert(ret);
+
+        r = chase_and_opendir(path, root, /* chase_flags= */ 0, /* ret_path= */ NULL, &dir);
+        if (r < 0) {
+                if (IN_SET(r, -ENOENT, -ENOTDIR, -EACCES)) {
+                        *ret = NULL;
+                        return 0;
+                }
+                return r;
+        }
+
+        FOREACH_DIRENT(de, dir, return -errno) {
+                _cleanup_closedir_ DIR *sub = NULL;
+                _cleanup_free_ char *dir_path = NULL;
+
+                if (!dependency_dir_suffix(de->d_name) ||
+                    (de->d_type != DT_DIR && !(follow_symlinks && de->d_type == DT_LNK)))
+                        continue;
+
+                dir_path = path_join(path, de->d_name);
+                if (!dir_path)
+                        return -ENOMEM;
+
+                if (follow_symlinks)
+                        r = chase_and_opendir(dir_path, root, /* chase_flags= */ 0, /* ret_path= */ NULL, &sub);
+                else {
+                        sub = xopendirat(dirfd(dir), de->d_name, O_NOFOLLOW);
+                        r = sub ? 0 : -errno;
+                }
+                if (r < 0) {
+                        if (IN_SET(r, -ENOENT, -ENOTDIR, -ELOOP, -EACCES))
+                                continue;
+                        return r;
+                }
+
+                FOREACH_DIRENT(sde, sub, return -errno) {
+                        _cleanup_free_ char *p = NULL;
+
+                        /* Entries of every type are listed, because an empty file is a mask too. */
+                        if (!unit_name_is_valid(sde->d_name, UNIT_NAME_ANY))
+                                continue;
+
+                        p = path_join(dir_path, sde->d_name);
+                        if (!p)
+                                return -ENOMEM;
+
+                        r = strv_consume(&l, TAKE_PTR(p));
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        /* Sorted, so that the reported changes come out in a stable order rather than in readdir order. */
+        strv_sort(l);
+
+        *ret = TAKE_PTR(l);
+        return 0;
+}
+
+/* Enablement that lives in the vendor unit directories cannot be removed on behalf of the administrator:
+ * /usr/ is frequently read-only, and anything we did there would be undone by the next image update. Shadow
+ * it with a symlink to /dev/null instead, which is what PID 1 looks for when deciding to ignore a dependency
+ * symlink. Only the symlinks that enabling would create are shadowed, see dependency_is_enablement(). A
+ * static dependency the vendor installed stays in effect. */
+static int install_info_mask_dependencies(
+                RuntimeScope scope,
+                const InstallInfo *info,
+                const LookupPaths *lp,
+                char **vendor_search_path,
+                const char *config_path,
+                bool dry_run,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_strv_free_ char **vendor_symlinks = NULL;
+        int r, ret = 0;
+
+        assert(info);
+        assert(lp);
+        assert(config_path);
+
+        /* Only entries in the vendor directories are looked at. The caller removes the administrator's
+         * symlinks before calling this function. In a dry run the administrator's symlinks are still there,
+         * and they would hide the vendor entries. */
+        STRV_FOREACH(p, vendor_search_path) {
+                _cleanup_strv_free_ char **l = NULL;
+
+                r = dependency_symlinks_list(*p, lp->root_dir, /* follow_symlinks= */ false, &l);
+                if (r < 0)
+                        return r;
+
+                r = strv_extend_strv_consume(&vendor_symlinks, TAKE_PTR(l), /* filter_duplicates= */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        STRV_FOREACH(vendor_path, vendor_symlinks) {
+                _cleanup_free_ char *dir_path = NULL, *dir = NULL, *entry = NULL, *path = NULL;
+
+                r = path_extract_filename(*vendor_path, &entry);
+                if (r < 0)
+                        return r;
+
+                r = dependency_name_matches(info, entry);
+                if (r <= 0) {
+                        if (r < 0)
+                                return r;
+                        continue;
+                }
+
+                r = path_extract_directory(*vendor_path, &dir_path);
+                if (r < 0)
+                        return r;
+
+                r = path_extract_filename(dir_path, &dir);
+                if (r < 0)
+                        return r;
+
+                r = dependency_is_enablement(scope, info, dir, entry);
+                if (r <= 0) {
+                        if (r < 0)
+                                return r;
+                        continue;
+                }
+
+                r = dependency_entry_is_used(lp, vendor_search_path, dir_path, entry);
+                if (r <= 0) {
+                        if (r < 0)
+                                return r;
+                        continue;
+                }
+
+                path = path_join(config_path, dir, entry);
+                if (!path)
+                        return -ENOMEM;
+
+                /* A non-symlink sitting here already shadows the vendor symlink, and PID 1 ignores it for
+                 * not being one, so the unit is off either way. Replacing it would fail on a directory and
+                 * destroy whatever it is otherwise, so leave anything we could not identify alone too.
+                 * -ENOENT is the normal case of there being nothing here yet. */
+                r = is_symlink(path);
+                if (r == 0)
+                        continue;
+                if (r < 0 && r != -ENOENT) {
+                        log_debug_errno(r, "Failed to look at '%s', not masking it: %m", path);
+                        continue;
+                }
+
+                /* Leave an existing mask alone too, so that disabling twice stays quiet. */
+                r = path_is_mask(lp, path);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        continue;
+
+                if (!dry_run) {
+                        (void) mkdir_parents_label(path, 0755);
+
+                        r = symlink_atomic("/dev/null", path);
+                        if (r < 0) {
+                                RET_GATHER(ret, install_changes_add(changes, n_changes, r, path, /* source= */ NULL));
+                                continue;
+                        }
+                }
+
+                RET_GATHER(ret, install_changes_add(changes, n_changes,
+                                                    INSTALL_CHANGE_MASK_DEPENDENCY, path, *vendor_path));
+        }
+
+        return ret;
+}
+
 static int find_symlinks_in_directory(
+                RuntimeScope scope,
                 DIR *dir,
                 const char *dir_path,
-                const char *root_dir,
+                const LookupPaths *lp,
                 const InstallInfo *info,
                 bool ignore_destination,
                 bool match_name,
                 bool ignore_same_name,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                const char *vendor_dependency_dir,
+                bool *found_static) {
 
         int r, ret = 0;
 
@@ -887,6 +1434,7 @@ static int find_symlinks_in_directory(
         assert(unit_name_is_valid(info->name, UNIT_NAME_ANY));
         assert(config_path);
         assert(same_name_link);
+        assert(!vendor_dependency_dir || found_static);
 
         FOREACH_DIRENT(de, dir, return -errno) {
                 bool found_path = false, found_dest = false, b = false;
@@ -945,6 +1493,24 @@ static int find_symlinks_in_directory(
                 if (b)
                         *same_name_link = true;
                 else if (found_path || found_dest) {
+                        if (ignore_destination) {
+                                r = dependency_entry_is_used(lp, lp->search_path, dir_path, de->d_name);
+                                if (r < 0)
+                                        return r;
+                                if (r == 0)
+                                        continue;
+                        }
+
+                        if (vendor_dependency_dir) {
+                                r = dependency_is_enablement(scope, info, vendor_dependency_dir, de->d_name);
+                                if (r < 0)
+                                        return r;
+                                if (r == 0) {
+                                        *found_static = true;
+                                        continue;
+                                }
+                        }
+
                         if (!match_name)
                                 return 1;
 
@@ -959,37 +1525,41 @@ static int find_symlinks_in_directory(
 }
 
 static int find_symlinks(
-                const char *root_dir,
+                RuntimeScope scope,
+                const LookupPaths *lp,
                 const InstallInfo *i,
                 bool match_name,
                 bool ignore_same_name,
                 const char *config_path,
-                bool *same_name_link) {
+                bool *same_name_link,
+                bool *ret_enablement) {
 
         _cleanup_closedir_ DIR *config_dir = NULL;
+        bool vendor, found_static = false;
         int r;
 
+        assert(lp);
         assert(i);
         assert(config_path);
         assert(same_name_link);
+        assert(ret_enablement);
 
         config_dir = opendir(config_path);
         if (!config_dir) {
-                if (IN_SET(errno, ENOENT, ENOTDIR, EACCES))
+                if (IN_SET(errno, ENOENT, ENOTDIR, EACCES)) {
+                        *ret_enablement = false;
                         return 0;
+                }
                 return -errno;
         }
 
+        vendor = path_is_vendor(lp, config_path);
+
         FOREACH_DIRENT(de, config_dir, return -errno) {
-                const char *suffix;
                 _cleanup_free_ const char *path = NULL;
                 _cleanup_closedir_ DIR *d = NULL;
 
-                if (de->d_type != DT_DIR)
-                        continue;
-
-                suffix = strrchr(de->d_name, '.');
-                if (!STRPTR_IN_SET(suffix, ".wants", ".requires", ".upholds"))
+                if (de->d_type != DT_DIR || !dependency_dir_suffix(de->d_name))
                         continue;
 
                 path = path_join(config_path, de->d_name);
@@ -1002,14 +1572,19 @@ static int find_symlinks(
                         continue;
                 }
 
-                r = find_symlinks_in_directory(d, path, root_dir, i,
-                                               /* ignore_destination= */ true,
-                                               /* match_name= */ match_name,
-                                               /* ignore_same_name= */ ignore_same_name,
-                                               config_path,
-                                               same_name_link);
-                if (r > 0)
+                r = find_symlinks_in_directory(
+                                scope, d, path, lp, i,
+                                /* ignore_destination= */ true,
+                                /* match_name= */ match_name,
+                                /* ignore_same_name= */ ignore_same_name,
+                                config_path,
+                                same_name_link,
+                                vendor ? de->d_name : NULL,
+                                &found_static);
+                if (r > 0) {
+                        *ret_enablement = true;
                         return 1;
+                }
                 if (r < 0)
                         log_debug_errno(r, "Failed to look up symlinks in \"%s\": %m", path);
         }
@@ -1017,12 +1592,19 @@ static int find_symlinks(
         /* We didn't find any suitable symlinks in .wants, .requires or .upholds directories,
          * let's look for linked unit files in this directory. */
         rewinddir(config_dir);
-        return find_symlinks_in_directory(config_dir, config_path, root_dir, i,
-                                          /* ignore_destination= */ false,
-                                          /* match_name= */ match_name,
-                                          /* ignore_same_name= */ ignore_same_name,
-                                          config_path,
-                                          same_name_link);
+        r = find_symlinks_in_directory(scope, config_dir, config_path, lp, i,
+                                       /* ignore_destination= */ false,
+                                       /* match_name= */ match_name,
+                                       /* ignore_same_name= */ ignore_same_name,
+                                       config_path,
+                                       same_name_link,
+                                       /* vendor_dependency_dir= */ NULL,
+                                       /* found_static= */ NULL);
+        if (r < 0)
+                return r;
+
+        *ret_enablement = false;
+        return r > 0 || found_static;
 }
 
 static int find_symlinks_in_scope(
@@ -1033,7 +1615,7 @@ static int find_symlinks_in_scope(
                 UnitFileState *state) {
 
         bool same_name_link_runtime = false, same_name_link_config = false;
-        bool enabled_in_runtime = false, enabled_at_all = false;
+        bool enabled_in_runtime = false, enabled_at_all = false, aliased_at_all = false;
         bool ignore_same_name = false;
         int r;
 
@@ -1046,9 +1628,9 @@ static int find_symlinks_in_scope(
          * effectively masked, so we should ignore them. */
 
         STRV_FOREACH(p, lp->search_path)  {
-                bool same_name_link = false;
+                bool same_name_link = false, enablement = false;
 
-                r = find_symlinks(lp->root_dir, info, match_name, ignore_same_name, *p, &same_name_link);
+                r = find_symlinks(scope, lp, info, match_name, ignore_same_name, *p, &same_name_link, &enablement);
                 if (r < 0)
                         return r;
                 if (r > 0) {
@@ -1066,19 +1648,29 @@ static int find_symlinks_in_scope(
                                 return 1;
                         }
 
-                        r = path_is_runtime(lp, *p, false);
+                        r = path_is_runtime(lp, *p, /* check_parent= */ false);
                         if (r < 0)
                                 return r;
                         if (r > 0)
                                 enabled_in_runtime = true;
-                        else
+                        else if (enablement && path_is_vendor(lp, *p))
+                                /* The vendor installed a .wants/, .requires/ or .upholds/ symlink below
+                                 * /usr/, in a directory the [Install] section names. PID 1 acts on it like
+                                 * on a symlink in /etc/, so the unit is enabled. A symlink or a mask in
+                                 * /etc/ still overrides it. */
                                 enabled_at_all = true;
+                        else
+                                /* The symlink is an alias, i.e. it gives the unit another name, a static
+                                 * dependency the vendor installed, or a symlink in one of the remaining
+                                 * directories, such as the one portable services are attached to. None of
+                                 * those enables the unit, see below. */
+                                aliased_at_all = true;
 
                 } else if (same_name_link) {
                         if (path_equal(*p, lp->persistent_config))
                                 same_name_link_config = true;
                         else {
-                                r = path_is_runtime(lp, *p, false);
+                                r = path_is_runtime(lp, *p, /* check_parent= */ false);
                                 if (r < 0)
                                         return r;
                                 if (r > 0)
@@ -1097,11 +1689,19 @@ static int find_symlinks_in_scope(
                 return 1;
         }
 
+        /* Enabled by the vendor rather than by the administrator. Report it as plain "enabled": that is what
+         * it behaves like, and it remains overridable from /etc/, either by removing the dependency symlink
+         * that shadows the vendor one or by masking it with a symlink to /dev/null. */
+        if (enabled_at_all) {
+                *state = UNIT_FILE_ENABLED;
+                return 1;
+        }
+
         /* Here's a special rule: if the unit we are looking for is an instance, and it symlinked in the search path
          * outside of runtime and configuration directory, then we consider it statically enabled. Note we do that only
          * for instance, not for regular names, as those are merely aliases, while instances explicitly instantiate
          * something, and hence are a much stronger concept. */
-        if (enabled_at_all && unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
+        if (aliased_at_all && unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
                 *state = UNIT_FILE_STATIC;
                 return 1;
         }
@@ -1177,10 +1777,10 @@ static int install_info_may_process(
          * transient or generated and thus not subject to enable/disable operations. */
 
         if (i->install_mode == INSTALL_MODE_MASKED)
-                return install_changes_add(changes, n_changes, -ERFKILL, i->path, NULL);
+                return install_changes_add(changes, n_changes, -ERFKILL, i->path, /* source= */ NULL);
         if (path_is_generator(lp, i->path) ||
             path_is_transient(lp, i->path))
-                return install_changes_add(changes, n_changes, -EADDRNOTAVAIL, i->path, NULL);
+                return install_changes_add(changes, n_changes, -EADDRNOTAVAIL, i->path, /* source= */ NULL);
 
         return 0;
 }
@@ -1314,7 +1914,7 @@ static int config_parse_also(
         for (;;) {
                 _cleanup_free_ char *word = NULL, *printed = NULL;
 
-                r = extract_first_word(&rvalue, &word, NULL, 0);
+                r = extract_first_word(&rvalue, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1325,7 +1925,7 @@ static int config_parse_also(
                         return log_syntax(unit, LOG_WARNING, filename, line, r,
                                           "Failed to resolve unit name in Also=\"%s\": %m", word);
 
-                r = install_info_add(ctx, printed, NULL, info->root, /* auxiliary= */ true, NULL);
+                r = install_info_add(ctx, printed, /* path= */ NULL, info->root, /* auxiliary= */ true, /* ret= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -1438,16 +2038,16 @@ static int unit_file_load(
                         return 0;
                 }
 
-                fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW);
+                fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY|O_NOFOLLOW);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
         } else {
                 /* Operating on a drop-in file. If we aren't supposed to load the unit file drop-ins don't matter, let's hence shortcut this. */
 
                 if (!(flags & SEARCH_LOAD))
                         return 0;
 
-                fd = chase_and_open(path, root_dir, 0, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
+                fd = chase_and_open(path, root_dir, /* chase_flags= */ 0, O_RDONLY|O_NOCTTY, /* ret_path= */ NULL);
                 if (fd < 0)
                         return fd;
         }
@@ -1488,8 +2088,8 @@ static int unit_file_load(
                          "-Target\0"
                          "-Timer\0",
                          config_item_table_lookup, items,
-                         0, info,
-                         NULL);
+                         /* flags= */ 0, info,
+                         /* ret_stat= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse \"%s\": %m", info->name);
 
@@ -1517,8 +2117,8 @@ static int unit_file_load_or_readlink(
 
         /* This is a symlink, let's read and verify it. */
         r = unit_file_resolve_symlink(lp->root_dir, lp->search_path,
-                                      NULL, AT_FDCWD, path,
-                                      true, &info->symlink_target);
+                                      /* dir= */ NULL, AT_FDCWD, path,
+                                      /* resolve_destination_target= */ true, &info->symlink_target);
         if (r < 0)
                 return r;
         bool outside_search_path = r > 0;
@@ -1647,7 +2247,7 @@ static int unit_file_search(
 
         /* Load drop-in conf files */
 
-        r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char**) dirs);
+        r = conf_files_list_strv(&files, ".conf", /* root= */ NULL, /* flags= */ 0, (const char**) dirs);
         if (r < 0)
                 return log_debug_errno(r, "Failed to get list of conf files: %m");
 
@@ -1717,7 +2317,7 @@ static int install_info_traverse(
                         return -ELOOP;
 
                 if (!FLAGS_SET(flags, SEARCH_FOLLOW_CONFIG_SYMLINKS)) {
-                        r = path_is_config(lp, i->path, true);
+                        r = path_is_config(lp, i->path, /* check_parent= */ true);
                         if (r < 0)
                                 return r;
                         if (r > 0)
@@ -1754,7 +2354,7 @@ static int install_info_traverse(
                                         /* We filled in the instance, and the target stayed the same? If so,
                                          * then let's honour the link as it is. */
 
-                                        r = install_info_follow(ctx, i, lp, flags, true);
+                                        r = install_info_follow(ctx, i, lp, flags, /* ignore_different_name= */ true);
                                         if (r < 0)
                                                 return r;
 
@@ -1765,7 +2365,7 @@ static int install_info_traverse(
                         } else
                                 bn = target_name;
 
-                        r = install_info_add(ctx, bn, NULL, lp->root_dir, /* auxiliary= */ false, &i);
+                        r = install_info_add(ctx, bn, /* path= */ NULL, lp->root_dir, /* auxiliary= */ false, &i);
                         if (r < 0)
                                 return r;
 
@@ -1803,9 +2403,9 @@ static int install_info_add_auto(
                 if (!pp)
                         return -ENOMEM;
 
-                return install_info_add(ctx, NULL, pp, lp->root_dir, /* auxiliary= */ false, ret);
+                return install_info_add(ctx, /* name= */ NULL, pp, lp->root_dir, /* auxiliary= */ false, ret);
         } else
-                return install_info_add(ctx, name_or_path, NULL, lp->root_dir, /* auxiliary= */ false, ret);
+                return install_info_add(ctx, name_or_path, /* path= */ NULL, lp->root_dir, /* auxiliary= */ false, ret);
 }
 
 static int install_info_discover(
@@ -1829,9 +2429,221 @@ static int install_info_discover(
                 r = install_info_traverse(ctx, lp, info, flags, ret);
 
         if (r < 0)
-                return install_changes_add(changes, n_changes, r, name_or_path, NULL);
+                return install_changes_add(changes, n_changes, r, name_or_path, /* source= */ NULL);
 
         return r;
+}
+
+static void vendor_symlinks_done(VendorSymlinks *v) {
+        assert(v);
+
+        v->units = hashmap_free(v->units);
+        v->own_names = set_free(v->own_names);
+        install_context_done(&v->loaded);
+}
+
+static int install_info_collect_vendor_symlinks(
+                const LookupPaths *lp,
+                InstallInfo *info,
+                UnitFileFlags file_flags,
+                VendorSymlinks *vendor) {
+
+        InstallInfo *loaded = info;
+        int r;
+
+        assert(lp);
+        assert(info);
+        assert(vendor);
+
+        /* Loading rules in the removal context would add Also= units after their preset policies were
+         * applied. A separate context keeps Also= units out of the removal set. */
+        if (!install_info_has_rules(info)) {
+                r = install_info_discover(&vendor->loaded, lp, info->name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                          &loaded, /* changes= */ NULL, /* n_changes= */ NULL);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0) {
+                        /* Without the [Install] section no dependency symlink counts as enablement and no
+                         * name is recorded, so disabling keeps all symlinks of the unit. */
+                        log_debug_errno(r, "Failed to load %s, keeping its symlinks in the vendor directories: %m",
+                                        info->name);
+                        loaded = info;
+                }
+        }
+
+        r = hashmap_ensure_put(&vendor->units, &string_hash_ops, info->name, loaded);
+        if (r < 0 && r != -EEXIST)
+                return r;
+
+        /* Removing a vendor alias changes unit name resolution even when the preset only disables
+         * automatic activation. Presets therefore leave alias names installed. */
+        if (FLAGS_SET(file_flags, UNIT_FILE_APPLYING_PRESET))
+                return 0;
+
+        if (loaded->path) {
+                r = in_search_path(lp, loaded->path);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        r = set_put_strdup(&vendor->own_names, loaded->name);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        STRV_FOREACH(a, loaded->aliases) {
+                _cleanup_free_ char *dst = NULL;
+
+                /* A name we can't resolve isn't recorded, so the symlink with that name stays. */
+                r = install_name_printf(vendor->loaded.scope, loaded, *a, &dst);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to resolve specifiers in '%s', keeping the symlink: %m", *a);
+                        continue;
+                }
+
+                r = set_put_strdup(&vendor->own_names, dst);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static int install_context_mask_dependencies(
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                const char *config_path,
+                bool dry_run,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_strv_free_ char **vendor_search_path = NULL;
+        InstallInfo *i;
+        int r, ret = 0;
+
+        assert(ctx);
+        assert(lp);
+        assert(config_path);
+
+        if (path_is_vendor(lp, config_path))
+                return 0;
+
+        if (ordered_hashmap_isempty(ctx->have_processed))
+                return 0;
+
+        STRV_FOREACH(p, lp->search_path)
+                if (path_is_vendor(lp, *p)) {
+                        r = strv_extend(&vendor_search_path, *p);
+                        if (r < 0)
+                                return r;
+                }
+
+        if (strv_isempty(vendor_search_path))
+                return 0;
+
+        ORDERED_HASHMAP_FOREACH(i, ctx->have_processed) {
+                if (i->install_mode != INSTALL_MODE_REGULAR)
+                        continue;
+
+                RET_GATHER(ret, install_info_mask_dependencies(ctx->scope, i, lp, vendor_search_path, config_path,
+                                                               dry_run, changes, n_changes));
+        }
+
+        return ret;
+}
+
+/* Drops the dependency masks that disabling the units in ctx created. Creating a symlink replaces the mask
+ * at the same path. Disabling a template masks every instance the vendor installed a symlink for, and
+ * enabling the template only creates the symlink of its default instance, so the masks of the other
+ * instances are removed here. */
+static int install_context_unmask_dependencies(
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                const char *config_path,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_strv_free_ char **symlinks = NULL;
+        InstallInfo *i;
+        int r, ret = 0;
+
+        assert(ctx);
+        assert(lp);
+        assert(config_path);
+
+        /* Called after install_context_apply(), which is what discovers the Also= units and moves everything
+         * into have_processed. No dry run parameter unlike the masking side: nothing on the enabling path
+         * implements one, see create_symlink(), and honouring it here alone would make a dry run that is
+         * asked for anyway do half the work. */
+
+        if (ordered_hashmap_isempty(ctx->have_processed))
+                return 0;
+
+        r = dependency_symlinks_list(config_path, lp->root_dir, /* follow_symlinks= */ true, &symlinks);
+        if (r < 0)
+                return r;
+
+        ORDERED_HASHMAP_FOREACH(i, ctx->have_processed) {
+                if (i->install_mode != INSTALL_MODE_REGULAR)
+                        continue;
+
+                STRV_FOREACH(symlink, symlinks) {
+                        _cleanup_free_ char *dir_path = NULL, *dir = NULL, *entry = NULL, *resolved = NULL;
+
+                        r = path_extract_filename(*symlink, &entry);
+                        if (r < 0)
+                                return r;
+
+                        r = dependency_name_matches(i, entry);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue;
+
+                        /* Disabling never creates a mask in a directory the [Install] section does not
+                         * name, so a mask there is the administrator's and stays. */
+                        r = path_extract_directory(*symlink, &dir_path);
+                        if (r < 0)
+                                return r;
+
+                        r = path_extract_filename(dir_path, &dir);
+                        if (r < 0)
+                                return r;
+
+                        r = dependency_is_enablement(ctx->scope, i, dir, entry);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue;
+
+                        r = path_is_mask(lp, *symlink);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue;
+
+                        r = chase(*symlink, lp->root_dir, CHASE_NOFOLLOW, &resolved, /* ret_fd= */ NULL);
+                        if (r == -ENOENT)
+                                continue;
+                        if (r < 0)
+                                return r;
+
+                        if (unlink(resolved) < 0 && errno != ENOENT) {
+                                RET_GATHER(ret, install_changes_add(changes, n_changes, -errno, resolved, /* source= */ NULL));
+                                continue;
+                        }
+
+                        if (path_startswith(resolved, config_path))
+                                (void) rmdir_parents(resolved, config_path);
+
+                        RET_GATHER(ret, install_changes_add(changes, n_changes,
+                                                            INSTALL_CHANGE_UNMASK_DEPENDENCY, resolved, /* source= */ NULL));
+                }
+        }
+
+        return ret;
 }
 
 static int install_info_discover_and_check(
@@ -1895,7 +2707,7 @@ int unit_file_verify_alias(
                 if (!p)
                         p = endswith(dir, ".requires");
                 if (!p) {
-                        r = install_changes_add(changes, n_changes, -EXDEV, dst, NULL);
+                        r = install_changes_add(changes, n_changes, -EXDEV, dst, /* source= */ NULL);
                         if (r != -EXDEV)
                                 return r;
 
@@ -1906,7 +2718,7 @@ int unit_file_verify_alias(
 
                 UnitNameFlags type = unit_name_classify(dir);
                 if (type < 0) {
-                        r = install_changes_add(changes, n_changes, -EXDEV, dst, NULL);
+                        r = install_changes_add(changes, n_changes, -EXDEV, dst, /* source= */ NULL);
                         if (r != -EXDEV)
                                 return r;
                         return log_debug_errno(SYNTHETIC_ERRNO(EXDEV),
@@ -1937,7 +2749,7 @@ int unit_file_verify_alias(
 
                         UnitNameFlags type = unit_name_to_instance(info->name, &inst);
                         if (type < 0) {
-                                r = install_changes_add(changes, n_changes, -EUCLEAN, info->name, NULL);
+                                r = install_changes_add(changes, n_changes, -EUCLEAN, info->name, /* source= */ NULL);
                                 if (r != -EUCLEAN)
                                         return r;
                                 return log_debug_errno(type, "Failed to extract instance name from \"%s\": %m", info->name);
@@ -1965,6 +2777,93 @@ int unit_file_verify_alias(
         return 0;
 }
 
+/* This function checks whether the vendor already provides the Alias= symlink rel, in which case presetting
+ * does not need to create it in config_path. Unit files are looked up by name in search path order. A
+ * symlink in config_path therefore only takes precedence over the directories below config_path, and there
+ * the first entry found is used. Only a vendor supplied entry is accepted. An entry in /run/ or from a
+ * generator is removed again on reboot. An entry below /usr/local/ belongs to the administrator. The name
+ * of an alias does not identify its unit, so the entry also has to point at unit. */
+static int alias_provided_below(
+                const LookupPaths *lp,
+                const char *config_path,
+                const char *rel,
+                const InstallInfo *info) {
+
+        bool below = false;
+        int r;
+
+        assert(lp);
+        assert(config_path);
+        assert(rel);
+        assert(info);
+
+        STRV_FOREACH(p, lp->search_path) {
+                _cleanup_free_ char *path = NULL, *entry = NULL, *dest = NULL, *resolved = NULL;
+                struct stat st;
+
+                if (!below) {
+                        below = path_equal(*p, config_path);
+                        if (!below)
+                                continue;
+                }
+
+                path = path_join(*p, rel);
+                if (!path)
+                        return -ENOMEM;
+
+                r = chase_and_stat(path, lp->root_dir, CHASE_NOFOLLOW, &entry, &st);
+                if (r < 0) {
+                        if (IN_SET(r, -ENOENT, -ENOTDIR))
+                                continue;
+                        if (r == -ENOMEM)
+                                return r;
+
+                        /* Anything we cannot look at falls back on writing our own symlink. A redundant one
+                         * is harmless, while wrongly skipping it would leave the unit off, and aborting here
+                         * would leave the preset applied by halves. */
+                        log_debug_errno(r, "Failed to look at '%s', not skipping the symlink: %m", path);
+                        return false;
+                }
+
+                if (path_equal(*p, config_path))
+                        return false;
+
+                r = path_is_mask(lp, entry);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to check whether '%s' is masked, not skipping the symlink: %m", path);
+                        return false;
+                }
+                if (r > 0)
+                        return false;
+
+                /* Only what the vendor provides counts, not what an administrator put below /usr/local/. */
+                if (!S_ISLNK(st.st_mode) || !path_is_vendor(lp, *p) || path_is_usr_local(lp, *p))
+                        return false;
+
+                r = readlink_malloc(entry, &dest);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to read '%s', not skipping the symlink: %m", path);
+                        return false;
+                }
+
+                r = unit_symlink_name_compatible(info->name, last_path_component(dest), /* instance_propagation= */ true);
+                if (r <= 0)
+                        return r;
+
+                r = chase(entry, lp->root_dir, /* flags= */ 0, &resolved, /* ret_fd= */ NULL);
+                if (r == -ENOMEM)
+                        return r;
+                if (r < 0)
+                        return false;
+
+                return path_equal_or_inode_same(resolved, info->path, /* flags= */ 0);
+        }
+
+        return false;
+}
+
 static int install_info_symlink_alias(
                 RuntimeScope scope,
                 UnitFileFlags file_flags,
@@ -1986,7 +2885,7 @@ static int install_info_symlink_alias(
 
                 r = install_name_printf(scope, info, *s, &dst);
                 if (r < 0) {
-                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, *s, NULL));
+                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, *s, /* source= */ NULL));
                         continue;
                 }
 
@@ -1995,6 +2894,22 @@ static int install_info_symlink_alias(
                         if (r != -ELOOP)
                                 RET_GATHER(ret, r);
                         continue;
+                }
+
+                if (FLAGS_SET(file_flags, UNIT_FILE_APPLYING_PRESET)) {
+                        r = alias_provided_below(lp, config_path, dst_updated ?: dst, info);
+                        if (r < 0)
+                                return r;
+                        if (r > 0) {
+                                log_debug("Alias %s already provided below %s, not creating it.",
+                                          dst_updated ?: dst, config_path);
+
+                                /* A skipped symlink still counts as install information for the caller. */
+                                if (ret >= 0)
+                                        ret = 1;
+
+                                continue;
+                        }
                 }
 
                 alias_path = path_make_absolute(dst_updated ?: dst, config_path);
@@ -2031,6 +2946,79 @@ static int install_info_symlink_alias(
         }
 
         return ret;
+}
+
+/* This function checks whether the vendor already provides the dependency symlink rel, in which case
+ * presetting does not need to create it in config_path. A symlink in config_path only takes precedence over
+ * the directories below config_path. Only a vendor supplied entry is accepted. An entry in /run/ or from a
+ * generator is removed again on reboot. An entry below /usr/local/ belongs to the administrator. */
+static int dependency_provided_below(
+                const LookupPaths *lp,
+                const char *config_path,
+                const char *rel) {
+
+        _cleanup_free_ char *dir = NULL, *entry = NULL, *unit = NULL, *winner = NULL,
+                *search_path = NULL, *path = NULL, *resolved = NULL;
+        char **below = NULL;
+        const char *suffix;
+        int r;
+
+        assert(lp);
+        assert(config_path);
+        assert(rel);
+
+        path = path_join(config_path, rel);
+        if (!path)
+                return -ENOMEM;
+        r = chase(path, lp->root_dir, CHASE_NOFOLLOW, &resolved, /* ret_fd= */ NULL);
+        if (r == -ENOMEM)
+                return r;
+        if (r >= 0) {
+                r = path_is_mask(lp, resolved);
+                if (r <= 0)
+                        return r;
+        } else if (r != -ENOENT)
+                return false;
+
+        STRV_FOREACH(p, lp->search_path)
+                if (path_equal(*p, config_path)) {
+                        below = p + 1;
+                        break;
+                }
+
+        r = path_split_prefix_filename(rel, &dir, &entry);
+        if (r < 0)
+                return r;
+
+        suffix = dependency_dir_suffix(dir);
+        if (!suffix)
+                return false;
+
+        unit = strndup(dir, suffix - dir);
+        if (!unit)
+                return -ENOMEM;
+
+        /* If a lookup fails, presetting writes its own symlink. A redundant symlink is harmless. Wrongly
+         * skipping the symlink would leave the unit disabled. Returning the error would stop the preset
+         * after only some of the units were changed. */
+        r = unit_file_find_dropin_entry(lp->root_dir, below, suffix, unit, /* aliases= */ NULL, entry,
+                                        &search_path, &winner);
+        if (r == -ENOMEM)
+                return r;
+        if (r < 0) {
+                log_debug_errno(r, "Failed to look up '%s' below '%s', not skipping the symlink: %m",
+                                rel, config_path);
+                return false;
+        }
+        if (r == 0)
+                return false;
+
+        r = dependency_entry_is_symlink(lp, winner);
+        if (r <= 0)
+                return r;
+
+        /* Only what the vendor provides counts, not what an administrator put below /usr/local/. */
+        return path_is_vendor(lp, search_path) && !path_is_usr_local(lp, search_path);
 }
 
 static int install_info_symlink_wants(
@@ -2070,12 +3058,12 @@ static int install_info_symlink_wants(
                 if (r < 0)
                         return r;
 
-                r = unit_file_search(NULL, &instance, lp, SEARCH_FOLLOW_CONFIG_SYMLINKS);
+                r = unit_file_search(/* ctx= */ NULL, &instance, lp, SEARCH_FOLLOW_CONFIG_SYMLINKS);
                 if (r < 0)
                         return r;
 
                 if (instance.install_mode == INSTALL_MODE_MASKED)
-                        return install_changes_add(changes, n_changes, -ERFKILL, instance.path, NULL);
+                        return install_changes_add(changes, n_changes, -ERFKILL, instance.path, /* source= */ NULL);
 
                 n = instance.name;
 
@@ -2093,7 +3081,7 @@ static int install_info_symlink_wants(
 
                 q = install_name_printf(scope, info, *s, &dst);
                 if (q < 0) {
-                        RET_GATHER(r, install_changes_add(changes, n_changes, q, *s, NULL));
+                        RET_GATHER(r, install_changes_add(changes, n_changes, q, *s, /* source= */ NULL));
                         continue;
                 }
 
@@ -2111,12 +3099,34 @@ static int install_info_symlink_wants(
                         if (unit_name_is_valid(dst, UNIT_NAME_ANY))
                                 RET_GATHER(r, install_changes_add(changes, n_changes, -EIDRM, dst, n));
                         else
-                                RET_GATHER(r, install_changes_add(changes, n_changes, -EUCLEAN, dst, NULL));
+                                RET_GATHER(r, install_changes_add(changes, n_changes, -EUCLEAN, dst, /* source= */ NULL));
 
                         continue;
                 }
 
-                path = strjoin(config_path, "/", dst, suffix, n);
+                _cleanup_free_ char *rel = strjoin(dst, suffix, n);
+                if (!rel)
+                        return -ENOMEM;
+
+                /* Presets do not record an administrator override when vendor enablement already matches
+                 * the policy. Explicit enablement must remain recorded if a later image removes the link. */
+                if (FLAGS_SET(file_flags, UNIT_FILE_APPLYING_PRESET)) {
+                        q = dependency_provided_below(lp, config_path, rel);
+                        if (q < 0)
+                                return q;
+                        if (q > 0) {
+                                log_debug("Dependency %s already provided below %s, not creating it.",
+                                          rel, config_path);
+
+                                /* A skipped symlink still counts as install information for the caller. */
+                                if (r >= 0)
+                                        r = 1;
+
+                                continue;
+                        }
+                }
+
+                path = path_join(config_path, rel);
                 if (!path)
                         return -ENOMEM;
 
@@ -2238,22 +3248,22 @@ static int install_context_apply(
                 if (q < 0)
                         return q;
 
-                q = install_info_traverse(ctx, lp, i, flags, NULL);
+                q = install_info_traverse(ctx, lp, i, flags, /* ret= */ NULL);
                 if (q < 0) {
                         if (i->auxiliary) {
-                                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_AUXILIARY_FAILED, i->name, NULL);
+                                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_AUXILIARY_FAILED, i->name, /* source= */ NULL);
                                 if (q < 0)
                                         return q;
                                 continue;
                         }
 
-                        return install_changes_add(changes, n_changes, q, i->name, NULL);
+                        return install_changes_add(changes, n_changes, q, i->name, /* source= */ NULL);
                 }
 
                 /* We can attempt to process a masked unit when a different unit
                  * that we were processing specifies it in Also=. */
                 if (i->install_mode == INSTALL_MODE_MASKED) {
-                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path, NULL);
+                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path, /* source= */ NULL);
                         if (q < 0)
                                 return q;
                         if (r >= 0)
@@ -2281,7 +3291,9 @@ static int install_context_apply(
 static int install_context_mark_for_removal(
                 InstallContext *ctx,
                 const LookupPaths *lp,
+                UnitFileFlags file_flags,
                 Set **remove_symlinks_to,
+                VendorSymlinks *vendor,
                 const char *config_path,
                 InstallChange **changes,
                 size_t *n_changes) {
@@ -2308,10 +3320,12 @@ static int install_context_mark_for_removal(
                 if (r < 0)
                         return r;
 
-                r = install_info_traverse(ctx, lp, i, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, NULL);
+                r = install_info_traverse(ctx, lp, i, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, /* ret= */ NULL);
+                bool found = r >= 0;
+
                 if (r == -ENOLINK) {
                         log_debug_errno(r, "Name %s leads to a dangling symlink, removing name.", i->name);
-                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_DANGLING, i->path ?: i->name, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_DANGLING, i->path ?: i->name, /* source= */ NULL);
                         if (r < 0)
                                 return r;
                 } else if (r == -ENOENT) {
@@ -2319,7 +3333,7 @@ static int install_context_mark_for_removal(
                                 log_debug_errno(r, "Auxiliary unit of %s not found, removing name.", i->name);
                         else {
                                 log_debug_errno(r, "Unit %s not found, removing name.", i->name);
-                                r = install_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
+                                r = install_changes_add(changes, n_changes, r, i->path ?: i->name, /* source= */ NULL);
                                 /* In case there's no unit, we still want to remove any leftover symlink, even if
                                  * the unit might have been removed already, hence treating ENOENT as non-fatal. */
                                 if (r != -ENOENT)
@@ -2327,12 +3341,12 @@ static int install_context_mark_for_removal(
                         }
                 } else if (r < 0) {
                         log_debug_errno(r, "Failed to find unit %s, removing name: %m", i->name);
-                        int k = install_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
+                        int k = install_changes_add(changes, n_changes, r, i->path ?: i->name, /* source= */ NULL);
                         if (k != r)
                                 return k;
                 } else if (i->install_mode == INSTALL_MODE_MASKED) {
                         log_debug("Unit file %s is masked, ignoring.", i->name);
-                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path ?: i->name, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path ?: i->name, /* source= */ NULL);
                         if (r < 0)
                                 return r;
                         continue;
@@ -2340,6 +3354,16 @@ static int install_context_mark_for_removal(
                         log_debug("Unit %s has install mode %s, ignoring.",
                                   i->name, install_mode_to_string(i->install_mode) ?: "invalid");
                         continue;
+                }
+
+                /* In the vendor directories the static dependencies of a unit belong to whoever built the
+                 * image. Removing them would stop the unit from starting at boot, which disabling must not
+                 * do. Units we couldn't find at all aren't recorded, so that their symlinks are removed as
+                 * leftovers. */
+                if (found && vendor && path_is_vendor(lp, config_path)) {
+                        r = install_info_collect_vendor_symlinks(lp, i, file_flags, vendor);
+                        if (r < 0)
+                                return r;
                 }
 
                 r = mark_symlink_for_removal(remove_symlinks_to, i->name);
@@ -2365,7 +3389,10 @@ int unit_file_mask(
         assert(scope >= 0);
         assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (FLAGS_SET(flags, UNIT_FILE_VENDOR))
+                return -EOPNOTSUPP;
+
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -2411,7 +3438,10 @@ int unit_file_unmask(
         assert(scope >= 0);
         assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (FLAGS_SET(flags, UNIT_FILE_VENDOR))
+                return -EOPNOTSUPP;
+
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -2433,7 +3463,7 @@ int unit_file_unmask(
                                 .install_mode = _INSTALL_MODE_INVALID,
                         };
 
-                        r = unit_file_search(NULL, &info, &lp, 0);
+                        r = unit_file_search(/* ctx= */ NULL, &info, &lp, /* flags= */ 0);
                         if (r < 0) {
                                 if (r != -ENOENT)
                                         log_debug_errno(r, "Failed to look up unit %s, ignoring: %m", info.name);
@@ -2485,12 +3515,12 @@ int unit_file_unmask(
 
                 if (!dry_run && unlink(path) < 0) {
                         if (errno != ENOENT)
-                                RET_GATHER(r, install_changes_add(changes, n_changes, -errno, path, NULL));
+                                RET_GATHER(r, install_changes_add(changes, n_changes, -errno, path, /* source= */ NULL));
 
                         continue;
                 }
 
-                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, path, NULL);
+                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, path, /* source= */ NULL);
                 if (q < 0)
                         return q;
 
@@ -2500,7 +3530,8 @@ int unit_file_unmask(
                         return q;
         }
 
-        RET_GATHER(r, remove_marked_symlinks(remove_symlinks_to, config_path, &lp, dry_run, changes, n_changes));
+        RET_GATHER(r, remove_marked_symlinks(remove_symlinks_to, /* vendor= */ NULL,
+                                             config_path, &lp, dry_run, changes, n_changes));
 
         return r;
 }
@@ -2523,7 +3554,10 @@ int unit_file_link(
         assert(changes);
         assert(n_changes);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (FLAGS_SET(flags, UNIT_FILE_VENDOR))
+                return -EOPNOTSUPP;
+
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -2538,14 +3572,14 @@ int unit_file_link(
                         continue;
 
                 if (!path_is_absolute(*file))
-                        return install_changes_add(changes, n_changes, -EINVAL, *file, NULL);
+                        return install_changes_add(changes, n_changes, -EINVAL, *file, /* source= */ NULL);
 
                 r = path_extract_filename(*file, &fn);
                 if (r < 0)
-                        return install_changes_add(changes, n_changes, r, *file, NULL);
+                        return install_changes_add(changes, n_changes, r, *file, /* source= */ NULL);
 
                 if (!unit_name_is_valid(fn, UNIT_NAME_ANY))
-                        return install_changes_add(changes, n_changes, -EUCLEAN, *file, NULL);
+                        return install_changes_add(changes, n_changes, -EUCLEAN, *file, /* source= */ NULL);
 
                 full = path_join(lp.root_dir, *file);
                 if (!full)
@@ -2553,17 +3587,17 @@ int unit_file_link(
 
                 r = verify_regular_at(AT_FDCWD, full, /* follow= */ false);
                 if (r < 0)
-                        return install_changes_add(changes, n_changes, r, *file, NULL);
+                        return install_changes_add(changes, n_changes, r, *file, /* source= */ NULL);
 
                 r = in_search_path(&lp, *file);
                 if (r < 0)
-                        return install_changes_add(changes, n_changes, r, *file, NULL);
+                        return install_changes_add(changes, n_changes, r, *file, /* source= */ NULL);
                 if (r > 0)
                         /* A silent noop if the file is already in the search path. */
                         continue;
 
                 if (underneath_search_path(&lp, *file))
-                        return install_changes_add(changes, n_changes, -ETXTBSY, *file, NULL);
+                        return install_changes_add(changes, n_changes, -ETXTBSY, *file, /* source= */ NULL);
 
                 path = strdup(*file);
                 if (!path)
@@ -2602,7 +3636,7 @@ static int path_shall_revert(const LookupPaths *lp, const char *path) {
 
         /* Checks whether the path is one where the drop-in directories shall be removed. */
 
-        r = path_is_config(lp, path, true);
+        r = path_is_config(lp, path, /* check_parent= */ true);
         if (r != 0)
                 return r;
 
@@ -2638,7 +3672,7 @@ int unit_file_revert(
          * We remove all that in both the runtime and the persistent directories, if that applies.
          */
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -2659,12 +3693,12 @@ int unit_file_revert(
                         r = RET_NERRNO(lstat(path, &st));
                         if (r < 0) {
                                 if (r != -ENOENT)
-                                        return install_changes_add(changes, n_changes, r, path, NULL);
+                                        return install_changes_add(changes, n_changes, r, path, /* source= */ NULL);
                         } else if (S_ISREG(st.st_mode)) {
                                 /* Check if there's a vendor version */
                                 r = path_is_vendor_or_generator(&lp, path);
                                 if (r < 0)
-                                        return install_changes_add(changes, n_changes, r, path, NULL);
+                                        return install_changes_add(changes, n_changes, r, path, /* source= */ NULL);
                                 if (r > 0)
                                         has_vendor = true;
                         }
@@ -2676,12 +3710,12 @@ int unit_file_revert(
                         r = RET_NERRNO(lstat(dropin, &st));
                         if (r < 0) {
                                 if (r != -ENOENT)
-                                        return install_changes_add(changes, n_changes, r, dropin, NULL);
+                                        return install_changes_add(changes, n_changes, r, dropin, /* source= */ NULL);
                         } else if (S_ISDIR(st.st_mode)) {
                                 /* Remove the drop-ins */
                                 r = path_shall_revert(&lp, dropin);
                                 if (r < 0)
-                                        return install_changes_add(changes, n_changes, r, dropin, NULL);
+                                        return install_changes_add(changes, n_changes, r, dropin, /* source= */ NULL);
                                 if (r > 0) {
                                         if (!GREEDY_REALLOC0(todo, n_todo + 2))
                                                 return -ENOMEM;
@@ -2706,11 +3740,11 @@ int unit_file_revert(
                         r = RET_NERRNO(lstat(path, &st));
                         if (r < 0) {
                                 if (r != -ENOENT)
-                                        return install_changes_add(changes, n_changes, r, path, NULL);
+                                        return install_changes_add(changes, n_changes, r, path, /* source= */ NULL);
                         } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
-                                r = path_is_config(&lp, path, true);
+                                r = path_is_config(&lp, path, /* check_parent= */ true);
                                 if (r < 0)
-                                        return install_changes_add(changes, n_changes, r, path, NULL);
+                                        return install_changes_add(changes, n_changes, r, path, /* source= */ NULL);
                                 if (r > 0) {
                                         if (!GREEDY_REALLOC0(todo, n_todo + 2))
                                                 return -ENOMEM;
@@ -2743,12 +3777,12 @@ int unit_file_revert(
                         if (!t)
                                 return -ENOMEM;
 
-                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, t, NULL);
+                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, t, /* source= */ NULL);
                         if (q < 0)
                                 return q;
                 }
 
-                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, *i, NULL);
+                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, *i, /* source= */ NULL);
                 if (q < 0)
                         return q;
 
@@ -2758,11 +3792,13 @@ int unit_file_revert(
                         return q;
         }
 
-        q = remove_marked_symlinks(remove_symlinks_to, lp.runtime_config, &lp, false, changes, n_changes);
+        q = remove_marked_symlinks(remove_symlinks_to, /* vendor= */ NULL,
+                                   lp.runtime_config, &lp, /* dry_run= */ false, changes, n_changes);
         if (r >= 0)
                 r = q;
 
-        q = remove_marked_symlinks(remove_symlinks_to, lp.persistent_config, &lp, false, changes, n_changes);
+        q = remove_marked_symlinks(remove_symlinks_to, /* vendor= */ NULL,
+                                   lp.persistent_config, &lp, /* dry_run= */ false, changes, n_changes);
         if (r >= 0)
                 r = q;
 
@@ -2790,10 +3826,13 @@ int unit_file_add_dependency(
         assert(target);
         assert(IN_SET(dep, UNIT_WANTS, UNIT_REQUIRES));
 
-        if (!unit_name_is_valid(target, UNIT_NAME_ANY))
-                return install_changes_add(changes, n_changes, -EUCLEAN, target, NULL);
+        if (FLAGS_SET(file_flags, UNIT_FILE_VENDOR))
+                return -EOPNOTSUPP;
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (!unit_name_is_valid(target, UNIT_NAME_ANY))
+                return install_changes_add(changes, n_changes, -EUCLEAN, target, /* source= */ NULL);
+
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -2851,7 +3890,7 @@ static int do_unit_file_enable(
 
         _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
         InstallInfo *info;
-        int r;
+        int q, r;
 
         STRV_FOREACH(name, names_or_paths) {
                 r = install_info_discover_and_check(&ctx, lp, *name,
@@ -2868,8 +3907,16 @@ static int do_unit_file_enable(
            is useful to determine whether the passed units had any
            installation data at all. */
 
-        return install_context_apply(&ctx, lp, flags, config_path,
-                                     SEARCH_LOAD, changes, n_changes);
+        r = install_context_apply(&ctx, lp, flags, config_path,
+                                  SEARCH_LOAD, changes, n_changes);
+        if (r < 0)
+                return r;
+
+        q = install_context_unmask_dependencies(&ctx, lp, config_path, changes, n_changes);
+        if (q < 0)
+                return q;
+
+        return r;
 }
 
 int unit_file_enable(
@@ -2886,13 +3933,14 @@ int unit_file_enable(
         assert(scope >= 0);
         assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        const char *config_path = config_path_from_flags(&lp, flags);
-        if (!config_path)
-                return -ENXIO;
+        const char *config_path;
+        r = config_path_from_flags(&lp, flags, &config_path);
+        if (r < 0)
+                return r;
 
         return do_unit_file_enable(&lp, scope, flags, config_path, names_or_paths, changes, n_changes);
 }
@@ -2917,13 +3965,13 @@ static int do_unit_file_disable(
                 InstallInfo *info;
 
                 if (!unit_name_is_valid(*name, UNIT_NAME_ANY))
-                        return install_changes_add(changes, n_changes, -EUCLEAN, *name, NULL);
+                        return install_changes_add(changes, n_changes, -EUCLEAN, *name, /* source= */ NULL);
 
-                r = install_info_add(&ctx, *name, NULL, lp->root_dir, /* auxiliary= */ false, &info);
+                r = install_info_add(&ctx, *name, /* path= */ NULL, lp->root_dir, /* auxiliary= */ false, &info);
                 if (r >= 0)
-                        r = install_info_traverse(&ctx, lp, info, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, NULL);
+                        r = install_info_traverse(&ctx, lp, info, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, /* ret= */ NULL);
                 if (r < 0) {
-                        r = install_changes_add(changes, n_changes, r, *name, NULL);
+                        r = install_changes_add(changes, n_changes, r, *name, /* source= */ NULL);
                         /* In case there's no unit, we still want to remove any leftover symlink, even if
                          * the unit might have been removed already, hence treating ENOENT as non-fatal. */
                         if (r != -ENOENT)
@@ -2937,9 +3985,16 @@ static int do_unit_file_disable(
         }
 
         _cleanup_set_free_ Set *remove_symlinks_to = NULL;
-        r = install_context_mark_for_removal(&ctx, lp, &remove_symlinks_to, config_path, changes, n_changes);
+        _cleanup_(vendor_symlinks_done) VendorSymlinks vendor = { .loaded.scope = scope };
+
+        r = install_context_mark_for_removal(&ctx, lp, flags, &remove_symlinks_to, &vendor,
+                                             config_path, changes, n_changes);
         if (r >= 0)
-                r = remove_marked_symlinks(remove_symlinks_to, config_path, lp, flags & UNIT_FILE_DRY_RUN, changes, n_changes);
+                r = remove_marked_symlinks(remove_symlinks_to, &vendor, config_path, lp,
+                                           flags & UNIT_FILE_DRY_RUN, changes, n_changes);
+        if (r >= 0)
+                r = install_context_mask_dependencies(&ctx, lp, config_path, flags & UNIT_FILE_DRY_RUN,
+                                                      changes, n_changes);
         if (r < 0)
                 return r;
 
@@ -2961,13 +4016,14 @@ int unit_file_disable(
         assert(scope >= 0);
         assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        const char *config_path = config_path_from_flags(&lp, flags);
-        if (!config_path)
-                return -ENXIO;
+        const char *config_path;
+        r = config_path_from_flags(&lp, flags, &config_path);
+        if (r < 0)
+                return r;
 
         return do_unit_file_disable(&lp, scope, flags, config_path, files, changes, n_changes);
 }
@@ -3003,7 +4059,7 @@ static int normalize_linked_files(
                                                "Unexpected path to a directory \"%s\", refusing.", *a);
 
                 if (!is_path(*a) && !unit_name_is_valid(*a, UNIT_NAME_INSTANCE)) {
-                        r = install_info_discover(&ctx, lp, n, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, &i, NULL, NULL);
+                        r = install_info_discover(&ctx, lp, n, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, &i, /* changes= */ NULL, /* n_changes= */ NULL);
                         if (r < 0)
                                 log_debug_errno(r, "Failed to discover unit \"%s\", operating on name: %m", n);
                 }
@@ -3049,13 +4105,14 @@ int unit_file_reenable(
         assert(scope >= 0);
         assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        const char *config_path = config_path_from_flags(&lp, flags);
-        if (!config_path)
-                return -ENXIO;
+        const char *config_path;
+        r = config_path_from_flags(&lp, flags, &config_path);
+        if (r < 0)
+                return r;
 
         r = normalize_linked_files(scope, &lp, names_or_paths, &names, &files);
         if (r < 0)
@@ -3088,16 +4145,19 @@ int unit_file_set_default(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(name);
 
+        if (FLAGS_SET(flags, UNIT_FILE_VENDOR))
+                return -EOPNOTSUPP;
+
         if (unit_name_to_type(name) != UNIT_TARGET) /* this also validates the name */
                 return -EINVAL;
         if (streq(name, SPECIAL_DEFAULT_TARGET))
                 return -EINVAL;
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        r = install_info_discover_and_check(&ctx, &lp, name, 0, &info, changes, n_changes);
+        r = install_info_discover_and_check(&ctx, &lp, name, /* flags= */ 0, &info, changes, n_changes);
         if (r < 0)
                 return r;
 
@@ -3119,12 +4179,12 @@ int unit_file_get_default(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(ret);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
         r = install_info_discover(&ctx, &lp, SPECIAL_DEFAULT_TARGET, SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                  &info, NULL, NULL);
+                                  &info, /* changes= */ NULL, /* n_changes= */ NULL);
         if (r < 0)
                 return r;
 
@@ -3149,7 +4209,7 @@ int unit_file_lookup_state(
                 return -EINVAL;
 
         r = install_info_discover(&ctx, lp, name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                  &info, NULL, NULL);
+                                  &info, /* changes= */ NULL, /* n_changes= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to discover unit %s: %m", name);
 
@@ -3164,7 +4224,7 @@ int unit_file_lookup_state(
         switch (info->install_mode) {
 
         case INSTALL_MODE_MASKED:
-                r = path_is_runtime(lp, info->path, true);
+                r = path_is_runtime(lp, info->path, /* check_parent= */ true);
                 if (r < 0)
                         return r;
 
@@ -3197,7 +4257,7 @@ int unit_file_lookup_state(
                 /* Check if any of the Alias= symlinks have been created.
                  * We ignore other aliases, and only check those that would
                  * be created by systemctl enable for this unit. */
-                r = find_symlinks_in_scope(scope, lp, info, true, &state);
+                r = find_symlinks_in_scope(scope, lp, info, /* match_name= */ true, &state);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -3205,7 +4265,7 @@ int unit_file_lookup_state(
 
                 /* Check if the file is known under other names. If it is,
                  * it might be in use. Report that as UNIT_FILE_INDIRECT. */
-                r = find_symlinks_in_scope(scope, lp, info, false, &state);
+                r = find_symlinks_in_scope(scope, lp, info, /* match_name= */ false, &state);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -3242,7 +4302,7 @@ int unit_file_get_state(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(name);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -3304,7 +4364,7 @@ static int split_pattern_into_name_and_instances(const char *pattern, char **out
         assert(out_instances);
         assert(out_unit_name);
 
-        r = extract_first_word(&pattern, &unit_name, NULL, EXTRACT_RETAIN_ESCAPE);
+        r = extract_first_word(&pattern, &unit_name, /* separators= */ NULL, EXTRACT_RETAIN_ESCAPE);
         if (r < 0)
                 return r;
 
@@ -3351,7 +4411,7 @@ static int presets_find_config(RuntimeScope scope, const char *root_dir, char **
                         STRV_FOREACH(d, initrd_dirs) {
                                 r = chase_and_access(*d, root_dir, CHASE_PREFIX_ROOT, F_OK, /* ret_path= */ NULL);
                                 if (r >= 0)
-                                        return conf_files_list_strv(ret, ".preset", root_dir, 0, initrd_dirs);
+                                        return conf_files_list_strv(ret, ".preset", root_dir, /* flags= */ 0, initrd_dirs);
                                 if (r != -ENOENT)
                                         return r;
                         }
@@ -3362,7 +4422,7 @@ static int presets_find_config(RuntimeScope scope, const char *root_dir, char **
         else
                 assert_not_reached();
 
-        return conf_files_list_strv(ret, ".preset", root_dir, 0, dirs);
+        return conf_files_list_strv(ret, ".preset", root_dir, /* flags= */ 0, dirs);
 }
 
 static int read_presets(RuntimeScope scope, const char *root_dir, UnitFilePresets *presets) {
@@ -3577,7 +4637,7 @@ PresetAction unit_file_query_preset(RuntimeScope scope, const char *root_dir, co
                         return r;
         }
 
-        return query_presets(name, cached, NULL);
+        return query_presets(name, cached, /* instance_name_list= */ NULL);
 }
 
 static int execute_preset(
@@ -3600,12 +4660,21 @@ static int execute_preset(
 
         if (mode != UNIT_FILE_PRESET_ENABLE_ONLY) {
                 _cleanup_set_free_ Set *remove_symlinks_to = NULL;
+                _cleanup_(vendor_symlinks_done) VendorSymlinks vendor = { .loaded.scope = minus->scope };
 
-                r = install_context_mark_for_removal(minus, lp, &remove_symlinks_to, config_path, changes, n_changes);
+                r = install_context_mark_for_removal(minus, lp, file_flags | UNIT_FILE_APPLYING_PRESET,
+                                                     &remove_symlinks_to, &vendor,
+                                                     config_path, changes, n_changes);
                 if (r < 0)
                         return r;
 
-                r = remove_marked_symlinks(remove_symlinks_to, config_path, lp, false, changes, n_changes);
+                /* Unlike unit_file_disable(), a preset policy of "disable" doesn't mask the symlinks the
+                 * vendor installed below /usr/. Preset files have never needed to name the units the
+                 * vendor enabled. A mask would stop all of those units from starting at boot on existing
+                 * systems with a "disable *" rule. "systemctl disable" still masks them, and presetting
+                 * the vendor directories with UNIT_FILE_VENDOR removes them. */
+                r = remove_marked_symlinks(remove_symlinks_to, &vendor, config_path, lp,
+                                           /* dry_run= */ false, changes, n_changes);
         } else
                 r = 0;
 
@@ -3614,7 +4683,7 @@ static int execute_preset(
 
                 /* Returns number of symlinks that where supposed to be installed. */
                 q = install_context_apply(plus, lp,
-                                          file_flags | UNIT_FILE_IGNORE_AUXILIARY_FAILURE,
+                                          file_flags | UNIT_FILE_IGNORE_AUXILIARY_FAILURE | UNIT_FILE_APPLYING_PRESET,
                                           config_path,
                                           SEARCH_LOAD, changes, n_changes);
                 if (r >= 0) {
@@ -3623,6 +4692,8 @@ static int execute_preset(
                         else
                                 r += q;
                 }
+
+                RET_GATHER(r, install_context_unmask_dependencies(plus, lp, config_path, changes, n_changes));
         }
 
         return r;
@@ -3691,7 +4762,9 @@ int unit_file_preset(
                 InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(install_context_done) InstallContext plus = { .scope = scope }, minus = { .scope = scope };
+        _cleanup_(install_context_done) InstallContext
+                plus = { .scope = scope },
+                minus = { .scope = scope };
         _cleanup_(lookup_paths_done) LookupPaths lp = {};
         _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path;
@@ -3701,13 +4774,13 @@ int unit_file_preset(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (file_flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
-        if (!config_path)
-                return -ENXIO;
+        r = config_path_from_flags(&lp, file_flags, &config_path);
+        if (r < 0)
+                return r;
 
         r = read_presets(scope, root_dir, &presets);
         if (r < 0)
@@ -3730,7 +4803,9 @@ int unit_file_preset_all(
                 InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(install_context_done) InstallContext plus = { .scope = scope }, minus = { .scope = scope };
+        _cleanup_(install_context_done) InstallContext
+                plus = { .scope = scope },
+                minus = { .scope = scope };
         _cleanup_(lookup_paths_done) LookupPaths lp = {};
         _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path = NULL;
@@ -3740,13 +4815,13 @@ int unit_file_preset_all(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (file_flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
-        if (!config_path)
-                return -ENXIO;
+        r = config_path_from_flags(&lp, file_flags, &config_path);
+        if (r < 0)
+                return r;
 
         r = read_presets(scope, root_dir, &presets);
         if (r < 0)
@@ -3778,7 +4853,7 @@ int unit_file_preset_all(
                 }
         }
 
-        return execute_preset(file_flags, &plus, &minus, &lp, config_path, NULL, mode, changes, n_changes);
+        return execute_preset(file_flags, &plus, &minus, &lp, config_path, /* files= */ NULL, mode, changes, n_changes);
 }
 
 static UnitFileList* unit_file_list_free(UnitFileList *f) {
@@ -3810,7 +4885,7 @@ int unit_file_get_list(
         assert(scope < _RUNTIME_SCOPE_MAX);
         assert(ret);
 
-        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, /* flags= */ 0, root_dir);
         if (r < 0)
                 return r;
 
@@ -3902,6 +4977,8 @@ DEFINE_STRING_TABLE_LOOKUP(unit_file_state, UnitFileState);
 static const char* const install_change_type_table[_INSTALL_CHANGE_TYPE_MAX] = {
         [INSTALL_CHANGE_SYMLINK]                 = "symlink",
         [INSTALL_CHANGE_UNLINK]                  = "unlink",
+        [INSTALL_CHANGE_MASK_DEPENDENCY]         = "mask-dependency",
+        [INSTALL_CHANGE_UNMASK_DEPENDENCY]       = "unmask-dependency",
         [INSTALL_CHANGE_IS_MASKED]               = "masked",
         [INSTALL_CHANGE_IS_MASKED_GENERATOR]     = "masked by generator",
         [INSTALL_CHANGE_IS_DANGLING]             = "dangling",

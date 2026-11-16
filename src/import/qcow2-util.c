@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "compress.h"
 #include "copy.h"
+#include "io-util.h"
 #include "qcow2-util.h"
 #include "sparse-endian.h"
 
@@ -80,11 +81,9 @@ static int copy_cluster(
         if ((uint64_t) l != cluster_size)
                 return -EIO;
 
-        l = pwrite(dfd, buffer, cluster_size, doffset);
-        if (l < 0)
-                return -errno;
-        if ((uint64_t) l != cluster_size)
-                return -EIO;
+        r = pwrite_full(dfd, buffer, cluster_size, doffset);
+        if (r < 0)
+                return r;
 
         return 0;
 }
@@ -122,11 +121,9 @@ static int decompress_cluster(
         if (r < 0)
                 return r;
 
-        l = pwrite(dfd, buffer2, cluster_size, doffset);
-        if (l < 0)
-                return -errno;
-        if ((uint64_t) l != cluster_size)
-                return -EIO;
+        r = pwrite_full(dfd, buffer2, cluster_size, doffset);
+        if (r < 0)
+                return r;
 
         return 0;
 }
@@ -266,7 +263,7 @@ int qcow2_convert(int qcow2_fd, int raw_fd) {
         for (i = 0; i < HEADER_L1_SIZE(&header); i++) {
                 uint64_t l2_begin, j;
 
-                r = normalize_offset(&header, l1_table[i], &l2_begin, NULL, NULL);
+                r = normalize_offset(&header, l1_table[i], &l2_begin, /* compressed= */ NULL, /* compressed_size= */ NULL);
                 if (r < 0)
                         return r;
                 if (r == 0)

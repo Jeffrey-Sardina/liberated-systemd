@@ -43,8 +43,6 @@ TEST(assert_return_is_critical) {
         ASSERT_TRUE(log_get_assert_return_is_critical());
         ASSERT_RETURN_EXPECTED(ASSERT_ERROR(fail_with_EINVAL(), EINVAL));
         ASSERT_TRUE(log_get_assert_return_is_critical());
-        ASSERT_RETURN_EXPECTED_SE(fail_with_EINVAL() == -EINVAL);
-        ASSERT_TRUE(log_get_assert_return_is_critical());
 }
 
 TEST(file) {
@@ -104,9 +102,9 @@ static void test_log_format_iovec_sentinel(
 
         for (size_t i = 0; i < n; i++)
                 if (i < m)
-                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(v[i])));
+                        ASSERT_IOVEC_EQ(&iovec[i], &IOVEC_MAKE_STRING(v[i]));
                 else {
-                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(expected[i - m])));
+                        ASSERT_IOVEC_EQ(&iovec[i], &IOVEC_MAKE_STRING(expected[i - m]));
                         free(iovec[i].iov_base);
                 }
 
@@ -122,12 +120,12 @@ static void test_log_format_iovec_sentinel(
 
         for (size_t i = 0; i < n; i++)
                 if (i < m)
-                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(v[i])));
+                        ASSERT_IOVEC_EQ(&iovec[i], &IOVEC_MAKE_STRING(v[i]));
                 else if ((i - m) % 2 == 0) {
-                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING(expected[(i - m) / 2])));
+                        ASSERT_IOVEC_EQ(&iovec[i], &IOVEC_MAKE_STRING(expected[(i - m) / 2]));
                         free(iovec[i].iov_base);
                 } else
-                        ASSERT_TRUE(iovec_equal(&iovec[i], &IOVEC_MAKE_STRING("\n")));
+                        ASSERT_IOVEC_EQ(&iovec[i], &IOVEC_MAKE_STRING("\n"));
 }
 
 #define test_log_format_iovec_one(...)                 \

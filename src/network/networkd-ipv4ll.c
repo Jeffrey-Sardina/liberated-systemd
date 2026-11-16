@@ -119,7 +119,7 @@ static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
         if (r < 0)
                 return r;
 
-        return link_request_address(link, address, NULL, ipv4ll_address_handler, NULL);
+        return link_request_address(link, address, /* message_counter= */ NULL, ipv4ll_address_handler, /* ret= */ NULL);
 }
 
 static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
@@ -176,7 +176,7 @@ static int ipv4ll_check_mac(sd_ipv4ll *ll, const struct ether_addr *mac, void *u
                 .ether = *mac,
         };
 
-        return link_get_by_hw_addr(m, &hw_addr, NULL) >= 0;
+        return link_get_by_hw_addr(m, &hw_addr, /* ret= */ NULL) >= 0;
 }
 
 static int ipv4ll_set_address(Link *link) {
@@ -241,12 +241,12 @@ int ipv4ll_configure(Link *link) {
         if (r < 0)
                 return r;
 
-        r = sd_ipv4ll_attach_event(link->ipv4ll, link->manager->event, 0);
+        r = sd_ipv4ll_attach_event(link->ipv4ll, link->manager->event, /* priority= */ 0);
         if (r < 0)
                 return r;
 
         if (link->dev &&
-            net_get_unique_predictable_data(link->dev, true, &seed) >= 0) {
+            net_get_unique_predictable_data(link->dev, /* use_sysname= */ true, &seed) >= 0) {
                 r = sd_ipv4ll_set_address_seed(link->ipv4ll, seed);
                 if (r < 0)
                         return r;
@@ -369,13 +369,8 @@ int config_parse_ipv4ll(
          * applies only to IPv4 */
 
         r = parse_boolean(rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=%s, ignoring assignment. "
-                           "Note that the setting %s= is deprecated, please use LinkLocalAddressing= instead.",
-                           lvalue, rvalue, lvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         SET_FLAG(*link_local, ADDRESS_FAMILY_IPV4, r);
 
@@ -412,11 +407,8 @@ int config_parse_ipv4ll_address(
         }
 
         r = in_addr_from_string(AF_INET, rvalue, &a);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=, ignoring assignment: %s", lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         if (!in4_addr_is_link_local_dynamic(&a.in)) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Specified address cannot be used as an IPv4 link local address, ignoring assignment: %s",

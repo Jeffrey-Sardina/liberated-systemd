@@ -10,6 +10,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "glyph-util.h"
 #include "hashmap.h"
 #include "log.h"
@@ -77,9 +78,9 @@ static int prepare_dirs(
 
                 path_simplify(root_abs);
 
-                rfd = open(root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY|O_PATH);
                 if (rfd < 0)
-                        return log_full_errno(log_level, errno, "Failed to open '%s': %m", root_abs);
+                        return log_full_errno(log_level, rfd, "Failed to open '%s': %m", root_abs);
 
         } else if (ret_dirs) {
                 /* When an empty root or "/" is specified, we will open "/" below, hence we need to make
@@ -107,17 +108,17 @@ static int conf_file_prefix_root(ConfFile *c, const char *root, ConfFilesFlags f
 
         int log_level = conf_files_log_level(flags);
 
-        r = chaseat_prefix_root(c->result, root, &p);
+        r = chaseat_make_absolute(c->result, root, &p);
         if (r < 0)
                 return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->result, root);
         free_and_replace(c->result, p);
 
-        r = chaseat_prefix_root(c->resolved_path, root, &p);
+        r = chaseat_make_absolute(c->resolved_path, root, &p);
         if (r < 0)
                 return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->resolved_path, root);
         free_and_replace(c->resolved_path, p);
 
-        /* Do not use chaseat_prefix_root(), as it is for the result of chaseat(), but the path is not chased. */
+        /* An absolute c->original_path refers to root, so it still needs the root prefix. */
         p = path_join(empty_to_root(root), skip_leading_slash(c->original_path));
         if (!p)
                 return log_oom_full(log_level);
@@ -130,8 +131,16 @@ static bool conf_files_need_stat(ConfFilesFlags flags) {
         return (flags & (CONF_FILES_FILTER_MASKED | CONF_FILES_REGULAR | CONF_FILES_DIRECTORY | CONF_FILES_EXECUTABLE)) != 0;
 }
 
+static ChaseFlags conf_files_extra_chase_flags(ConfFilesFlags flags) {
+        /* Executables never fit under the 0664 file ceiling */
+        assert(!FLAGS_SET(flags, CONF_FILES_EXECUTABLE|CONF_FILES_CHASE_MAX_MODE));
+
+        return (FLAGS_SET(flags, CONF_FILES_CHASE_SAFE) ? CHASE_SAFE : 0) |
+                (FLAGS_SET(flags, CONF_FILES_CHASE_MAX_MODE) ? CHASE_MAX_MODE : 0);
+}
+
 static ChaseFlags conf_files_chase_flags(ConfFilesFlags flags) {
-        ChaseFlags chase_flags = 0;
+        ChaseFlags chase_flags = conf_files_extra_chase_flags(flags);
 
         if (!conf_files_need_stat(flags) || FLAGS_SET(flags, CONF_FILES_FILTER_MASKED_BY_SYMLINK))
                 /* Even if no verification is requested, let's unconditionally call chaseat(),
@@ -485,9 +494,6 @@ static int dump_files(Hashmap *fh, const char *root, ConfFilesFlags flags, ConfF
 
         CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
-        assert(ret_files);
-        assert(ret_n_files);
-
         /* The entries in the array given by hashmap_dump_sorted() are still owned by the hashmap. */
         r = hashmap_dump_sorted(fh, (void***) &files, &n_files);
         if (r < 0)
@@ -504,8 +510,10 @@ static int dump_files(Hashmap *fh, const char *root, ConfFilesFlags flags, ConfF
                                 return r;
                 }
 
-        *ret_files = TAKE_PTR(files);
-        *ret_n_files = n_files;
+        if (ret_files)
+                *ret_files = TAKE_PTR(files);
+        if (ret_n_files)
+                *ret_n_files = n_files;
         return 0;
 }
 
@@ -540,7 +548,7 @@ static int copy_and_sort_files_from_hashmap(
                 else if (root && !FLAGS_SET(flags, CONF_FILES_DONT_PREFIX_ROOT)) {
                         _cleanup_free_ char *p = NULL;
 
-                        r = chaseat_prefix_root(c->result, root, &p);
+                        r = chaseat_make_absolute(c->result, root, &p);
                         if (r < 0)
                                 return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->result, root);
 
@@ -631,7 +639,10 @@ static int conf_files_list_impl(
         root = empty_to_root(root);
 
         if (replacement) {
-                r = conf_file_new_at(replacement, root, rfd, flags & CONF_FILES_WARN, &c);
+                r = conf_file_new_at(
+                                replacement, root, rfd,
+                                flags & (CONF_FILES_WARN|CONF_FILES_CHASE_SAFE|CONF_FILES_CHASE_MAX_MODE),
+                                &c);
                 if (r < 0)
                         return r;
         }
@@ -640,7 +651,7 @@ static int conf_files_list_impl(
                 _cleanup_closedir_ DIR *dir = NULL;
                 _cleanup_free_ char *path = NULL;
 
-                r = chase_and_opendirat(rfd, rfd, *p, 0, &path, &dir);
+                r = chase_and_opendirat(rfd, rfd, *p, conf_files_extra_chase_flags(flags), &path, &dir);
                 if (r < 0) {
                         if (r != -ENOENT)
                                 log_full_errno(conf_files_log_level(flags), r,
@@ -712,9 +723,6 @@ int conf_files_list_strv_full(
         _cleanup_free_ char *root_abs = NULL;
         _cleanup_strv_free_ char **dirs_abs = NULL;
         int r;
-
-        assert(ret_files);
-        assert(ret_n_files);
 
         r = prepare_dirs(root, flags, (char**) dirs, &root_abs, &rfd, &dirs_abs);
         if (r < 0)
@@ -872,7 +880,7 @@ int conf_files_list_with_replacement(
                 return r;
 
         if (c) {
-                r = chaseat_prefix_root(c->result, root_abs, &inserted);
+                r = chaseat_make_absolute(c->result, root_abs, &inserted);
                 if (r < 0)
                         return log_full_errno(conf_files_log_level(flags), r,
                                               "Failed to prefix '%s' with root '%s': %m",

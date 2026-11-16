@@ -11,13 +11,17 @@
 #include "extension-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
+#include "host-properties.h"
 #include "log.h"
 #include "macro.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "stat-util.h"
 #include "string-util.h"
+#include "string-table.h"
 #include "strv.h"
+#include "xattr-match.h"
 
 int extension_release_validate(
                 const char *name,
@@ -25,11 +29,14 @@ int extension_release_validate(
                 const char *host_os_release_id_like,
                 const char *host_os_release_version_id,
                 const char *host_os_extension_release_level,
+                const char *host_os_release_image_id,
+                const char *host_os_release_image_version,
                 const char *host_extension_scope,
                 char **extension_release,
                 ImageClass image_class) {
 
-        const char *extension_release_id = NULL, *extension_release_level = NULL, *extension_architecture = NULL;
+        const char *extension_release_id = NULL, *extension_release_level = NULL, *extension_architecture = NULL,
+                   *extension_release_image_id = NULL, *extension_release_image_version = NULL;
         const char *extension_level = image_class == IMAGE_CONFEXT ? "CONFEXT_LEVEL" : "SYSEXT_LEVEL";
         const char *extension_scope = image_class == IMAGE_CONFEXT ? "CONFEXT_SCOPE" : "SYSEXT_SCOPE";
         _cleanup_strv_free_ char **id_like_l = NULL;
@@ -80,6 +87,38 @@ int extension_release_validate(
                 log_debug("Extension '%s' does not contain ID in release file but requested to match '%s' or be '_any'",
                         name, host_os_release_id);
                 return 0;
+        }
+
+        /* If the extension has an IMAGE_ID declared, then it must match the host IMAGE_ID */
+        extension_release_image_id = strv_env_pairs_get(extension_release, "IMAGE_ID");
+        if (!isempty(extension_release_image_id)) {
+                if (isempty(host_os_release_image_id)) {
+                        log_debug("Extension '%s' requires IMAGE_ID '%s', but host has no IMAGE_ID set.",
+                                  name, extension_release_image_id);
+                        return 0;
+                }
+
+                if (!streq(host_os_release_image_id, extension_release_image_id)) {
+                        log_debug("Extension '%s' is for image '%s', but deployed on top of image '%s'.",
+                                  name, extension_release_image_id, host_os_release_image_id);
+                        return 0;
+                }
+        }
+
+        /* If the extension has an IMAGE_VERSION declared, then it must match the host IMAGE_VERSION */
+        extension_release_image_version = strv_env_pairs_get(extension_release, "IMAGE_VERSION");
+        if (!isempty(extension_release_image_version)) {
+                if (isempty(host_os_release_image_version)) {
+                        log_debug("Extension '%s' requires IMAGE_VERSION '%s', but host has no IMAGE_VERSION set.",
+                                  name, extension_release_image_version);
+                        return 0;
+                }
+
+                if (!streq(host_os_release_image_version, extension_release_image_version)) {
+                        log_debug("Extension '%s' is for image version '%s', but deployed on top of image version '%s'.",
+                                  name, extension_release_image_version, host_os_release_image_version);
+                        return 0;
+                }
         }
 
         /* A sysext(or confext) with no host OS dependency (static binaries or scripts) can match
@@ -177,7 +216,7 @@ int extension_has_forbidden_content(const char *root) {
         /* Insist that extension images do not overwrite the underlying OS release file (it's fine if
          * they place one in /etc/os-release, i.e. where things don't matter, as they aren't
          * merged.) */
-        r = chase("/usr/lib/os-release", root, CHASE_PREFIX_ROOT, NULL, NULL);
+        r = chase("/usr/lib/os-release", root, CHASE_PREFIX_ROOT, /* ret_path= */ NULL, /* ret_fd= */ NULL);
         if (r > 0) {
                 log_debug("Extension contains '/usr/lib/os-release', which is not allowed, refusing.");
                 return 1;
@@ -202,9 +241,9 @@ int extension_overlay_block(const char *p, ImageClass image_class, dev_t *ret) {
         if (!j)
                 return log_oom_debug();
 
-        _cleanup_close_ int fd = open(j, O_RDONLY|O_DIRECTORY);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, j, O_RDONLY|O_DIRECTORY);
         if (fd < 0)
-                return log_debug_errno(errno, "Failed to open '%s': %m", j);
+                return log_debug_errno(fd, "Failed to open '%s': %m", j);
 
         r = fd_is_fs_type(fd, OVERLAYFS_SUPER_MAGIC);
         if (r < 0)
@@ -229,4 +268,119 @@ int extension_overlay_block(const char *p, ImageClass image_class, dev_t *ret) {
 
         (void) block_get_originating(*ret, ret, /* recursive= */ false);
         return 1;
+}
+
+/* The extension-release fields that correspond to the "user.uapi.match_…" extended attributes, 1:1 */
+static const char* const extension_release_match_field_table[_XATTR_MATCH_MAX] = {
+        [XATTR_MATCH_HOSTNAME]      = "MATCH_HOSTNAME",
+        [XATTR_MATCH_MACHINE_ID]    = "MATCH_MACHINE_ID",
+        [XATTR_MATCH_MACHINE_TAGS]  = "MATCH_MACHINE_TAGS",
+        [XATTR_MATCH_IMAGE_ID]      = "MATCH_IMAGE_ID",
+        [XATTR_MATCH_IMAGE_VERSION] = "MATCH_IMAGE_VERSION",
+        [XATTR_MATCH_OS_ID]         = "MATCH_OS_ID",
+        [XATTR_MATCH_OS_VERSION]    = "MATCH_OS_VERSION",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(extension_release_match_field, XAttrMatch);
+
+static int extension_match_test(
+                const char *name,
+                const char *image_path,
+                XAttrMatchLists xattrs,
+                XAttrMatchLists fields,
+                HostProperties *host,
+                const char *root) {
+
+        int r;
+
+        assert(name);
+        assert(image_path);
+        assert(xattrs);
+        assert(fields);
+        assert(host);
+
+        r = xattr_match_filter_test_lists(
+                        &(const XAttrMatchFilter) {
+                                .mask = XATTR_MATCH_MASK_ALL,
+                                .host = host,
+                                .root = root,
+                        },
+                        xattrs,
+                        image_path);
+        if (r <= 0)
+                return r;
+
+        for (XAttrMatch m = 0; m < _XATTR_MATCH_MAX; m++) {
+                if (!fields[m])
+                        continue;
+
+                r = host_properties_load(host, root);
+                if (r < 0)
+                        return r;
+
+                const char *field = extension_release_match_field_to_string(m);
+
+                r = xattr_match_test_strv(m, fields[m], host);
+                if (r == -EINVAL) {
+                        log_debug("%s= in extension-release file of extension '%s' is invalid, ignoring extension.", field, name);
+                        return 0;
+                }
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to match %s= of extension '%s': %m", field, name);
+                if (r == 0) {
+                        log_debug("%s= of extension '%s' does not match this system, ignoring extension.", field, name);
+                        return 0;
+                }
+        }
+
+        return 1;
+}
+
+int extension_match_host(
+                const char *name,
+                const char *image_path,
+                char **extension_release,
+                HostProperties *host,
+                const char *root,
+                unsigned *ret_contradicting) {
+
+        unsigned contradicting = 0;
+        int r;
+
+        assert(name);
+        assert(image_path);
+        assert(host);
+
+        _cleanup_(xattr_match_lists_done) XAttrMatchLists xattrs = {}, fields = {};
+        r = xattr_match_lists_read(AT_FDCWD, image_path, XATTR_MATCH_MASK_ALL, &xattrs);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to read 'user.uapi.match_*' extended attributes of '%s': %m", image_path);
+
+        for (XAttrMatch m = 0; m < _XATTR_MATCH_MAX; m++) {
+                const char *field = extension_release_match_field_to_string(m);
+                const char *v = strv_env_pairs_get(extension_release, field);
+                if (isempty(v))
+                        continue;
+
+                fields[m] = strv_split(v, WHITESPACE);
+                if (!fields[m])
+                        return log_oom_debug();
+
+                /* It's fine if only one of the two carries a rule for a property, but if both do they
+                 * should agree. If they don't, we honour both anyway, i.e. effectively the stricter one. */
+                if (!xattrs[m])
+                        continue;
+
+                if (!strv_equal_ignore_order(xattrs[m], fields[m]))
+                        contradicting |= XATTR_MATCH_MASK(m);
+        }
+
+        r = extension_match_test(name, image_path, xattrs, fields, host, root);
+        if (r < 0)
+                return r;
+
+        if (ret_contradicting)
+                *ret_contradicting = contradicting;
+
+        return r;
 }

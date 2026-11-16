@@ -7,6 +7,7 @@
 #include "alloc-util.h"
 #include "crypto-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "fsprg-openssl.h"
 #include "hexdecoct.h"
 #include "iovec-util.h"
@@ -83,12 +84,12 @@ static int journal_auth_load(JournalAuthContext **ret) {
                      SD_ID128_FORMAT_VAL(machine)) < 0)
                 return -ENOMEM;
 
-        _cleanup_close_ int fd = open(path, O_RDWR|O_CLOEXEC|O_NOCTTY, 0600);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, path, O_RDWR|O_NOCTTY);
         if (fd < 0) {
-                if (errno != ENOENT)
-                        log_error_errno(errno, "Failed to open %s: %m", path);
+                if (fd != -ENOENT)
+                        log_error_errno(fd, "Failed to open %s: %m", path);
 
-                return -errno;
+                return fd;
         }
 
         struct stat st;
@@ -294,7 +295,7 @@ static int journal_auth_setup(JournalAuthContext *c) {
         if (r < 0)
                 return r;
 
-        _cleanup_(EVP_MAC_freep) EVP_MAC *hmac = sym_EVP_MAC_fetch(NULL, "HMAC", NULL);
+        _cleanup_(EVP_MAC_freep) EVP_MAC *hmac = sym_EVP_MAC_fetch(/* libctx= */ NULL, "HMAC", /* properties= */ NULL);
         if (!hmac)
                 return log_openssl_errors(LOG_DEBUG, "EVP_MAC_fetch() failed");
 
@@ -306,7 +307,7 @@ static int journal_auth_setup(JournalAuthContext *c) {
         if (!bld)
                 return log_openssl_errors(LOG_DEBUG, "OSSL_PARAM_BLD_new() failed");
 
-        if (sym_OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_MAC_PARAM_DIGEST, "SHA256", 0) <= 0)
+        if (sym_OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_MAC_PARAM_DIGEST, "SHA256", /* bsize= */ 0) <= 0)
                 return log_openssl_errors(LOG_DEBUG, "OSSL_PARAM_BLD_push_utf8_string() failed");
 
         _cleanup_(OSSL_PARAM_freep) OSSL_PARAM *params = sym_OSSL_PARAM_BLD_to_param(bld);
@@ -468,25 +469,29 @@ static int journal_auth_append_tag(JournalAuthContext *c, JournalFile *f) {
         if (r < 0)
                 return r;
 
+        /* Opening a file only checks that n_tags is not larger than n_objects. A corrupted file can still
+         * have n_tags set to UINT64_MAX, and the sequence number of the next tag would wrap around to 0. */
+        uint64_t n_tags = le64toh(f->header->n_tags);
+        if (n_tags == UINT64_MAX)
+                return -EBADMSG;
+
         Object *o;
-        uint64_t p;
+        uint64_t p, epoch, seqnum = n_tags + 1;
+
         r = journal_file_append_object(f, OBJECT_TAG, sizeof(struct TagObject), &o, &p);
         if (r < 0)
                 return r;
 
-        uint64_t seqnum = le64toh(f->header->n_tags) + 1;
         f->header->n_tags = htole64(seqnum);
 
-        o->tag.seqnum = htole64(seqnum);
-
-        uint64_t epoch;
         r = fsprg_get_epoch(&c->fsprg_state, &epoch);
         if (r < 0)
                 return r;
+
+        o->tag.seqnum = htole64(seqnum);
         o->tag.epoch = htole64(epoch);
 
-        log_debug("Writing tag %"PRIu64" for epoch %"PRIu64"",
-                  le64toh(o->tag.seqnum), epoch);
+        log_debug("Writing tag %"PRIu64" for epoch %"PRIu64"", seqnum, epoch);
 
         /* Add the tag object itself, so that we can protect its
          * header. This will exclude the actual hash value in it */

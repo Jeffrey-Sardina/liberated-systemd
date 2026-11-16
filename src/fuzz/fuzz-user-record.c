@@ -4,6 +4,7 @@
 
 #include "alloc-util.h"
 #include "fuzz.h"
+#include "tests.h"
 #include "user-record.h"
 
 #include "sd-json.h"
@@ -15,15 +16,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         unsigned line = 0;
         int r;
 
-        if (outside_size_range(size, 0, 65536))
+        if (outside_size_range(size, /* lower= */ 0, 65536))
                 return 0;
 
-        assert_se(str = memdup_suffix0(data, size));
-        assert_se(ur = user_record_new());
+        str = ASSERT_NOT_NULL(memdup_suffix0(data, size));
+        ur = ASSERT_NOT_NULL(user_record_new());
 
         fuzz_setup_logging();
 
-        r = sd_json_parse(str, 0, &v, &line, /* reterr_column= */ NULL);
+        r = sd_json_parse(str, /* flags= */ 0, &v, &line, /* reterr_column= */ NULL);
         if (r < 0) {
                 (void) log_syntax(/* unit= */ NULL, LOG_DEBUG, "<stdin>", line, r, "JSON parse failure.");
                 return 0;

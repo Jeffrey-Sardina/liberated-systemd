@@ -11,6 +11,7 @@
 #include "device-util.h"
 #include "fd-util.h"
 #include "fdset.h"
+#include "fs-util.h"
 #include "glyph-util.h"
 #include "hash-funcs.h"
 #include "lock-util.h"
@@ -149,9 +150,9 @@ static int lock_device(
         int r;
 
         /* We open in O_WRONLY mode here, to trigger a rescan in udev once we are done */
-        fd = open(path, O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, path, O_WRONLY|O_NONBLOCK|O_NOCTTY);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open '%s': %m", path);
+                return log_error_errno(fd, "Failed to open '%s': %m", path);
 
         if (fstat(fd, &st) < 0)
                 return log_error_errno(errno, "Failed to stat '%s': %m", path);
@@ -160,32 +161,13 @@ static int lock_device(
         if (!S_ISBLK(st.st_mode) || st.st_rdev != devno)
                 return log_error_errno(SYNTHETIC_ERRNO(ENXIO), "Path '%s' no longer refers to specified block device %u:%u.", path, major(devno), minor(devno));
 
-        r = lock_generic(fd, LOCK_BSD, LOCK_EX|LOCK_NB);
-        if (r < 0) {
-                if (r != -EAGAIN)
-                        return log_error_errno(r, "Failed to lock device '%s': %m", path);
-
-                if (deadline == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Device '%s' is currently locked.", path);
-
-                if (deadline == USEC_INFINITY)  {
-                        log_info("Device '%s' is currently locked, waiting%s", path, glyph(GLYPH_ELLIPSIS));
-
-                        r = lock_generic(fd, LOCK_BSD, LOCK_EX);
-                } else {
-                        usec_t left = usec_sub_unsigned(deadline, now(CLOCK_MONOTONIC));
-
-                        log_info("Device '%s' is currently locked, waiting %s%s",
-                                 path, FORMAT_TIMESPAN(left, 0),
-                                 glyph(GLYPH_ELLIPSIS));
-
-                        r = lock_generic_with_timeout(fd, LOCK_BSD, LOCK_EX, left);
-                        if (r == -ETIMEDOUT)
-                                return log_error_errno(r, "Timeout reached.");
-                }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to lock device '%s': %m", path);
-        }
+        r = lock_generic_with_timeout(fd, LOCK_BSD, LOCK_EX, usec_sub_unsigned(deadline, now(CLOCK_MONOTONIC)));
+        if (r == -EAGAIN && deadline == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Device '%s' is currently locked.", path);
+        if (r == -ETIMEDOUT)
+                return log_error_errno(r, "Timeout reached.");
+        if (r < 0)
+                return log_error_errno(r, "Failed to lock device '%s': %m", path);
 
         log_debug("Successfully locked %s (%u:%u)%s", path, major(devno), minor(devno), glyph(GLYPH_ELLIPSIS));
 
@@ -264,11 +246,11 @@ int verb_lock_main(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r == 0) {
                 /* Child */
 
-                execvp(arg_cmdline[0], arg_cmdline);
+                r = execvp_safe(arg_cmdline[0], arg_cmdline);
                 log_open();
-                log_error_errno(errno, "Failed to execute %s: %m", arg_cmdline[0]);
+                log_error_errno(r, "Failed to execute %s: %m", arg_cmdline[0]);
                 _exit(EXIT_FAILURE);
         }
 
-        return pidref_wait_for_terminate_and_check(arg_cmdline[0], &pidref, 0);
+        return pidref_wait_for_terminate_and_check(arg_cmdline[0], &pidref, /* flags= */ 0);
 }

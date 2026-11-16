@@ -139,7 +139,7 @@ int network_verify(Network *network) {
                                          network->filename);
 
         /* skip out early if configuration does not match the environment */
-        if (!condition_test_list_net(network->conditions, environ, NULL, NULL, NULL))
+        if (!condition_test_list_net(network->conditions, environ, /* to_string= */ NULL, /* logger= */ NULL, /* userdata= */ NULL))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s: Conditions in the file do not match the system environment, skipping.",
                                        network->filename);
@@ -398,6 +398,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .dhcp_use_routes = true,
                 .dhcp_use_gateway = -1,
                 .dhcp_send_hostname = true,
+                .dhcp_send_hostname_updates = true,
                 .dhcp_send_release = true,
                 .dhcp_extra_options = TLV_INIT(TLV_DHCP4),
                 .dhcp_vendor_options = TLV_INIT(TLV_DHCP4_SUBOPTION),
@@ -422,6 +423,7 @@ int network_load_one(Manager *manager, OrderedHashmap **networks, const char *fi
                 .dhcp6_use_captive_portal = true,
                 .dhcp6_use_rapid_commit = true,
                 .dhcp6_send_hostname = true,
+                .dhcp6_send_hostname_updates = true,
                 .dhcp6_duid.type = _DUID_TYPE_INVALID,
                 .dhcp6_client_start_mode = _DHCP6_CLIENT_START_MODE_INVALID,
                 .dhcp6_send_release = true,
@@ -1033,12 +1035,8 @@ int config_parse_required_for_online(
         r = parse_operational_state_range(rvalue, &network->required_operstate_for_online);
         if (r < 0) {
                 r = parse_boolean(rvalue);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse %s= setting, ignoring assignment: %s",
-                                   lvalue, rvalue);
-                        return 0;
-                }
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
                 network->required_for_online = r;
                 network->required_operstate_for_online = LINK_OPERSTATE_RANGE_DEFAULT;
@@ -1075,14 +1073,11 @@ int config_parse_link_group(
         }
 
         r = safe_atoi32(rvalue, &group);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse Group=, ignoring assignment: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         if (group < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Value of Group= must be in the range 0…2147483647, ignoring assignment: %s", rvalue);
                 return 0;
         }
@@ -1124,11 +1119,8 @@ int config_parse_ignore_carrier_loss(
         }
 
         r = parse_sec(rvalue, &usec);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=, ignoring assignment: %s", lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         network->ignore_carrier_loss_set = true;
         network->ignore_carrier_loss_usec = usec;

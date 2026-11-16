@@ -7,6 +7,7 @@
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "io-util.h"
 #include "memfd-util.h"
 #include "process-util.h"
 #include "string-util.h"
@@ -18,7 +19,11 @@ int memfd_create_wrapper(const char *name, unsigned mode) {
         assert(name);
 
         /* Wrapper around memfd_create() which adds compat with older kernels where memfd_create() didn't
-         * support MFD_EXEC/MFD_NOEXEC_SEAL. (kernel 6.3+) */
+         * support MFD_EXEC/MFD_NOEXEC_SEAL. (kernel 6.3+)
+         *
+         * MFD_CLOEXEC is always set. */
+
+        mode |= MFD_CLOEXEC;
 
         mfd = RET_NERRNO(memfd_create(name, mode));
         if (mfd != -EINVAL)
@@ -60,7 +65,7 @@ int memfd_new_full(const char *name, unsigned extra_flags) {
 
         return memfd_create_wrapper(
                         name,
-                        MFD_CLOEXEC | MFD_NOEXEC_SEAL | extra_flags);
+                        MFD_NOEXEC_SEAL | extra_flags);
 }
 
 static int memfd_add_seals(int fd, unsigned seals) {
@@ -95,8 +100,25 @@ int memfd_get_sealed(int fd) {
         if (r < 0)
                 return r;
 
-        /* We ignore F_SEAL_EXEC here to support older kernels. */
+        /* We ignore F_SEAL_EXEC here to support older kernels.
+         * It is supported since kernel v6.3 (6fd7353829cafc4067aad9eea0dc95da67e7df16). */
         return FLAGS_SET(seals, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+}
+
+int memfd_set_sealed_gracefully(int fd) {
+        int r;
+
+        r = memfd_set_sealed(fd);
+        if (r != -EPERM)
+                return r;
+
+        /* Already sealed? Check if required seals are set. */
+        r = memfd_get_sealed(fd);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EPERM; /* Propagate the original error. */
+        return 0;
 }
 
 int memfd_get_size(int fd, uint64_t *ret) {
@@ -132,11 +154,9 @@ int memfd_new_and_seal(const char *name, const void *data, size_t sz) {
                 return fd;
 
         if (sz > 0) {
-                ssize_t n = pwrite(fd, data, sz, 0);
-                if (n < 0)
-                        return -errno;
-                if ((size_t) n != sz)
-                        return -EIO;
+                r = pwrite_full(fd, data, sz, /* offset= */ 0);
+                if (r < 0)
+                        return r;
         }
 
         r = memfd_set_sealed(fd);

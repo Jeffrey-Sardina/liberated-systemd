@@ -130,21 +130,21 @@ static int varlink_error_for_enroll(sd_varlink *link, int error) {
         switch (error) {
 
         case -EHOSTDOWN:        /* check_for_homed() */
-                return sd_varlink_error(link, "io.systemd.CryptEnroll.VolumeUnderForeignManagement", NULL);
+                return sd_varlink_error(link, "io.systemd.CryptEnroll.VolumeUnderForeignManagement", /* parameters= */ NULL);
 
         case -ENOPKG:           /* credential querying disabled in headless mode but none provided */
-                return sd_varlink_error(link, "io.systemd.CryptEnroll.PasswordRequired", NULL);
+                return sd_varlink_error(link, "io.systemd.CryptEnroll.PasswordRequired", /* parameters= */ NULL);
 
         case -EPERM:
         case -ENOKEY:           /* provided password/key did not unlock the volume */
-                return sd_varlink_error(link, "io.systemd.CryptEnroll.PasswordIncorrect", NULL);
+                return sd_varlink_error(link, "io.systemd.CryptEnroll.PasswordIncorrect", /* parameters= */ NULL);
 
         case -ENODEV:
         case -ENOTUNIQ:         /* no (or no unique) FIDO2 device found */
-                return sd_varlink_error(link, "io.systemd.CryptEnroll.FidoDeviceNotFound", NULL);
+                return sd_varlink_error(link, "io.systemd.CryptEnroll.FidoDeviceNotFound", /* parameters= */ NULL);
 
         case -ENOSTR:           /* FIDO_ERR_ACTION_TIMEOUT */
-                return sd_varlink_error(link, "io.systemd.CryptEnroll.FidoActionTimeout", NULL);
+                return sd_varlink_error(link, "io.systemd.CryptEnroll.FidoActionTimeout", /* parameters= */ NULL);
 
         default:
                 return sd_varlink_error_errno(link, error);
@@ -158,7 +158,7 @@ static int vl_method_enroll(
                 void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "node",                      SD_JSON_VARIANT_STRING,        json_dispatch_path,        offsetof(MethodEnrollParameters, node),                          SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "node",                      SD_JSON_VARIANT_STRING,        json_dispatch_path,        offsetof(MethodEnrollParameters, node),                          SD_JSON_NULLABLE|SD_JSON_STRICT },
                 { "mechanism",                 SD_JSON_VARIANT_STRING,        json_dispatch_enroll_type, offsetof(MethodEnrollParameters, mechanism),                     SD_JSON_MANDATORY },
                 { "unlockPassword",            SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,   offsetof(MethodEnrollParameters, unlock_password),               SD_JSON_NULLABLE },
                 { "unlockKeyFile",             SD_JSON_VARIANT_STRING,        json_dispatch_path,        offsetof(MethodEnrollParameters, unlock_keyfile),                SD_JSON_NULLABLE|SD_JSON_STRICT },
@@ -215,7 +215,13 @@ static int vl_method_enroll(
         c.enroll_type = p.mechanism;
         c.unlock_type = _UNLOCK_TYPE_INVALID;
 
-        if (strdup_to(&c.node, p.node) < 0)
+        if (!p.node) {
+                r = determine_default_node(&c.node);
+                if (r == -ENXIO)
+                        return sd_varlink_error_invalid_parameter_name(link, "node");
+                if (r < 0)
+                        return r;
+        } else if (strdup_to(&c.node, p.node) < 0)
                 return -ENOMEM;
 
         if (p.unlock_password) {
@@ -413,7 +419,8 @@ static int vl_method_list_slots(
                 void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "node", SD_JSON_VARIANT_STRING, json_dispatch_const_path, 0, SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "node", SD_JSON_VARIANT_STRING, json_dispatch_const_path, 0, SD_JSON_NULLABLE|SD_JSON_STRICT },
+                VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
 
@@ -422,21 +429,36 @@ static int vl_method_list_slots(
         _cleanup_free_ EnrolledSlot *slots = NULL;
         const char *node = NULL;
         size_t n_slots;
+        Hashmap **polkit_registry = ASSERT_PTR(userdata);
         int r;
 
         assert(link);
 
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
 
         r = sd_varlink_dispatch(link, parameters, dispatch_table, &node);
         if (r != 0)
                 return r;
 
-        /* NB: No polkit authentication here for now, given this is read access only. */
+        r = varlink_verify_polkit_async(
+                        link,
+                        /* bus= */ NULL,
+                        "io.systemd.cryptenroll.list-slots",
+                        /* details= */ NULL,
+                        polkit_registry);
+        if (r <= 0)
+                return r;
 
         c.interactive = false;
-        if (strdup_to(&c.node, node) < 0)
+
+        if (!node) {
+                r = determine_default_node(&c.node);
+                if (r == -ENXIO)
+                        return sd_varlink_error_invalid_parameter_name(link, "node");
+                if (r < 0)
+                        return r;
+        } else if (strdup_to(&c.node, node) < 0)
                 return -ENOMEM;
 
         r = dlopen_cryptsetup(LOG_DEBUG);
@@ -465,7 +487,7 @@ static int vl_method_list_slots(
                         return r;
         }
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_make_recovery_key(
@@ -505,7 +527,7 @@ int cryptenroll_varlink_server(void) {
 
         r = varlink_server_new(
                         &varlink_server,
-                        SD_VARLINK_SERVER_ROOT_ONLY|SD_VARLINK_SERVER_MYSELF_ONLY|SD_VARLINK_SERVER_INPUT_SENSITIVE|SD_VARLINK_SERVER_INHERIT_USERDATA|SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_HANDLE_SIGINT|SD_VARLINK_SERVER_HANDLE_SIGTERM,
+                        SD_VARLINK_SERVER_INPUT_SENSITIVE|SD_VARLINK_SERVER_INHERIT_USERDATA|SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_HANDLE_SIGINT|SD_VARLINK_SERVER_HANDLE_SIGTERM,
                         &polkit_registry);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate Varlink server: %m");

@@ -5,7 +5,10 @@
 
 #include "sd-id128.h"
 
+#include "alloc-util.h"
 #include "errno-util.h"
+#include "iovec-util.h"
+#include "iovec-wrapper.h"
 #include "tests.h"
 
 TEST(ASSERT) {
@@ -96,9 +99,28 @@ TEST(ASSERT) {
         ASSERT_SIGNAL(ASSERT_NOT_STREQ("foo", "foo"), SIGABRT);
         ASSERT_SIGNAL(ASSERT_NOT_STREQ(NULL, NULL), SIGABRT);
 
+        ASSERT_STRV_EQ(NULL, NULL);
+        ASSERT_STRV_EQ(STRV_MAKE("foo", "bar"), STRV_MAKE("foo", "bar"));
+        ASSERT_SIGNAL(ASSERT_STRV_EQ(STRV_MAKE("foo"), NULL), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_STRV_EQ(STRV_MAKE("foo", "bar"), STRV_MAKE("foo", "baz")), SIGABRT);
+
+        ASSERT_STRV_EQ_SET(STRV_MAKE("foo", "bar"), "foo", "bar");
+        ASSERT_STRV_EQ_SET(STRV_MAKE(""), "");
+        ASSERT_SIGNAL(ASSERT_STRV_EQ_SET(NULL, "foo"), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_STRV_EQ_SET(STRV_MAKE("foo"), "foo", "bar"), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_STRV_EQ_SET(STRV_MAKE("foo", "bar"), "foo", "baz"), SIGABRT);
+
+        _cleanup_free_ char *q = ASSERT_NOT_NULL(strv_join_quoted(STRV_MAKE("a", "", "b c", "d\"e\\f\n")));
+        ASSERT_STREQ(q, "[\"a\", \"\", \"b c\", \"d\\\"e\\\\f\\n\"]");
+        q = mfree(q);
+        ASSERT_NOT_NULL(q = strv_join_quoted(NULL));
+        ASSERT_STREQ(q, "[]");
+
         ASSERT_EQ(0, 0);
         ASSERT_EQ(-1, -1);
         ASSERT_SIGNAL(ASSERT_EQ(255, -1), SIGABRT);
+        ASSERT_EQ((int8_t) -1, (int8_t) -1);
+        ASSERT_SIGNAL(ASSERT_EQ((int8_t) 1, (int8_t) -1), SIGABRT);
 
         ASSERT_GE(0, 0);
         ASSERT_GE(1, -1);
@@ -131,6 +153,44 @@ TEST(ASSERT) {
                                 SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e)),
                 SIGABRT);
         ASSERT_SIGNAL(ASSERT_NE_ID128(SD_ID128_NULL, SD_ID128_NULL), SIGABRT);
+
+        static const uint8_t m1[] = { 0, 1, 2, 3 }, m2[] = { 0, 1, 2, 3 }, m3[] = { 0, 1, 9, 3 };
+
+        ASSERT_MEMEQ(m1, m2, sizeof(m1));
+        ASSERT_MEMEQ(m1, m3, 2);
+        ASSERT_MEMEQ(NULL, NULL, 0);
+        ASSERT_SIGNAL(ASSERT_MEMEQ(m1, m3, sizeof(m1)), SIGABRT);
+
+        ASSERT_MEMEQ_NN(m1, sizeof(m1), m2, sizeof(m2));
+        ASSERT_MEMEQ_NN(NULL, 0, NULL, 0);
+        ASSERT_SIGNAL(ASSERT_MEMEQ_NN(m1, sizeof(m1), m2, sizeof(m2) - 1), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_MEMEQ_NN(m1, sizeof(m1), m3, sizeof(m3)), SIGABRT);
+
+        ASSERT_IOVEC_EQ(&IOVEC_MAKE(m1, sizeof(m1)), &IOVEC_MAKE(m2, sizeof(m2)));
+        ASSERT_SIGNAL(ASSERT_IOVEC_EQ(&IOVEC_MAKE(m1, sizeof(m1)), &IOVEC_MAKE(m3, sizeof(m3))), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_IOVEC_EQ(&IOVEC_MAKE(m1, sizeof(m1)), &IOVEC_MAKE(m1, sizeof(m1) - 1)), SIGABRT);
+
+        static const uint8_t allx[] = { 'x', 'x', 'x', 'x' }, mixed[] = { 'x', 'x', 'y', 'x' }, zeros[4] = {};
+
+        ASSERT_MEMEQ_BYTE('x', allx, sizeof(allx));
+        ASSERT_MEMEQ_BYTE('x', allx, 0);
+        ASSERT_SIGNAL(ASSERT_MEMEQ_BYTE('x', mixed, sizeof(mixed)), SIGABRT);
+
+        ASSERT_MEMEQ_ZERO(zeros, sizeof(zeros));
+        ASSERT_MEMEQ_ZERO(NULL, 0);
+        ASSERT_SIGNAL(ASSERT_MEMEQ_ZERO(allx, sizeof(allx)), SIGABRT);
+
+        struct iovec iova[] = { IOVEC_MAKE_STRING("foo"), IOVEC_MAKE_STRING("bar") };
+        struct iovec iovb[] = { IOVEC_MAKE_STRING("foo"), IOVEC_MAKE_STRING("baz") };
+        struct iovec_wrapper iovwa = { .iovec = iova, .count = ELEMENTSOF(iova) };
+        struct iovec_wrapper iovwb = { .iovec = iovb, .count = ELEMENTSOF(iovb) };
+        struct iovec_wrapper iovwa1 = { .iovec = iova, .count = 1 };
+
+        ASSERT_IOVW_EQ(&iovwa, &iovwa);
+        ASSERT_IOVW_EQ(NULL, NULL);
+        ASSERT_SIGNAL(ASSERT_IOVW_EQ(&iovwa, &iovwb), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_IOVW_EQ(&iovwa, &iovwa1), SIGABRT);
+        ASSERT_SIGNAL(ASSERT_IOVW_EQ(&iovwa, NULL), SIGABRT);
 }
 
 TEST(ASSERT_OK_OR) {

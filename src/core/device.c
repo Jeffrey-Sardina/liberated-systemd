@@ -80,11 +80,16 @@ static void device_unset_sysfs(Device *d) {
         d->sysfs = mfree(d->sysfs);
 }
 
-static int device_set_sysfs(Device *d, const char *sysfs) {
+static int device_set_sysfs(Device *d, sd_device *dev) {
         Unit *u = UNIT(ASSERT_PTR(d));
         int r;
 
-        assert(sysfs);
+        assert(dev);
+
+        const char *sysfs;
+        r = sd_device_get_syspath(dev, &sysfs);
+        if (r < 0)
+                return r;
 
         if (path_equal(d->sysfs, sysfs))
                 return 0; /* unchanged */
@@ -144,7 +149,7 @@ static void device_done(Unit *u) {
 static int device_load(Unit *u) {
         int r;
 
-        r = unit_load_fragment_and_dropin(u, false);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ false);
         if (r < 0)
                 return r;
 
@@ -176,7 +181,7 @@ static void device_set_state(Device *d, DeviceState state) {
                 (void) unit_acquire_invocation_id(UNIT(d));
 
         if (d->state != state)
-                bus_unit_send_pending_change_signal(UNIT(d), false);
+                bus_unit_send_pending_change_signal(UNIT(d), /* including_new= */ false);
 
         old_state = d->state;
         d->state = state;
@@ -373,7 +378,7 @@ static int device_found_from_string_many(const char *name, DeviceFound *ret) {
                 _cleanup_free_ char *word = NULL;
                 DeviceFound f = 0;
 
-                r = extract_first_word(&name, &word, ",", 0);
+                r = extract_first_word(&name, &word, ",", /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -442,21 +447,12 @@ static int device_deserialize_sysfs(Device *d, const char *value) {
                                 "Failed to validate deserialized sysfs path '%s': %m",
                                 value);
 
-        /* For safety, normalize the syspath. */
-        const char *syspath;
-        r = sd_device_get_syspath(dev, &syspath);
-        if (r < 0)
-                return log_unit_debug_errno(
-                                UNIT(d), r,
-                                "Failed to get syspath from sd_device generated from deserialized sysfs path '%s': %m",
-                                value);
-
-        r = device_set_sysfs(d, syspath);
+        r = device_set_sysfs(d, dev);
         if (r < 0)
                 return log_unit_debug_errno(
                                 UNIT(d), r,
                                 "Failed to set deserialized sysfs path '%s': %m",
-                                syspath);
+                                value);
 
         return 0;
 }
@@ -590,7 +586,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
         for (;;) {
                 _cleanup_free_ char *word = NULL, *k = NULL;
 
-                r = extract_first_word(&wants, &word, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&wants, &word, /* separators= */ NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE);
                 if (r == 0)
                         break;
                 if (r == -ENOMEM)
@@ -619,7 +615,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
                                 return log_unit_error_errno(u, r, "Failed to mangle unit name \"%s\": %m", word);
                 }
 
-                r = unit_add_dependency_by_name(u, UNIT_WANTS, k, true, UNIT_DEPENDENCY_UDEV);
+                r = unit_add_dependency_by_name(u, UNIT_WANTS, k, /* add_reference= */ true, UNIT_DEPENDENCY_UDEV);
                 if (r < 0)
                         return log_unit_error_errno(u, r, "Failed to add Wants= dependency: %m");
 
@@ -650,7 +646,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
                                         continue; /* The unit was already listed and is running. */
                         }
 
-                        r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, NULL, &error, NULL);
+                        r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, /* affected_jobs= */ NULL, &error, /* ret= */ NULL);
                         if (r < 0)
                                 log_unit_full_errno(u, sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ? LOG_DEBUG : LOG_WARNING, r,
                                                     "Failed to enqueue %s job, ignoring: %s", property, bus_error_message(&error, r));
@@ -687,7 +683,7 @@ static void device_upgrade_mount_deps(Unit *u) {
                 if (other->type != UNIT_MOUNT)
                         continue;
 
-                r = unit_add_dependency(other, UNIT_BINDS_TO, u, true, UNIT_DEPENDENCY_UDEV);
+                r = unit_add_dependency(other, UNIT_BINDS_TO, u, /* add_reference= */ true, UNIT_DEPENDENCY_UDEV);
                 if (r < 0)
                         log_unit_warning_errno(u, r, "Failed to add BindsTo= dependency between device and mount unit, ignoring: %m");
         }
@@ -700,13 +696,6 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, Devic
         assert(path);
         assert(dev || found != DEVICE_FOUND_UDEV);
         assert(IN_SET(found, DEVICE_FOUND_UDEV, DEVICE_FOUND_MOUNT, DEVICE_FOUND_SWAP));
-
-        const char *sysfs = NULL;
-        if (dev) {
-                r = sd_device_get_syspath(dev, &sysfs);
-                if (r < 0)
-                        return log_device_debug_errno(dev, r, "Couldn't get syspath from device: %m");
-        }
 
         _cleanup_free_ char *e = NULL;
         r = unit_name_from_path(path, ".device", &e);
@@ -755,14 +744,14 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, Devic
         /* If this was created via some dependency and has not actually been seen yet, ->sysfs will not be
          * initialized. Hence initialize it if necessary. */
         bool sysfs_updated = false;
-        if (sysfs) {
-                r = device_set_sysfs(d, sysfs);
+        if (dev) {
+                r = device_set_sysfs(d, dev);
                 if (r < 0)
-                        return log_unit_error_errno(u, r, "Failed to set sysfs path %s: %m", sysfs);
+                        return log_unit_error_errno(u, r, "Failed to set sysfs path: %m");
                 sysfs_updated = r > 0;
 
                 /* The additional systemd udev properties we only interpret for the main object */
-                if (path_equal(sysfs, path))
+                if (path_equal(d->sysfs, path))
                         (void) device_add_udev_wants(u, dev);
         }
 
@@ -906,11 +895,30 @@ static int device_setup_devlink_unit_one(Manager *m, sd_device *dev, DeviceBusyF
                 /* The devlink points to a device other than the one we are currently processing. */
                 dev = dev_by_devlink;
 
-                if (device_get_busy_flags(dev) != DEVICE_BUSY_NONE)
-                        /* The devlink may be tentatively not-ready (e.g. due to ID_PROCESSING=1). Let's keep
-                         * the state of the unit for now. If it is really gone, we will hopefully receive a
-                         * uevent about that later. */
+                busy_flags = device_get_busy_flags(dev);
+                if (busy_flags != DEVICE_BUSY_NONE) {
+                        /* The devlink itself exists, but the device is not ready. */
+
+                        Unit *u;
+                        if (device_by_path(m, devlink, &u) < 0)
+                                return 0;
+
+                        /* If the device is tentatively not-ready (e.g., due to ID_PROCESSING=1), keep the
+                         * unit state unchanged for now to avoid unnecessary state transitions (e.g., plugged
+                         * -> dead -> plugged). Otherwise, drop the _READY flag. */
+                        if ((busy_flags & (DEVICE_BUSY_RENAMING | DEVICE_BUSY_PROCESSING)) == 0)
+                                device_update_found_by_name(m, devlink, DEVICE_NOT_FOUND, DEVICE_FOUND_UDEV_READY);
+
+                        /* Update the sysfs path so that the device unit will be processed when we receive a
+                         * uevent for the device. */
+                        if (DEVICE(u)->state != DEVICE_DEAD) {
+                                r = device_set_sysfs(DEVICE(u), dev);
+                                if (r < 0)
+                                        return log_unit_debug_errno(u, r, "Failed to update sysfs path: %m");
+                        }
+
                         return 0;
+                }
         }
 
         /* The devlink is ready. Setup/update the device unit. */
@@ -976,7 +984,7 @@ static int device_setup_units(Manager *m, sd_device *dev, DeviceBusyFlag busy_fl
                 if (r < 0 && r != -ENOENT)
                         log_device_warning_errno(dev, r, "Failed to get SYSTEMD_ALIAS property, ignoring: %m");
                 if (r >= 0) {
-                        r = strv_split_full(&aliases, s, NULL, EXTRACT_UNQUOTE);
+                        r = strv_split_full(&aliases, s, /* separators= */ NULL, EXTRACT_UNQUOTE);
                         if (r < 0)
                                 log_device_warning_errno(dev, r, "Failed to parse SYSTEMD_ALIAS property, ignoring: %m");
                 }
@@ -1062,7 +1070,7 @@ static int device_following_set(Unit *u, Set **ret) {
                 return 0;
         }
 
-        set = set_new(NULL);
+        set = set_new(/* hash_ops= */ NULL);
         if (!set)
                 return -ENOMEM;
 
@@ -1191,7 +1199,7 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
 
         /* When udevd failed to process the device, SYSTEMD_ALIAS or any other properties may contain invalid
          * values. Let's refuse to handle the uevent. */
-        if (sd_device_get_property_value(dev, "UDEV_WORKER_FAILED", NULL) >= 0) {
+        if (sd_device_get_property_value(dev, "UDEV_WORKER_FAILED", /* ret= */ NULL) >= 0) {
                 int v;
 
                 if (device_get_property_int(dev, "UDEV_WORKER_ERRNO", &v) >= 0)

@@ -11,7 +11,10 @@
 #include "io-util.h"
 #include "string-util.h"
 #include "tests.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
+
+#define N_TRANSFERS 4U
 
 #define ASSERT_CURL_OK(expr)                                                            \
         ({                                                                              \
@@ -55,7 +58,7 @@ static int on_finished(CurlSlot *slot, CURL *curl, CURLcode code, void *userdata
         f->finished = true;
         f->result = code;
 
-        return sd_event_exit(f->event, 0);
+        return sd_event_exit(f->event, /* code= */ 0);
 }
 
 static int make_tmp_url(char **ret_path, char **ret_url, const char *body) {
@@ -220,7 +223,7 @@ static int concurrent_on_finished(CurlSlot *slot, CURL *curl, CURLcode code, voi
 
         (*cr->remaining)--;
         if (*cr->remaining == 0)
-                return sd_event_exit(cr->ctx.event, 0);
+                return sd_event_exit(cr->ctx.event, /* code= */ 0);
         return 0;
 }
 
@@ -252,11 +255,11 @@ TEST(curl_concurrent) {
         /* All three fire as floating slots; the only way the loop exits is through the
          * remaining-counter hitting zero, which means every callback fired with the right
          * userdata routed to its respective body. */
-        ASSERT_OK(curl_glue_perform_async(g, ea, concurrent_on_finished, &reqs[0], NULL));
+        ASSERT_OK(curl_glue_perform_async(g, ea, concurrent_on_finished, &reqs[0], /* ret_slot= */ NULL));
         TAKE_PTR(ea);
-        ASSERT_OK(curl_glue_perform_async(g, eb, concurrent_on_finished, &reqs[1], NULL));
+        ASSERT_OK(curl_glue_perform_async(g, eb, concurrent_on_finished, &reqs[1], /* ret_slot= */ NULL));
         TAKE_PTR(eb);
-        ASSERT_OK(curl_glue_perform_async(g, ec, concurrent_on_finished, &reqs[2], NULL));
+        ASSERT_OK(curl_glue_perform_async(g, ec, concurrent_on_finished, &reqs[2], /* ret_slot= */ NULL));
         TAKE_PTR(ec);
 
         ASSERT_OK(sd_event_loop(event));
@@ -269,6 +272,49 @@ TEST(curl_concurrent) {
                 ASSERT_STREQ(r->ctx.body, r->expected);
                 context_done(&r->ctx);
         }
+}
+
+TEST(curl_glue_start_latency) {
+        /* libcurl asks the glue for a timeout of 0 to start a transfer, which the glue implements with an
+         * sd-event timer. If that timer is armed with accuracy 0, sd-event uses its default accuracy of
+         * 250ms and the start of every transfer is delayed by up to that much. Each transfer here uses a
+         * fresh event loop and glue because on_finished() calls sd_event_exit(), which leaves the loop
+         * SD_EVENT_FINISHED, so the old loop and the glue bound to it can't be reused for the next
+         * transfer; that also means each transfer hits the timer's first-creation path. A few such
+         * delays add up to well over the limit below, whereas reading a small file takes milliseconds. */
+
+        _cleanup_(unlink_and_freep) char *path = NULL;
+        _cleanup_free_ char *url = NULL;
+        ASSERT_OK(make_tmp_url(&path, &url, "latency"));
+
+        usec_t start = now(CLOCK_MONOTONIC);
+
+        for (unsigned i = 0; i < N_TRANSFERS; i++) {
+                _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+                ASSERT_OK(sd_event_new(&event));
+
+                _cleanup_(curl_glue_unrefp) CurlGlue *g = NULL;
+                ASSERT_OK(curl_glue_new(&g, event));
+
+                _cleanup_(context_done) Context f = { .event = sd_event_ref(event) };
+
+                _cleanup_(curl_easy_cleanupp) CURL *easy = NULL;
+                ASSERT_OK(build_easy(url, &f, &easy));
+
+                ASSERT_OK(curl_glue_perform_async(g, easy, on_finished, &f, /* ret_slot= */ NULL));
+                TAKE_PTR(easy);
+
+                ASSERT_OK(sd_event_loop(event));
+
+                ASSERT_TRUE(f.finished);
+                ASSERT_CURL_OK(f.result);
+                ASSERT_STREQ(f.body, "latency");
+        }
+
+        usec_t elapsed = usec_sub_unsigned(now(CLOCK_MONOTONIC), start);
+        log_info("%u transfers took %s", N_TRANSFERS, FORMAT_TIMESPAN(elapsed, USEC_PER_MSEC));
+
+        ASSERT_LT(elapsed, N_TRANSFERS * 125 * USEC_PER_MSEC);
 }
 
 static int intro(void) {

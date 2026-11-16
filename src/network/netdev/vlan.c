@@ -146,13 +146,9 @@ int config_parse_vlan_qos_maps(
                 _cleanup_free_ char *w = NULL;
                 unsigned from, to;
 
-                r = extract_first_word(&p, &w, NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
-                if (r == -ENOMEM)
-                        return log_oom();
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse %s, ignoring: %s", lvalue, rvalue);
-                        return 0;
-                }
+                r = extract_first_word(&p, &w, /* separators= */ NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
                         return 0;
 

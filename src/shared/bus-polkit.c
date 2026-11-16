@@ -148,7 +148,7 @@ int bus_test_polkit(
         if (r < 0)
                 return r;
 
-        r = sd_bus_call(call->bus, request, 0, reterr_error, &reply);
+        r = sd_bus_call(call->bus, request, /* usec= */ 0, reterr_error, &reply);
         if (r < 0) {
                 /* Treat no PK available as access denied */
                 if (bus_error_is_unknown_service(reterr_error)) {
@@ -289,7 +289,7 @@ static int async_polkit_read_reply(sd_bus_message *reply, AsyncPolkitQuery *q) {
 
         a = ASSERT_PTR(TAKE_PTR(q->action));
 
-        if (sd_bus_message_is_method_error(reply, NULL)) {
+        if (sd_bus_message_is_method_error(reply, /* name= */ NULL)) {
                 const sd_bus_error *e = ASSERT_PTR(sd_bus_message_get_error(reply));
 
                 if (bus_error_is_unknown_service(e)) {
@@ -393,6 +393,13 @@ static int async_polkit_process_reply(sd_bus_message *reply, AsyncPolkitQuery *q
          * We install an idle event loop event to clean-up the PolicyKit request data when we are idle again,
          * i.e. after the second time the message is processed is complete. */
 
+        /* All replies for a query share the one-shot defer event source below, and it drops a single
+         * reference when it fires. Every additional action we asked polkit about took a reference of its
+         * own (see bus_verify_polkit_async_full()), so if the defer from an earlier reply is still pending,
+         * re-arming it would not release the reference this reply took, and the query and the request would
+         * leak. Release it right away instead: the pending defer keeps the query alive. */
+        bool defer_pending = false;
+
         if (!q->defer_event_source) {
                 r = sd_event_add_defer(
                                 sd_bus_get_event(q->bus),
@@ -405,6 +412,12 @@ static int async_polkit_process_reply(sd_bus_message *reply, AsyncPolkitQuery *q
                 r = sd_event_source_set_priority(q->defer_event_source, SD_EVENT_PRIORITY_IDLE);
                 if (r < 0)
                         return r;
+        } else {
+                r = sd_event_source_get_enabled(q->defer_event_source, /* ret= */ NULL);
+                if (r < 0)
+                        return r;
+
+                defer_pending = r > 0;
         }
 
         r = sd_event_source_set_enabled(q->defer_event_source, SD_EVENT_ONESHOT);
@@ -412,7 +425,7 @@ static int async_polkit_process_reply(sd_bus_message *reply, AsyncPolkitQuery *q
                 return r;
 
         if (q->request) {
-                r = sd_bus_message_rewind(q->request, true);
+                r = sd_bus_message_rewind(q->request, /* complete= */ true);
                 if (r < 0)
                         return r;
 
@@ -426,6 +439,9 @@ static int async_polkit_process_reply(sd_bus_message *reply, AsyncPolkitQuery *q
                 if (r < 0)
                         return r;
         }
+
+        if (defer_pending)
+                async_polkit_query_unref(q); /* Not the last reference, the pending defer holds one. */
 
         return 1;
 }
@@ -695,7 +711,7 @@ int bus_verify_polkit_async_full(
                 q->registry = *registry;
         }
 
-        r = sd_bus_call_async(call->bus, &q->slot, pk, async_polkit_callback, q, 0);
+        r = sd_bus_call_async(call->bus, &q->slot, pk, async_polkit_callback, q, /* usec= */ 0);
         if (r < 0)
                 return r;
 
@@ -736,7 +752,7 @@ static int varlink_check_good_user(sd_varlink *link, uid_t good_user, bool *ret_
         return good_user == peer_uid;
 }
 
-static int varlink_check_peer_privilege(sd_varlink *link) {
+int varlink_check_peer_privilege(sd_varlink *link) {
         int r;
 
         assert(link);
@@ -894,9 +910,9 @@ int varlink_verify_polkit_async_full(
                         if (!FLAGS_SET(flags, POLKIT_DONT_REPLY)) {
                                 /* Reply with a nice error */
                                 if (sd_bus_error_has_name(&error, SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED))
-                                        (void) sd_varlink_error(link, SD_VARLINK_ERROR_INTERACTIVE_AUTHENTICATION_REQUIRED, NULL);
+                                        (void) sd_varlink_error(link, SD_VARLINK_ERROR_INTERACTIVE_AUTHENTICATION_REQUIRED, /* parameters= */ NULL);
                                 else if (ERRNO_IS_NEG_PRIVILEGE(r))
-                                        (void) sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                                        (void) sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
                         }
 
                         return r;
@@ -908,13 +924,19 @@ int varlink_verify_polkit_async_full(
                 }
         }
 
+        /* One-way requests are not kept after the handler returns, so we cannot retry them when polkit replies.
+         * Reject them unless the checks above already granted access. */
+        if (!sd_varlink_wants_reply(link))
+                return log_debug_errno(SYNTHETIC_ERRNO(EACCES),
+                                       "Cannot query polkit for '%s' on a one-way call, refusing.", action);
+
         _cleanup_(sd_bus_unrefp) sd_bus *mybus = NULL;
         if (!bus) {
                 r = sd_bus_open_system(&mybus);
                 if (r < 0)
                         return r;
 
-                r = sd_bus_attach_event(mybus, sd_varlink_get_event(link), 0);
+                r = sd_bus_attach_event(mybus, sd_varlink_get_event(link), /* priority= */ 0);
                 if (r < 0)
                         return r;
 
@@ -961,7 +983,7 @@ int varlink_verify_polkit_async_full(
                 q->registry = *registry;
         }
 
-        r = sd_bus_call_async(bus, &q->slot, pk, async_polkit_callback, q, 0);
+        r = sd_bus_call_async(bus, &q->slot, pk, async_polkit_callback, q, /* usec= */ 0);
         if (r < 0)
                 return r;
 

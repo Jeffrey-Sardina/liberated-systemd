@@ -21,6 +21,64 @@
 #include "strv.h"
 #include "user-util.h"
 
+static int user_manager_get_unit_by_pidref(const PidRef *pidref, char **ret_unit, char **ret_subgroup) {
+        int r;
+
+        assert(pidref);
+
+        _cleanup_free_ char *cgroup = NULL;
+        r = cg_pidref_get_path_shifted(pidref, /* cached_root= */ NULL, &cgroup);
+        if (r < 0)
+                return r;
+
+        /* cg_path_get_user_unit_full() strips any user manager prefix, hence make sure the process
+         * actually belongs to our user manager, and not to some other user's that happens to have a unit
+         * of the same name. */
+        _cleanup_free_ char *manager_unit = NULL;
+        r = cg_path_get_unit(cgroup, &manager_unit);
+        if (r < 0)
+                return r;
+
+        /* The system unit we are running in, i.e. our own user@.service or capsule@.service */
+        _cleanup_free_ char *our_manager_unit = NULL;
+        r = cg_pid_get_unit(/* pid= */ 0, &our_manager_unit);
+        if (r < 0)
+                return r;
+
+        if (!streq(manager_unit, our_manager_unit))
+                return -ENXIO;
+
+        _cleanup_free_ char *unit = NULL, *subgroup = NULL;
+        r = cg_path_get_user_unit_full(cgroup, &unit, &subgroup);
+        if (r < 0)
+                return r;
+
+        if (ret_unit)
+                *ret_unit = TAKE_PTR(unit);
+        if (ret_subgroup)
+                *ret_subgroup = TAKE_PTR(subgroup);
+        return 0;
+}
+
+int manager_get_unit_by_pidref(Manager *m, const PidRef *pidref, char **ret_unit, char **ret_subgroup) {
+        assert(m);
+        assert(pidref);
+
+        /* Determines the unit of the specified process in the service manager we are running for */
+
+        switch (m->runtime_scope) {
+
+        case RUNTIME_SCOPE_USER:
+                return user_manager_get_unit_by_pidref(pidref, ret_unit, ret_subgroup);
+
+        case RUNTIME_SCOPE_SYSTEM:
+                return cg_pidref_get_unit_full(pidref, ret_unit, ret_subgroup);
+
+        default:
+                assert_not_reached();
+        }
+}
+
 int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **ret) {
         _cleanup_(pidref_done) PidRef current = PIDREF_NULL;
         Machine *mm = NULL;
@@ -37,7 +95,7 @@ int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **re
 
                 /* Then look for the unit */
                 _cleanup_free_ char *unit = NULL;
-                if (cg_pidref_get_unit(pidref, &unit) >= 0) {
+                if (manager_get_unit_by_pidref(m, pidref, &unit, /* ret_subgroup= */ NULL) >= 0) {
                         mm = hashmap_get(m->machines_by_unit, unit);
                         if (mm)
                                 break;
@@ -246,7 +304,7 @@ int machine_get_addresses(Machine *machine, struct local_address **ret_addresses
                 if (r < 0)
                         return log_debug_errno(r, "Failed to open namespace: %m");
 
-                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, pair) < 0)
                         return log_debug_errno(errno, "Failed to call socketpair(): %m");
 
                 r = namespace_fork("(sd-addrns)",
@@ -357,7 +415,7 @@ int machine_get_os_release(Machine *machine, char ***ret_os_release) {
                 if (r < 0)
                         return log_debug_errno(r, "Failed to open namespace: %m");
 
-                if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) < 0)
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, pair) < 0)
                         return log_debug_errno(errno, "Failed to call socketpair(): %m");
 
                 r = namespace_fork("(sd-osrelns)",
@@ -459,7 +517,7 @@ int manager_acquire_image(Manager *m, const char *name, Image **ret) {
                 return log_debug_errno(r, "Failed to enable source: %m") ;
 
         _cleanup_(image_unrefp) Image *image = NULL;
-        r = image_find(m->runtime_scope, IMAGE_MACHINE, name, NULL, &image);
+        r = image_find(m->runtime_scope, IMAGE_MACHINE, name, /* root= */ NULL, &image);
         if (r < 0)
                 return log_debug_errno(r, "Failed to find image: %m");
 

@@ -14,6 +14,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "import-common.h"
 #include "import-tar.h"
 #include "import-util.h"
@@ -51,7 +52,10 @@ typedef struct TarImport {
         int tree_fd;
         int userns_fd;
 
+        Compression compression;
         Compressor *compress;
+
+        ImportDigest decoded_digest;
 
         sd_event_source *input_event_source;
 
@@ -127,6 +131,7 @@ int tar_import_new(
                 .userdata = userdata,
                 .last_percent = UINT_MAX,
                 .image_root = TAKE_PTR(root),
+                .compression = _COMPRESSION_INVALID,
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
                 .tar_pid = PIDREF_NULL,
         };
@@ -163,7 +168,7 @@ static void tar_import_report_progress(TarImport *i) {
         if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+        sd_notifyf(/* unset_environment= */ false, "X_IMPORT_PROGRESS=%u%%", percent);
 
         if (isatty_safe(STDERR_FILENO))
                 (void) draw_progress_barf(
@@ -198,6 +203,10 @@ static int tar_import_finish(TarImport *i) {
                 if (r != EXIT_SUCCESS)
                         return -EPROTO;
         }
+
+        r = import_digest_verify(&i->decoded_digest);
+        if (r < 0)
+                return r;
 
         assert_se(d = i->temp_path ?: i->local);
 
@@ -238,7 +247,7 @@ static int tar_import_fork_tar(TarImport *i) {
                 if (!i->final_path)
                         return log_oom();
 
-                r = tempfn_random(i->final_path, NULL, &i->temp_path);
+                r = tempfn_random(i->final_path, /* extra= */ NULL, &i->temp_path);
                 if (r < 0)
                         return log_oom();
 
@@ -264,14 +273,9 @@ static int tar_import_fork_tar(TarImport *i) {
                         return log_error_errno(r, "Failed to connect to mountfsd: %m");
 
                 _cleanup_close_ int directory_fd = -EBADF;
-                r = mountfsd_make_directory(
-                                mountfsd_link,
-                                d,
-                                MODE_INVALID,
-                                /* flags= */ 0,
-                                &directory_fd);
+                r = mkdir_foreign(d, MODE_INVALID, &directory_fd);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to make directory via mountfsd: %m");
+                        return log_error_errno(r, "Failed to make foreign UID range owned directory: %m");
 
                 r = mountfsd_mount_directory_fd(
                                 mountfsd_link,
@@ -297,9 +301,9 @@ static int tar_import_fork_tar(TarImport *i) {
                         (void) import_assign_pool_quota_and_warn(d);
                 }
 
-                i->tree_fd = open(d, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                i->tree_fd = xopenat(AT_FDCWD, d, O_DIRECTORY|O_NOFOLLOW);
                 if (i->tree_fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", d);
+                        return log_error_errno(i->tree_fd, "Failed to open '%s': %m", d);
         }
 
         i->tar_fd = import_fork_tar_x(i->tree_fd, i->userns_fd, &i->tar_pid);
@@ -312,6 +316,8 @@ static int tar_import_fork_tar(TarImport *i) {
 static int tar_import_write(const void *p, size_t sz, void *userdata) {
         TarImport *i = userdata;
         int r;
+
+        import_digest_update(&i->decoded_digest, p, sz);
 
         r = loop_write(i->tar_fd, p, sz);
         if (r < 0)
@@ -347,7 +353,14 @@ static int tar_import_process(TarImport *i) {
 
         if (!i->compress) {
 
-                if (l == 0) { /* EOF */
+                if (i->compression >= 0) {
+                        /* We were told which algorithm to expect, hence don't guess from the data */
+                        r = decompressor_force(&i->compress, i->compression);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to initialize decompressor: %m");
+                                goto finish;
+                        }
+                } else if (l == 0) { /* EOF */
                         log_debug("File too short to be compressed, as no compression signature fits in, thus assuming uncompressed.");
                         decompressor_force_off(&i->compress);
                 } else {
@@ -418,12 +431,13 @@ static int tar_import_on_defer(sd_event_source *s, void *userdata) {
         return tar_import_process(i);
 }
 
-int tar_import_start(TarImport *i, int fd, const char *local, ImportFlags flags) {
+int tar_import_start(TarImport *i, int fd, const char *local, Compression compression, const struct iovec *decoded_checksum, ImportFlags flags) {
         int r;
 
         assert(i);
         assert(fd >= 0);
         assert(local);
+        assert(compression < _COMPRESSION_MAX);
         assert(!(flags & ~IMPORT_FLAGS_MASK_TAR));
 
         if (!import_validate_local(local, flags))
@@ -432,7 +446,7 @@ int tar_import_start(TarImport *i, int fd, const char *local, ImportFlags flags)
         if (i->input_fd >= 0)
                 return -EBUSY;
 
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(fd, /* nonblock= */ true);
         if (r < 0)
                 return r;
 
@@ -441,6 +455,8 @@ int tar_import_start(TarImport *i, int fd, const char *local, ImportFlags flags)
                 return r;
 
         i->flags = flags;
+        i->compression = compression;
+        import_digest_init(&i->decoded_digest, decoded_checksum);
 
         if (fstat(fd, &i->input_stat) < 0)
                 return -errno;

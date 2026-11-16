@@ -9,11 +9,33 @@
 #include "fileio.h"
 #include "fs-util.h"
 #include "initrd-cpio.h"
+#include "iovec-util.h"
 #include "machine-credential.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "tests.h"
 #include "tmpfile-util.h"
+
+TEST(initrd_cpio_credentials_to_memory) {
+        _cleanup_(machine_credential_context_done) MachineCredentialContext creds = {};
+        _cleanup_(iovec_done) struct iovec empty = {}, archive = {};
+
+        /* Without credentials the archive still carries the directories and the trailer */
+        ASSERT_OK(initrd_cpio_credentials_to_memory(&creds, &empty));
+        ASSERT_NOT_NULL(empty.iov_base);
+        ASSERT_GT(empty.iov_len, 0U);
+        ASSERT_EQ(empty.iov_len % 4, 0U);
+        ASSERT_NOT_NULL(memmem(empty.iov_base, empty.iov_len, "TRAILER!!!", STRLEN("TRAILER!!!")));
+        ASSERT_NOT_NULL(memmem(empty.iov_base, empty.iov_len, ".extra/system_credentials", STRLEN(".extra/system_credentials")));
+
+        ASSERT_OK(machine_credential_add(&creds, "foo", "hello", 5));
+        ASSERT_OK(initrd_cpio_credentials_to_memory(&creds, &archive));
+        ASSERT_NOT_NULL(archive.iov_base);
+        ASSERT_GT(archive.iov_len, empty.iov_len);
+        ASSERT_NOT_NULL(memmem(archive.iov_base, archive.iov_len, ".extra/system_credentials/foo.cred", STRLEN(".extra/system_credentials/foo.cred")));
+        ASSERT_NOT_NULL(memmem(archive.iov_base, archive.iov_len, "hello", STRLEN("hello")));
+        ASSERT_NULL(memmem(empty.iov_base, empty.iov_len, "foo.cred", STRLEN("foo.cred")));
+}
 
 TEST_RET(initrd_cpio_credentials_basic) {
         struct stat st;
@@ -24,7 +46,7 @@ TEST_RET(initrd_cpio_credentials_basic) {
         _cleanup_(rm_rf_physical_and_freep) char *extract_dir = NULL;
         int r;
 
-        r = find_executable("cpio", NULL);
+        r = find_executable("cpio", /* ret_filename= */ NULL);
         if (r < 0)
                 return log_tests_skipped_errno(r, "Could not find cpio binary: %m");
 
@@ -34,7 +56,7 @@ TEST_RET(initrd_cpio_credentials_basic) {
         ASSERT_OK(initrd_cpio_credentials_to_tempfile(&creds, &cpio_path));
         ASSERT_NOT_NULL(cpio_path);
 
-        ASSERT_OK(mkdtemp_malloc(NULL, &extract_dir));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &extract_dir));
         ASSERT_OK(asprintf(&cmd, "cd %s && cpio -idm < %s", extract_dir, cpio_path));
         ASSERT_OK_ZERO_ERRNO(system(cmd));
 
@@ -53,16 +75,14 @@ TEST_RET(initrd_cpio_credentials_basic) {
         ASSERT_TRUE(S_ISREG(st.st_mode));
         ASSERT_EQ((mode_t) (st.st_mode & 07777), (mode_t) 0400);
         ASSERT_OK(read_full_file(foo_path, &foo_content, &foo_size));
-        ASSERT_EQ(foo_size, 5U);
-        ASSERT_EQ(memcmp(foo_content, "hello", 5), 0);
+        ASSERT_MEMEQ_NN(foo_content, foo_size, "hello", 5);
 
         ASSERT_NOT_NULL(bar_path = path_join(extract_dir, ".extra/system_credentials/bar.cred"));
         ASSERT_OK_ERRNO(stat(bar_path, &st));
         ASSERT_TRUE(S_ISREG(st.st_mode));
         ASSERT_EQ((mode_t) (st.st_mode & 07777), (mode_t) 0400);
         ASSERT_OK(read_full_file(bar_path, &bar_content, &bar_size));
-        ASSERT_EQ(bar_size, 7U);
-        ASSERT_EQ(memcmp(bar_content, "abc\0def", 7), 0);
+        ASSERT_MEMEQ_NN(bar_content, bar_size, "abc\0def", 7);
 
         return 0;
 }

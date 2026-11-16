@@ -26,6 +26,8 @@ typedef struct LookupPaths {
         char *persistent_attached;
         char *runtime_attached;
 
+        char *vendor_config;
+
         /* Where to place generated unit files (i.e. those a "generator" tool generated). Note the special semantics of
          * this directory: the generators are flushed each time a "systemctl daemon-reload" is issued. The user should
          * not alter these directories directly. */
@@ -63,6 +65,7 @@ int runtime_directory(RuntimeScope scope, const char *fallback_suffix, char **re
 int runtime_directory_resolve(RuntimeScope scope, const char *suffix, const char *identifier, char **ret);
 int runtime_directory_make(RuntimeScope scope, const char *suffix, const char *identifier, char **ret);
 int state_directory_generic(RuntimeScope scope, const char *suffix, char **ret);
+int state_directory(RuntimeScope scope, const char *fallback_suffix, char **ret);
 
 /* We don't treat /etc/xdg/systemd/ in these functions as the xdg base dir spec suggests because we assume
  * that is a link to /etc/systemd/ anyway. */
@@ -87,10 +90,10 @@ bool path_is_valid_search_path(const char *path) _pure_;
 
 int generator_binary_paths_internal(RuntimeScope scope, bool env_generator, char ***ret);
 static inline int generator_binary_paths(RuntimeScope runtime_scope, char ***ret) {
-        return generator_binary_paths_internal(runtime_scope, false, ret);
+        return generator_binary_paths_internal(runtime_scope, /* env_generator= */ false, ret);
 }
 static inline int env_generator_binary_paths(RuntimeScope runtime_scope, char ***ret) {
-        return generator_binary_paths_internal(runtime_scope, true, ret);
+        return generator_binary_paths_internal(runtime_scope, /* env_generator= */ true, ret);
 }
 
 static inline int credential_store_path(RuntimeScope runtime_scope, char ***ret) {

@@ -453,7 +453,7 @@ int route_nexthops_is_ready_to_configure(const Route *route, Manager *manager) {
                         return r;
 
                 HASHMAP_FOREACH(nhg, nh->group) {
-                        r = nexthop_is_ready(manager, nhg->id, NULL);
+                        r = nexthop_is_ready(manager, nhg->id, /* ret= */ NULL);
                         if (r <= 0)
                                 return r;
                 }
@@ -1073,7 +1073,7 @@ int config_parse_multipath_route(
                 return log_oom();
 
         p = rvalue;
-        r = extract_first_word(&p, &word, NULL, 0);
+        r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
         if (r <= 0)
                 return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
@@ -1099,7 +1099,7 @@ int config_parse_multipath_route(
 
         if (isempty(word)) {
                 if (!dev)
-                        return log_syntax_parse_error(unit, filename, line, SYNTHETIC_ERRNO(EINVAL), lvalue, rvalue);
+                        return log_syntax_parse_error(unit, filename, line, 0, lvalue, rvalue);
         } else {
                 r = in_addr_from_string_auto(word, &nh->family, &nh->gw);
                 if (r < 0) {

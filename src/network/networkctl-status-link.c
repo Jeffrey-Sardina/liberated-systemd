@@ -111,13 +111,13 @@ static int dump_ifindexes(Table *table, const char *prefix, const int *ifindexes
 
         for (unsigned c = 0; ifindexes[c] > 0; c++) {
                 if (c == 0)
-                        r = table_add_cell(table, NULL, TABLE_FIELD, prefix);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, prefix);
                 else
-                        r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_EMPTY, /* data= */ NULL);
                 if (r < 0)
                         return table_log_add_error(r);
 
-                r = table_add_cell(table, NULL, TABLE_IFINDEX, &ifindexes[c]);
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_IFINDEX, &ifindexes[c]);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -174,7 +174,7 @@ static int dump_hw_address(Table *table, sd_hwdb *hwdb, const char *field, const
         if (addr->length == ETH_ALEN)
                 (void) ieee_oui(hwdb, &addr->ether, &description);
 
-        r = table_add_cell(table, NULL, TABLE_FIELD, field);
+        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, field);
         if (r < 0)
                 return table_log_add_error(r);
 
@@ -238,7 +238,8 @@ static int link_status_one(
         _cleanup_free_ char *t = NULL, *network = NULL, *netdev = NULL, *iaid = NULL, *duid = NULL, *captive_portal = NULL,
                 *setup_state = NULL, *operational_state = NULL, *online_state = NULL, *activation_policy = NULL;
         const char *driver = NULL, *path = NULL, *vendor = NULL, *model = NULL, *link = NULL,
-                *on_color_operational, *off_color_operational, *on_color_setup, *off_color_setup, *on_color_online;
+                *on_color_operational, *off_color_operational, *on_color_setup, *off_color_setup, *on_color_online,
+                *dhcp_state = NULL;
         _cleanup_free_ int *carrier_bound_to = NULL, *carrier_bound_by = NULL;
         _cleanup_(table_unrefp) Table *table = NULL;
         int r;
@@ -251,7 +252,7 @@ static int link_status_one(
         operational_state_to_color(info->name, operational_state, &on_color_operational, &off_color_operational);
 
         (void) sd_network_link_get_online_state(info->ifindex, &online_state);
-        online_state_to_color(online_state, &on_color_online, NULL);
+        online_state_to_color(online_state, &on_color_online, /* off= */ NULL);
 
         (void) sd_network_link_get_setup_state(info->ifindex, &setup_state);
         setup_state_to_color(setup_state, &on_color_setup, &off_color_setup);
@@ -308,7 +309,7 @@ static int link_status_one(
                 return log_oom();
 
         if (arg_full)
-                table_set_width(table, 0);
+                table_set_width(table, /* width= */ 0);
 
         /* Config files and basic states. */
         if (netdev_dropins) {
@@ -333,6 +334,10 @@ static int link_status_one(
                                    on_color_setup, setup_state ?: "unmanaged", off_color_setup);
         if (r < 0)
                 return table_log_add_error(r);
+
+        r = dump_list(table, "Configuring", info->configuring_reasons);
+        if (r < 0)
+                return r;
 
         r = table_add_many(table,
                            TABLE_FIELD, "Online state",
@@ -388,7 +393,7 @@ static int link_status_one(
                 xsprintf(min_str, "%" PRIu32, info->min_mtu);
                 xsprintf(max_str, "%" PRIu32, info->max_mtu);
 
-                r = table_add_cell(table, NULL, TABLE_FIELD, "MTU");
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "MTU");
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -697,7 +702,7 @@ static int link_status_one(
                 else
                         p = "bridge";
 
-                r = table_add_cell(table, NULL, TABLE_FIELD, "Mode");
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "Mode");
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -710,7 +715,7 @@ static int link_status_one(
         if (info->has_wlan_link_info) {
                 _cleanup_free_ char *esc = NULL;
 
-                r = table_add_cell(table, NULL, TABLE_FIELD, "Wi-Fi access point");
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "Wi-Fi access point");
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -725,7 +730,7 @@ static int link_status_one(
         }
 
         if (info->has_bitrates) {
-                r = table_add_cell(table, NULL, TABLE_FIELD, "Bit Rate (Tx/Rx)");
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "Bit Rate (Tx/Rx)");
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -737,7 +742,7 @@ static int link_status_one(
         }
 
         if (info->has_tx_queues || info->has_rx_queues) {
-                r = table_add_cell(table, NULL, TABLE_FIELD, "Number of Queues (Tx/Rx)");
+                r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "Number of Queues (Tx/Rx)");
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -843,6 +848,15 @@ static int link_status_one(
                 }
         }
 
+        dhcp_state = dhcp_state_to_string(info->dhcp4_client_state);
+        if (dhcp_state) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "DHCPv4 Client State",
+                                   TABLE_STRING, dhcp_state);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
         if (sd_dhcp_client_id_is_set(&info->dhcp_client_id)) {
                 _cleanup_free_ char *id = NULL;
 
@@ -854,6 +868,23 @@ static int link_status_one(
                         if (r < 0)
                                 return table_log_add_error(r);
                 }
+        }
+
+        if (info->dhcp4_lease_timestamp != USEC_INFINITY) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "DHCPv4 Lease Timestamp",
+                                   TABLE_TIMESTAMP, info->dhcp4_lease_timestamp);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        dhcp_state = dhcp6_state_to_string(info->dhcp6_client_state);
+        if (dhcp_state) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "DHCPv6 Client State",
+                                   TABLE_STRING, dhcp_state);
+                if (r < 0)
+                        return table_log_add_error(r);
         }
 
         r = sd_network_link_get_dhcp6_client_iaid_string(info->ifindex, &iaid);
@@ -870,6 +901,14 @@ static int link_status_one(
                 r = table_add_many(table,
                                    TABLE_FIELD, "DHCPv6 Client DUID",
                                    TABLE_STRING, duid);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (info->dhcp6_lease_timestamp != USEC_INFINITY) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "DHCPv6 Lease Timestamp",
+                                   TABLE_TIMESTAMP, info->dhcp6_lease_timestamp);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -924,7 +963,7 @@ int verb_link_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 return r;
 
         if (arg_all)
-                c = acquire_link_info(vl, rtnl, NULL, &links);
+                c = acquire_link_info(vl, rtnl, /* patterns= */ NULL, &links);
         else if (argc <= 1)
                 return system_status(rtnl, hwdb);
         else

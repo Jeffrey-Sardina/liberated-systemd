@@ -27,6 +27,7 @@
 
 import glob
 import os
+import re
 import string
 import sys
 
@@ -77,6 +78,8 @@ from functools import lru_cache
 EOL = LineEnd().suppress()
 EMPTYLINE = LineEnd()
 COMMENTLINE = pythonStyleComment + EOL
+# A '#' starts a comment unless it is escaped as "\#", see hwdb(7).
+TRAILING_COMMENT_RE = re.compile(r'(?<!\\)#.*')
 INTEGER = Word(nums)
 REAL = Combine((INTEGER + Optional('.' + Optional(INTEGER))) ^ ('.' + INTEGER))
 SIGNED_REAL = Combine(Optional(Word('-+')) + REAL)
@@ -113,6 +116,7 @@ TYPES = {
 # Patterns that are used to set general properties on a device
 GENERAL_MATCHES = {
     'acpi',
+    'block',
     'bluetooth',
     'dmi',
     'ieee1394',
@@ -121,12 +125,17 @@ GENERAL_MATCHES = {
     'sdio',
     'tpm2',
     'usb',
+    'usb-interface',
     'vmbus',
 }
 
 
 def upperhex_word(length):
     return Word(nums + 'ABCDEF', exact=length)
+
+
+def lowerhex_word(length):
+    return Word(nums + 'abcdef', exact=length)
 
 
 @lru_cache
@@ -142,7 +151,10 @@ def hwdb_grammar():
     propertyline = (
         White(' ', exact=1).suppress()
         + Combine(
-            UDEV_TAG - '=' - Optional(Word(alphanums + '_=:@*.!-;, "/?&')) - Optional(pythonStyleComment)
+            UDEV_TAG
+            - '='
+            - Optional(Regex(r'([A-Za-z0-9_=:@*.!;, "/?&-]|\\#)+'))
+            - Optional(pythonStyleComment)
         )
         + EOL
     )
@@ -187,6 +199,10 @@ def property_grammar():
         ('ID_AUTOSUSPEND_DELAY_MS', INTEGER),
         ('ID_AV_PRODUCTION_CONTROLLER', zero_one),
         ('ID_AV_LIGHTS', zero_one),
+        (
+            'ID_BLOCK_IO_TIMEOUT_MS',
+            Or((INTEGER.copy().addCondition(lambda t: 0 < int(t[0]) < 2**32), Literal('max'))),
+        ),
         ('ID_DEBUG_APPLIANCE', name_literal),
         ('ID_PERSIST', zero_one),
         ('ID_PDA', zero_one),
@@ -209,6 +225,12 @@ def property_grammar():
         ('ID_SOFTWARE_RADIO', zero_one),
         ('ID_MM_DEVICE_IGNORE', zero_one),
         ('ID_NET_AUTO_LINK_LOCAL_ONLY', zero_one),
+        ('ID_LINK_DIR', Word(alphanums + '-_')),
+        ('ID_USB3_VISION', zero_one),
+        ('ID_PRINTER', zero_one),
+        ('ID_SMARTCARD_READER', zero_one),
+        ('ID_PTP_MTP', zero_one),
+        ('ID_VIDEO', zero_one),
         ('POINTINGSTICK_SENSITIVITY', INTEGER),
         ('ID_INTEGRATION', Or(('internal', 'external'))),
         ('ID_INPUT_TOUCHPAD_INTEGRATION', Or(('internal', 'external'))),
@@ -247,6 +269,8 @@ def property_grammar():
         ('ID_PRODUCT_NAME_IS_RUBBISH', zero_one),
         ('ID_PRODUCT_VERSION_IS_RUBBISH', zero_one),
         ('ID_BOARD_VERSION_IS_RUBBISH', zero_one),
+        ('ID_PRODUCT_SERIAL_IS_RUBBISH', zero_one),
+        ('ID_BOARD_SERIAL_IS_RUBBISH', zero_one),
         ('ID_PRODUCT_SKU_IS_RUBBISH', zero_one),
         ('ID_CHASSIS_ASSET_TAG_IS_RUBBISH', zero_one),
         ('ID_CHASSIS', name_literal),
@@ -317,10 +341,12 @@ def check_matches(groups):
     matches = sum((group[0] for group in groups), [])
 
     # This is a partial check. The other cases could be also done, but those
-    # three are the most commonly wrong.
+    # are the most commonly wrong.
+    usb_id = lowerhex_word(4) | '*'
     grammars = {
         'bluetooth': 'v' + upperhex_word(4) + Optional('p' + upperhex_word(4) + Optional(':')) + '*',
         'usb': 'v' + upperhex_word(4) + Optional('p' + upperhex_word(4) + Optional(':')) + '*',
+        'usb-interface': 'v' + usb_id + 'p' + usb_id + ':' + Word(nums + 'abcdef:*?') + stringEnd,
         'pci': 'v' + upperhex_word(8) + Optional('d' + upperhex_word(8) + Optional(':')) + '*',
     }
 
@@ -394,7 +420,7 @@ def check_properties(groups):
         seen_props = {}
         for prop in props:
             # print('--', prop)
-            prop = prop.partition('#')[0].rstrip()
+            prop = TRAILING_COMMENT_RE.sub('', prop, count=1).rstrip().replace('\\#', '#')
             try:
                 parsed = grammar.parseString(prop)
             except ParseBaseException:

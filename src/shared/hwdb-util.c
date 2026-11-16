@@ -373,7 +373,7 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
         /* calculate size of header, nodes, children entries, value entries */
         trie_store_nodes_size(&t, trie->root, compat);
 
-        r = fopen_tmpfile_linkable(filename, O_WRONLY|O_CLOEXEC, &filename_tmp, &f);
+        r = fopen_tmpfile_linkable(filename, O_WRONLY, &filename_tmp, &f);
         if (r < 0)
                 return r;
 
@@ -461,6 +461,21 @@ static int insert_data(struct trie *trie, char **match_list, char *line, const c
         return 0;
 }
 
+static void strip_comment(char *line) {
+        /* A '#' starts a comment that extends to the end of the line. "\#" stands for a literal '#' that
+         * does not start a comment, e.g. "ID_MODEL_FROM_DATABASE=SB200 OHCI USB Controller \#1". */
+
+        assert(line);
+
+        char *d = line;
+        for (const char *s = line; *s && *s != '#'; s++) {
+                if (s[0] == '\\' && s[1] == '#')
+                        s++;
+                *d++ = *s;
+        }
+        *d = '\0';
+}
+
 static int import_file(struct trie *trie, int fd, const char *filename, uint16_t file_priority, bool compat) {
         enum {
                 HW_NONE,
@@ -483,7 +498,6 @@ static int import_file(struct trie *trie, int fd, const char *filename, uint16_t
         for (;;) {
                 _cleanup_free_ char *line = NULL;
                 size_t len;
-                char *pos;
 
                 r = read_line_full(f, LONG_LINE_MAX, READ_LINE_NOT_A_TTY, &line);
                 if (r < 0)
@@ -497,10 +511,7 @@ static int import_file(struct trie *trie, int fd, const char *filename, uint16_t
                 if (line[0] == '#')
                         continue;
 
-                /* strip trailing comment */
-                pos = strchr(line, '#');
-                if (pos)
-                        pos[0] = '\0';
+                strip_comment(line);
 
                 /* strip trailing whitespace */
                 len = strlen(line);
@@ -676,7 +687,7 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         if (r < 0)
                 return log_error_errno(r, "Failed to write database %s: %m", hwdb_bin);
 
-        r = label_fix(hwdb_bin, 0);
+        r = label_fix(hwdb_bin, /* flags= */ 0);
         if (r < 0)
                 return r;
 

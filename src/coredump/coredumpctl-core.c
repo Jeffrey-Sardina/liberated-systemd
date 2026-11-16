@@ -12,12 +12,12 @@
 #include "coredumpctl-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "io-util.h"
 #include "log.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
 static int coredump_open_tmpfile(char **ret_path, int *ret_fd) {
@@ -62,23 +62,11 @@ static int acquire_core_from_journal(sd_journal *j, int fd, char **ret_tmpfile) 
                 fd = fdt;
         }
 
-        /* We want full data, nothing truncated. */
-        (void) sd_journal_set_data_threshold(j, 0);
-
-        const void *data;
-        size_t len;
-        r = sd_journal_get_data(j, "COREDUMP", &data, &len);
+        r = sd_journal_get_data_to_fd(j, "COREDUMP", SD_JOURNAL_DATA_SKIP_FIELD, fd, /* ret_size= */ NULL);
         if (r == -ENOENT)
                 return log_error_errno(r, "Coredump entry has no core attached (neither internally in the journal nor externally on disk).");
         if (r < 0)
                 return log_error_errno(r, "Failed to retrieve COREDUMP field: %m");
-
-        data = ASSERT_PTR(memory_startswith(data, len, "COREDUMP="));
-        len -= STRLEN("COREDUMP=");
-
-        r = loop_write(fd, data, len);
-        if (r < 0)
-                return log_error_errno(r, "Failed to write core: %m");
 
         if (ret_tmpfile)
                 *ret_tmpfile = TAKE_PTR(temp);
@@ -140,7 +128,7 @@ int acquire_core(sd_journal *j, int fd, char **ret_tmpfile, char **ret_path) {
         }
 
 #if HAVE_COMPRESSION
-        _cleanup_close_ int fdf = fd_reopen(fdf_opath, O_RDONLY | O_CLOEXEC);
+        _cleanup_close_ int fdf = fd_reopen(fdf_opath, O_RDONLY);
         if (fdf < 0)
                 return log_error_errno(fdf, "Failed to open '%s': %m", path);
 
@@ -203,6 +191,16 @@ int verb_dump_core(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 return r;
 
         r = sd_journal_previous(j);
+        if (r > 0 && arg_since != USEC_INFINITY) {
+                usec_t usec;
+
+                int q = sd_journal_get_realtime_usec(j, &usec);
+                if (q < 0)
+                        return log_error_errno(q, "Failed to determine timestamp: %m");
+                if (usec < arg_since)
+                        r = 0;
+        }
+
         if (r > 0 && !arg_quiet)
                 log_notice("More than one entry matches, ignoring rest.");
 

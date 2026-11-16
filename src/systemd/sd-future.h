@@ -206,9 +206,20 @@ _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_future, sd_fiber_timeout_unref);
              _SD_CONCATENATE(_sd_fto_b_, uniq);                                                                                                                 \
              _SD_CONCATENATE(_sd_fto_b_, uniq) = NULL)
 
-/* A channel buffers up to `capacity` items of type void*. An item must not be NULL. A receive waits on
- * its future while the channel is empty. The overflow policy controls the behavior of a send while the
- * channel is full:
+/* A channel buffers up to `capacity` items of type void*. An item must not be NULL. A receive future
+ * resolves right away if an item is buffered. Otherwise it waits until a new item wakes it, and each new
+ * item wakes one waiting receive. A resolved receive future does not contain an item. It only means
+ * that an item was buffered when the future resolved, and the item stays in the channel until a receive
+ * pops it. sd_channel_recv_get() pops the oldest buffered item. Other receives can empty the buffer
+ * before that, and sd_channel_recv_get() then fails with -EAGAIN. The caller then has to receive again.
+ * sd_channel_pop() receives again by itself. If a resolved receive future is freed before
+ * sd_channel_recv_get() reads it, for example because it lost to another child of a WAIT_ANY group,
+ * the channel wakes the next waiting receive.
+ *
+ * sd_channel_close() wakes every waiting receive. On a closed channel, a receive fails with -EPIPE once
+ * the buffer is empty.
+ *
+ * The overflow policy controls the behavior of a send while the channel is full:
  *
  *   SD_CHANNEL_OVERFLOW_WAIT: the send waits on its future until a receive frees a slot.
  *   SD_CHANNEL_OVERFLOW_DROP_OLDEST: the channel destroys its oldest item to make room, and the
@@ -222,9 +233,8 @@ _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_future, sd_fiber_timeout_unref);
  * succeeds.
  *
  * The channel calls the destroy callback, if set, on every item that it owns and that nobody
- * received: items still buffered when the last reference is dropped, items of failed sends, items
- * that a receive future got but the caller never took with sd_channel_recv_get(), and items dropped by
- * the overflow policy. */
+ * received: items still buffered when the last reference is dropped, items of failed sends, and items
+ * dropped by the overflow policy. */
 
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_channel_overflow_t) {
         SD_CHANNEL_OVERFLOW_WAIT        = 0,
@@ -242,7 +252,9 @@ int sd_channel_new_conflated(sd_event *e, sd_channel_destroy_t destroy, sd_chann
 int sd_channel_send(sd_channel *c, void *item, sd_future **ret);
 int sd_channel_recv(sd_channel *c, sd_future **ret);
 /* sd_channel_recv_get() returns the future's result if that is negative, and 1 with the received item
- * otherwise. As with sd_future_result(), the future has to be resolved. */
+ * otherwise. It fails with -EAGAIN if the buffer is empty when it is called, and with -EPIPE if the
+ * channel is also closed. It fails with -ESTALE if the future was already read. As with
+ * sd_future_result(), the future has to be resolved. */
 int sd_channel_recv_get(sd_future *f, void **ret);
 int sd_channel_try_push(sd_channel *c, void *item);
 int sd_channel_try_pop(sd_channel *c, void **ret);
@@ -255,7 +267,18 @@ int sd_channel_set_slot(sd_channel *c, void *slot, sd_channel_destroy_t destroy)
 _SD_DECLARE_TRIVIAL_REF_UNREF_FUNC(sd_channel);
 _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_channel, sd_channel_unref);
 
-/* Fiber I/O operations - use sd-event for non-blocking I/O when in fiber context */
+/* The sd_fiber_*() I/O functions suspend the calling fiber instead of blocking the thread. If the event loop
+ * uses io_uring, the kernel runs the operation. Otherwise, the function waits until the fd is ready and then
+ * runs the syscall.
+ *
+ * With io_uring, a cancellation or a timeout of the fiber doesn't interrupt I/O on a regular file or a
+ * block device. The fiber gets -ECANCELED or -ETIME only after the I/O finished. The exit of the event loop
+ * also waits until the I/O finished.
+ *
+ * sd_fiber_read(), sd_fiber_write(), sd_fiber_readv() and sd_fiber_writev() use and advance the file
+ * position like read() and write(). With io_uring, the kernel doesn't serialize the update of the file
+ * position, unlike read() and write() on a regular file. Two fibers that do I/O on the same open file at the
+ * same time can read or write at the same position. */
 ssize_t sd_fiber_read(int fd, void *buf, size_t count);
 ssize_t sd_fiber_write(int fd, const void *buf, size_t count);
 ssize_t sd_fiber_readv(int fd, const struct iovec *iov, int iovcnt);

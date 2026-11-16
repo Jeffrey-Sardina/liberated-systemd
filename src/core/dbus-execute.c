@@ -23,6 +23,7 @@
 #include "hexdecoct.h"
 #include "hostname-util.h"
 #include "image-policy.h"
+#include "io-uring-filter.h"
 #include "ioprio-util.h"
 #include "iovec-util.h"
 #include "journal-file.h"
@@ -327,6 +328,41 @@ static int property_get_smack_process_label(
         assert(reply);
 
         return sd_bus_message_append(reply, "(bs)", c->smack_process_label_ignore, c->smack_process_label);
+}
+
+static int property_get_io_uring_filter(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *reterr_error) {
+
+        ExecContext *c = ASSERT_PTR(userdata);
+        _cleanup_strv_free_ char **l = NULL;
+        int r;
+
+        assert(bus);
+        assert(reply);
+
+        r = sd_bus_message_open_container(reply, 'r', "bas");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(reply, "b", c->io_uring_filter_allow_list);
+        if (r < 0)
+                return r;
+
+        l = exec_context_get_io_uring_filter(c);
+        if (!l)
+                return -ENOMEM;
+
+        r = sd_bus_message_append_strv(reply, l);
+        if (r < 0)
+                return r;
+
+        return sd_bus_message_close_container(reply);
 }
 
 static int property_get_address_families(
@@ -1356,6 +1392,7 @@ const sd_bus_vtable bus_exec_vtable[] = {
         SD_BUS_PROPERTY("Personality", "s", property_get_personality, offsetof(ExecContext, personality), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("LockPersonality", "b", bus_property_get_bool, offsetof(ExecContext, lock_personality), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RestrictAddressFamilies", "(bas)", property_get_address_families, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("IOUringFilter", "(bas)", property_get_io_uring_filter, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RuntimeDirectorySymlink", "a(sst)", property_get_exec_dir_symlink, offsetof(ExecContext, directories[EXEC_DIRECTORY_RUNTIME]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RuntimeDirectoryPreserve", "s", bus_property_get_exec_preserve_mode, offsetof(ExecContext, runtime_directory_preserve_mode), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RuntimeDirectoryMode", "u", bus_property_get_mode, offsetof(ExecContext, directories[EXEC_DIRECTORY_RUNTIME].mode), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -1375,6 +1412,7 @@ const sd_bus_vtable bus_exec_vtable[] = {
         SD_BUS_PROPERTY("LogsDirectoryAccounting", "b", bus_property_get_bool, offsetof(ExecContext, directories[EXEC_DIRECTORY_LOGS].exec_quota.quota_accounting), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("LogsDirectoryQuota", "(tus)", property_get_exec_quota, offsetof(ExecContext, directories[EXEC_DIRECTORY_LOGS].exec_quota), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("LogsDirectory", "as", property_get_exec_dir, offsetof(ExecContext, directories[EXEC_DIRECTORY_LOGS]), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ConfigurationDirectorySymlink", "a(sst)", property_get_exec_dir_symlink, offsetof(ExecContext, directories[EXEC_DIRECTORY_CONFIGURATION]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("ConfigurationDirectoryMode", "u", bus_property_get_mode, offsetof(ExecContext, directories[EXEC_DIRECTORY_CONFIGURATION].mode), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("ConfigurationDirectory", "as", property_get_exec_dir, offsetof(ExecContext, directories[EXEC_DIRECTORY_CONFIGURATION]), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TimeoutCleanUSec", "t", bus_property_get_usec, offsetof(ExecContext, timeout_clean_usec), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -1700,16 +1738,6 @@ int bus_set_transient_exec_command(
                         if (strv_isempty(argv))
                                 return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                          "\"%s\" argv cannot be empty", name);
-                } else {
-                        /* Always normalize path and argv0 to be "sh" */
-                        path = _PATH_BSHELL;
-
-                        if (strv_isempty(argv))
-                                r = strv_extend(&argv, "sh");
-                        else
-                                r = free_and_strdup(&argv[0], argv[0][0] == '-' ? "-sh" : "sh");
-                        if (r < 0)
-                                return r;
                 }
 
                 r = sd_bus_message_exit_container(message);
@@ -1719,16 +1747,7 @@ int bus_set_transient_exec_command(
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         _cleanup_(exec_command_freep) ExecCommand *c = NULL;
 
-                        c = new(ExecCommand, 1);
-                        if (!c)
-                                return -ENOMEM;
-
-                        *c = (ExecCommand) {
-                                .argv = TAKE_PTR(argv),
-                                .flags = command_flags,
-                        };
-
-                        r = path_simplify_alloc(path, &c->path);
+                        r = exec_command_new(path, TAKE_PTR(argv), command_flags, &c);
                         if (r < 0)
                                 return r;
 
@@ -1768,7 +1787,7 @@ int bus_set_transient_exec_command(
                         fprintf(f, "%s=%s\n", written_name, a);
                 }
 
-                r = memstream_finalize(&m, &buf, NULL);
+                r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -2011,7 +2030,7 @@ int bus_exec_context_set_transient_property(
                         if (isempty(pattern))
                                 continue;
 
-                        r = pattern_compile_and_log(pattern, 0, &compiled_pattern);
+                        r = pattern_compile_and_log(pattern, /* case_= */ 0, &compiled_pattern);
                         if (r < 0)
                                 return r;
 
@@ -2449,7 +2468,7 @@ int bus_exec_context_set_transient_property(
                                               FILESYSTEM_PARSE_LOG|
                                               (invert_flag ? FILESYSTEM_PARSE_INVERT : 0)|
                                               (c->restrict_filesystems_allow_list ? FILESYSTEM_PARSE_ALLOW_LIST : 0),
-                                              u->id, NULL, 0);
+                                              u->id, /* filename= */ NULL, /* line= */ 0);
                                 if (r < 0)
                                         return r;
                         }
@@ -2459,6 +2478,72 @@ int bus_exec_context_set_transient_property(
                                 return -ENOMEM;
 
                         unit_write_settingf(u, flags, name, "%s=%s%s", name, allow_list ? "" : "~", joined);
+                }
+
+                return 1;
+        }
+
+        if (streq(name, "IOUringFilter")) {
+                _cleanup_strv_free_ char **l = NULL;
+                int allow_list;
+
+                r = sd_bus_message_enter_container(message, 'r', "bas");
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_read(message, "b", &allow_list);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_read_strv(message, &l);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                STRV_FOREACH(s, l)
+                        if (io_uring_op_from_string(*s) < 0)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Invalid io_uring operation: %s", *s);
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        _cleanup_free_ char *joined = NULL;
+
+                        if (strv_isempty(l)) {
+                                c->io_uring_filter_allow_list = false;
+                                c->io_uring_filter = set_free(c->io_uring_filter);
+
+                                unit_write_setting(u, flags, name, "IOUringFilter=");
+                                return 1;
+                        }
+
+                        if (!c->io_uring_filter) {
+                                c->io_uring_filter = set_new(/* hash_ops= */ NULL);
+                                if (!c->io_uring_filter)
+                                        return -ENOMEM;
+
+                                c->io_uring_filter_allow_list = allow_list;
+                        }
+
+                        STRV_FOREACH(s, l) {
+                                int op = io_uring_op_from_string(*s);
+                                assert(op >= 0);
+
+                                if (allow_list == c->io_uring_filter_allow_list) {
+                                        r = set_put(c->io_uring_filter, INT_TO_PTR(op + 1));
+                                        if (r < 0)
+                                                return r;
+                                } else
+                                        set_remove(c->io_uring_filter, INT_TO_PTR(op + 1));
+                        }
+
+                        joined = strv_join(l, " ");
+                        if (!joined)
+                                return -ENOMEM;
+
+                        unit_write_settingf(u, flags, name, "IOUringFilter=%s%s", allow_list ? "" : "~", joined);
                 }
 
                 return 1;
@@ -2495,7 +2580,7 @@ int bus_exec_context_set_transient_property(
                         } else {
                                 _cleanup_free_ char *joined = NULL;
 
-                                r = strv_extend_strv(&c->supplementary_groups, l, true);
+                                r = strv_extend_strv(&c->supplementary_groups, l, /* filter_duplicates= */ true);
                                 if (r < 0)
                                         return r;
 
@@ -2750,7 +2835,7 @@ int bus_exec_context_set_transient_property(
                         eq = memchr(p, '=', sz);
                         if (!eq)
                                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Journal field contains no '=' character");
-                        if (!journal_field_valid(p, eq - (const char*) p, false))
+                        if (!journal_field_valid(p, eq - (const char*) p, /* allow_protected= */ false))
                                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Journal field invalid");
 
                         copy = memdup_suffix0(p, sz);
@@ -2825,7 +2910,7 @@ int bus_exec_context_set_transient_property(
                         }
 
                         if (!c->syscall_filter) {
-                                c->syscall_filter = hashmap_new(NULL);
+                                c->syscall_filter = hashmap_new(/* hash_ops= */ NULL);
                                 if (!c->syscall_filter)
                                         return log_oom();
 
@@ -2838,7 +2923,7 @@ int bus_exec_context_set_transient_property(
                                                                          SECCOMP_PARSE_PERMISSIVE |
                                                                          SECCOMP_PARSE_ALLOW_LIST,
                                                                          u->id,
-                                                                         NULL, 0);
+                                                                         /* filename= */ NULL, /* line= */ 0);
                                         if (r < 0)
                                                 return r;
                                 }
@@ -2862,7 +2947,7 @@ int bus_exec_context_set_transient_property(
                                                                  invert_flag |
                                                                  (c->syscall_allow_list ? SECCOMP_PARSE_ALLOW_LIST : 0),
                                                                  u->id,
-                                                                 NULL, 0);
+                                                                 /* filename= */ NULL, /* line= */ 0);
                                 if (r < 0)
                                         return r;
                         }
@@ -2909,7 +2994,7 @@ int bus_exec_context_set_transient_property(
                         }
 
                         if (!c->syscall_log) {
-                                c->syscall_log = hashmap_new(NULL);
+                                c->syscall_log = hashmap_new(/* hash_ops= */ NULL);
                                 if (!c->syscall_log)
                                         return log_oom();
 
@@ -2924,7 +3009,7 @@ int bus_exec_context_set_transient_property(
                                                                  invert_flag |
                                                                  (c->syscall_log_allow_list ? SECCOMP_PARSE_ALLOW_LIST : 0),
                                                                  u->id,
-                                                                 NULL, 0);
+                                                                 /* filename= */ NULL, /* line= */ 0);
                                 if (r < 0)
                                         return r;
                         }
@@ -2985,6 +3070,19 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
+                /* The names may be specified without the AF_ prefix and in any case. Validate them all before
+                 * applying anything, and use the canonical form from here on, in particular in the drop-in. */
+                STRV_FOREACH(s, l) {
+                        int af = af_from_name(*s);
+                        if (af < 0)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Invalid address family: %s", *s);
+
+                        r = free_and_strdup(s, af_to_name(af));
+                        if (r < 0)
+                                return r;
+                }
+
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         _cleanup_free_ char *joined = NULL;
 
@@ -2998,7 +3096,7 @@ int bus_exec_context_set_transient_property(
                         }
 
                         if (!c->address_families) {
-                                c->address_families = set_new(NULL);
+                                c->address_families = set_new(/* hash_ops= */ NULL);
                                 if (!c->address_families)
                                         return log_oom();
 
@@ -3006,11 +3104,8 @@ int bus_exec_context_set_transient_property(
                         }
 
                         STRV_FOREACH(s, l) {
-                                int af;
-
-                                af = af_from_name(*s);
-                                if (af < 0)
-                                        return af;
+                                int af = af_from_name(*s);
+                                assert(af >= 0);
 
                                 if (allow_list == c->address_families_allow_list) {
                                         r = set_put(c->address_families, INT_TO_PTR(af));
@@ -3558,7 +3653,7 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
-                r = memstream_finalize(&m, &joined, NULL);
+                r = memstream_finalize(&m, &joined, /* ret_size= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -3567,7 +3662,7 @@ int bus_exec_context_set_transient_property(
                                 c->environment_files = strv_free(c->environment_files);
                                 unit_write_setting(u, flags, name, "EnvironmentFile=");
                         } else {
-                                r = strv_extend_strv(&c->environment_files, l, true);
+                                r = strv_extend_strv(&c->environment_files, l, /* filter_duplicates= */ true);
                                 if (r < 0)
                                         return r;
 
@@ -3598,7 +3693,7 @@ int bus_exec_context_set_transient_property(
                         } else {
                                 _cleanup_free_ char *joined = NULL;
 
-                                r = strv_extend_strv(&c->pass_environment, l, true);
+                                r = strv_extend_strv(&c->pass_environment, l, /* filter_duplicates= */ true);
                                 if (r < 0)
                                         return r;
 
@@ -3659,7 +3754,7 @@ int bus_exec_context_set_transient_property(
                                 if (!joined)
                                         return -ENOMEM;
 
-                                r = strv_extend_strv(dirs, l, true);
+                                r = strv_extend_strv(dirs, l, /* filter_duplicates= */ true);
                                 if (r < 0)
                                         return r;
 
@@ -3686,7 +3781,7 @@ int bus_exec_context_set_transient_property(
                                 unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "ExecSearchPath=");
                         } else {
                                 _cleanup_free_ char *joined = NULL;
-                                r = strv_extend_strv(&c->exec_search_path, l, true);
+                                r = strv_extend_strv(&c->exec_search_path, l, /* filter_duplicates= */ true);
                                 if (r < 0)
                                         return r;
                                 joined = strv_join(c->exec_search_path, ":");
@@ -3727,16 +3822,27 @@ int bus_exec_context_set_transient_property(
                                 exec_directory_done(d);
                                 unit_write_settingf(u, flags, name, "%s=", name);
                         } else {
+                                _cleanup_strv_free_ char **escaped = NULL;
                                 _cleanup_free_ char *joined = NULL;
 
                                 STRV_FOREACH(source, l) {
                                         r = exec_directory_add(d, *source, /* symlink= */ NULL, /* flags= */ 0);
                                         if (r < 0)
                                                 return log_oom();
+
+                                        /* unit_concat_strv() quotes each path, so only tuple separators and
+                                         * double quotes need extra escaping before parsing it again. */
+                                        _cleanup_free_ char *source_escaped = xescape(*source, ":\"");
+                                        if (!source_escaped)
+                                                return log_oom();
+
+                                        r = strv_consume(&escaped, TAKE_PTR(source_escaped));
+                                        if (r < 0)
+                                                return log_oom();
                                 }
                                 exec_directory_sort(d);
 
-                                joined = unit_concat_strv(l, UNIT_ESCAPE_SPECIFIERS);
+                                joined = unit_concat_strv(escaped, UNIT_ESCAPE_SPECIFIERS);
                                 if (!joined)
                                         return -ENOMEM;
 
@@ -4192,7 +4298,10 @@ int bus_exec_context_set_transient_property(
 
                 return 1;
 
-        } else if (STR_IN_SET(name, "StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink", "LogsDirectorySymlink")) {
+        } else if (STR_IN_SET(name,
+                              "StateDirectorySymlink", "RuntimeDirectorySymlink", "CacheDirectorySymlink",
+                              "LogsDirectorySymlink", "ConfigurationDirectorySymlink")) {
+                const char *const escape_chars = ":\"' ";
                 char *source, *destination;
                 ExecDirectory *directory;
                 uint64_t symlink_flags;
@@ -4214,15 +4323,26 @@ int bus_exec_context_set_transient_property(
                                 return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Source path %s is absolute.", source);
                         if (!path_is_normalized(source))
                                 return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Source path %s is not normalized.", source);
+                        if (path_startswith(source, "private"))
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Source path %s is 'private'.", source);
                         if (isempty(destination))
                                 destination = NULL;
                         else {
+                                /* Symlinks are not supported for ConfigurationDirectory=, matching what the
+                                 * unit file parser accepts. The flags field is still useful there, though. */
+                                if (i == EXEC_DIRECTORY_CONFIGURATION)
+                                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                                 "Symlink destination is not supported for %s=.",
+                                                                 exec_directory_type_to_string(i));
                                 if (!path_is_valid(destination))
                                         return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Destination path %s is not valid.", destination);
                                 if (path_is_absolute(destination))
                                         return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Destination path %s is absolute.", destination);
                                 if (!path_is_normalized(destination))
                                         return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Destination path %s is not normalized.", destination);
+                                if (path_startswith(destination, "private"))
+                                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                                 "Destination path %s is 'private'.", destination);
                         }
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
@@ -4232,24 +4352,29 @@ int bus_exec_context_set_transient_property(
                                 if (r < 0)
                                         return r;
 
-                                /* Need to store them in the unit with the escapes, so that they can be parsed again */
-                                source_escaped = xescape(source, ":");
+                                /* Escape tuple separators, quotes and whitespace so the unit file parser
+                                 * preserves each path when it splits the assignment into words and fields. */
+                                source_escaped = xescape(source, escape_chars);
                                 if (!source_escaped)
                                         return -ENOMEM;
                                 if (destination) {
-                                        destination_escaped = xescape(destination, ":");
+                                        destination_escaped = xescape(destination, escape_chars);
                                         if (!destination_escaped)
                                                 return -ENOMEM;
                                 }
 
+                                const char *flags_string = exec_directory_flags_to_string(symlink_flags);
+                                assert(flags_string); /* Validated before applying the property. */
+
                                 unit_write_settingf(
                                                 u, flags|UNIT_ESCAPE_SPECIFIERS, exec_directory_type_to_string(i),
-                                                "%s=%s%s%s%s",
+                                                "%s=%s%s%s%s%s",
                                                 exec_directory_type_to_string(i),
                                                 source_escaped,
-                                                destination_escaped || FLAGS_SET(symlink_flags, EXEC_DIRECTORY_READ_ONLY) ? ":" : "",
-                                                destination_escaped,
-                                                FLAGS_SET(symlink_flags, EXEC_DIRECTORY_READ_ONLY) ? ":ro" : "");
+                                                destination || !isempty(flags_string) ? ":" : "",
+                                                strempty(destination_escaped),
+                                                isempty(flags_string) ? "" : ":",
+                                                flags_string);
                         }
                 }
                 if (r < 0)

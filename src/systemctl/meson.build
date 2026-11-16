@@ -28,6 +28,7 @@ systemctl_sources = files(
         'systemctl-start-special.c',
         'systemctl-switch-root.c',
         'systemctl-trivial-method.c',
+        'systemctl-wait.c',
         'systemctl-whoami.c',
 )
 systemctl_export_sources = files(
@@ -43,7 +44,6 @@ systemctl_export_sources = files(
 executables += [
         executable_template + {
                 'name' : 'systemctl',
-                'public' : true,
                 'sources' : systemctl_sources,
                 'export' : systemctl_export_sources,
                 'dependencies' : [

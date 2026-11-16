@@ -35,7 +35,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - **zsh:**
     - `<command> <verb> -<TAB>` should complete options, but currently does not
     - systemctl add-wants,add-requires
-    - systemctl reboot --boot-loader-entry=
 
 - systemctl status should know about 'systemd-analyze calendar ... --iterations='
 - If timer has just OnInactiveSec=..., it should fire after a specified time
@@ -127,15 +126,45 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 ## Features
 
-- sysext: condition confext/sysext on machine tags, too
+- vpick: honour manifest
+
+- sysupdate: add http header to sources in uapi16
+
+- systemd-repart: support squashing DDIs in sysext/confext overlayfs style, so
+  that we take a combination of base DDI plus multiple sysext/confext and turn
+  into into a single squashed DDI.
+
+- sysupdate: add mode where download entries can be explicitly revoked or
+  implicitly by removing them from the listings, which would cause local
+  removal.
+
+- image version pin logic, which allows us to pin root fs, confext, sysext ddis
+  in their versions. make it a short string. then have a small service that at
+  boot generates a credential from it, and then issues bootctl link-auto to
+  create a boot menu entry from it that pins a working version. also add
+  ability to "unpin" versions after successful sysupdate download.
+
+- vmspawn: pass in a document as credential that carries host ids, signed by
+  the TPM, so that we can determine relationshiops between VMs and bare metal
+  in our mgmt UIs. On COCO use chip ids (amd) instead.
+
+- systemd-report needs an upload queue. After all it records resource usage,
+  and it would be useful to collect this data even when networking is not
+  available, and upload it once it is. Make this smart, i.e. introduce a
+  monotonic report counter for this, so that we have strict ordering even with
+  no clock, and if the queue grows too large remove "logarithmically", i.e.
+  for really old stuff only keep one report per week, for really recent stuff
+  one per 5min, and in between logarithmically increasing.
+
+- define portabled auto-attach dir where DDIs can be dropped that are
+  automatically attached after an explicit call to work on it
+
+- portabled attempt counters and automatic fallback with reattachment of
+  portable service
+
+- make vpick assessment counting work
 
 - sysupdate: add health check logic, revert updates if fail
-
-- sysupdate: run things in a loop always, to deal with stepping stones, and
-  adding new transfer files. finish, when stable.
-
-- sysupdate: add flag field for features and components, to require a restart
-  of the update loop once they have been updated.
 
 - confext/sysext: add policy file concept: json files that encode for relevant
   confext/sysext ddis rules when to enable them, i.e. version checks. also use
@@ -150,6 +179,9 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   be useful in particular in CoCo scenarios where a disk encryption key is only
   handed out once an attestation run completed, and might be delivered to the
   node asynchronously.
+
+- ptybroker: maybe dlopen() libtsm and render terminal data locally for the
+  trackBuffer
 
 - acquire a TSA from time stamping server, include it in report
 
@@ -206,16 +238,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   which other node. in particular useful for transient nodes, as it gives them
   a better location
 
-- add a small varlink service that wraps the raw sftp logic (without ssh) after a
-  varlink protocol upgrade, which enables varlink clients to do file transfers,
-  which is in particular useful when accessing a system via http varlink proxy
-
-- add a small varlink service that allocates a pty and then does ptyfwd stuff
-  after a protocol upgrade on the incoming connection. Then spawn a shell/getty
-  on it. This enables varlink clients to acquire a fully featured ssh-like
-  interactive tty/shell via varlink, which is again useful via http varlink
-  proxy.
-
 - add something like podman's conmon as a native systemd subsystem:
   i.e. allocate ptys, that can be bound to stdio/console of containers and VMs,
   that maintain a bit of a scrollback buffer, and one can reconnect to
@@ -237,13 +259,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   sequences of this type, so that every step of the way we get the right
   behaviour.
 
-- implement "varlinkctl trace" or so, that watches socket traffic on a group of
-  processes (select by pid, select by cgroup, select by all machine), and shows
-  traffic of all sockets marked via the new varlink socket xattrs. Use BPF for
-  all of that of course.
-
-- add tooling for generating dictionary-based hostnames
-
 - do not pull dbus daemon/broker anymore, instead lazy activate it. Given how
   the Varlinkifcation has progressed various non-desktop usescase might not
   need D-Bus running at all anymore.
@@ -253,14 +268,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   multiple tables from the same tool we want to separate things with a title,
   hence we might as well associate the title with the table itself, and
   streamline a few things.
-
-- sysupdate: offer reading transfer files/components/features optionally from
-  some JSON fragment rather than transfer files, so that we can update it
-  independently from any DDI, and it needs no activation cycle. Why? so that
-  making additional transfers/components/features available can be done without
-  reloading confext/sysext, and out-band with other configuration changes.
-
-- sysupdate: go through all components, and update them all, one by one.
 
 - pcrextend: we probably should measure /etc/machine-info during boot somehow
 
@@ -325,17 +332,12 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 - **systemd-sysinstall:**
   - read installation definition from json file
-  - polkit support in sysinstall
   - sysinstall: permit driving installer via credentials
   - add --offline=no mode where we talk to socket based services rather than forking off
   - if a user doesn't pick a locale during boot into installer, don't ask again after install, because we suppressed credential propagation
 
 - repart: add MatchLabel= which matches against partition label, so that we
   truly can install different images in parallel
-
-- add "systemctl wait" or so, which does what "systemd-run --wait" does, but
-  for all units. It should be both a way to pin units into memory as well as a
-  wait to retrieve their exit data.
 
 - add "systemd-analyze debug" + AttachDebugger= in unit files: The former
   specifies a command to execute; the latter specifies that an already running
@@ -348,9 +350,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   what it was signed.
 
 - add --vacuum-xyz options to coredumpctl, matching those journalctl already has.
-
-- sysupdate: in .transfer files have a 2nd url that is used if we
-  auto-rollbacked the OS before.
 
 - sysupdate: optionally enrich URL with countme=1 once a week
 
@@ -555,9 +554,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
   ReadWritePaths=:/var/lib/foobar
 
-- add some service that makes an atomic snapshot of PCR state and event log up
-  to that point available, possibly even with quote by the TPM.
-
 - add some special mode to LogsDirectory=/StateDirectory=… that allows
   declaring these directories without necessarily pulling in deps for them, or
   creating them when starting up. That way, we could declare that
@@ -570,18 +566,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   cmdline, and maybe even support a syntax such as
   root=nvme:\<trtype>:\<traddr>:\<trsvcid>:\<nqn>:\<partition> to boot directly from
   nvme-oF
-
-- add support for asymmetric LUKS2 TPM based encryption. i.e. allow preparing
-  an encrypted image on some host given a public key belonging to a specific
-  other host, so that only hosts possessing the private key in the TPM2 chip
-  can decrypt the volume key and activate the volume. Use case: systemd-confext
-  for a central orchestrator to generate confext images securely that can only
-  be activated on one specific host (which can be used for installing a bunch
-  of creds in /etc/credstore/ for example). Extending on this: allow binding
-  LUKS2 TPM based encryption also to the TPM2 internal clock. Net result:
-  prepare a confext image that can only be activated on a specific host that
-  runs a specific software in a specific time window. confext would be
-  automatically invalidated outside of it.
 
 - Add support for extra verity configuration options to systemd-repart (FEC,
   hash type, etc)
@@ -650,9 +634,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - automatically propagate LUKS password credential into cryptsetup from host
   (i.e. SMBIOS type #11, …), so that one can unlock LUKS via VM hypervisor
   supplied password.
-
-- automatically reset specific EFI vars on factory reset (make this generic
-  enough so that infra can be used to erase shim's mok vars?)
 
 - be able to specify a forced restart of service A where service B depends on, in case B
   needs to be auto-respawned?
@@ -964,6 +945,10 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - expose the handoff timestamp fully via the D-Bus properties that contain
   ExecStatus information
 
+- extend the factory reset EFI variable erasing in systemd-boot
+  (LoaderFactoryResetVariables) to other vendors' namespaces, e.g. to erase
+  shim's MOK variables
+
 - extend the smbios11 logic for passing credentials so that instead of passing
   the credential data literally it can also just reference an AF_VSOCK CID/port
   to read them from. This way the data doesn't remain in the SMBIOS blob during
@@ -1176,8 +1161,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
     work for ECDSA keys since their signatures contain a random component, but
     will work for RSA and Ed25519 keys.
 
-- honour validatefs xattrs in dissect-image.c too
-
 - hook up journald with TPMs? measure new journal records to the TPM in regular
   intervals, validate the journal against current TPM state with that. (taking
   inspiration from IMA log)
@@ -1222,9 +1205,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 - **importd/importctl:**
   - complete varlink interface
   - download images into .v/ dirs
-
-- importd: support image signature verification with PKCS#7 + OpenBSD signify
-  logic, as alternative to crummy gpg
 
 - In .socket units, add ConnectStream=, ConnectDatagram=,
   ConnectSequentialPacket= that create a socket, and then *connect to* rather than
@@ -1982,7 +1962,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - pre-calc cryptsetup root key measurement
   - maybe make systemd-repart generate .pcrlock for old and new GPT header in
     /run?
-  - Add support for more than 8 branches per PCR OR
   - add "systemd-pcrlock lock-kernel-current" or so which synthesizes .pcrlock
     policy from currently booted kernel/event log, to close gap for first boot
     for pre-built images
@@ -2527,8 +2506,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   device to dissect. also support dissecting a regular file. useccase: include
   encrypted/verity root fs in UKI.
 
-- systemd-inhibit: make taking delay locks useful: support sending SIGINT or SIGTERM on PrepareForSleep()
-
 - **systemd-measure tool:**
   - pre-calculate PCR 12 (command line) + PCR 13 (sysext) the same way we can precalculate PCR 11
   - add --pcrpkey-auto as an alternative to --pcrpkey=, where it would just use
@@ -2655,7 +2632,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - download multiple arbitrary patterns from same source
   - SHA256SUMS format with bearer tokens for each resource to download
   - decrypt SHA256SUMS with key from tpm
-  - turn http backend stuff int plugin via varlink
   - for each transfer support looking at multiple sources,
     pick source with newest entry. If multiple sources have the same entry, use
     first configured source. Usecase: "sideload" components from local dirs,
@@ -2663,8 +2639,6 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   - support "revoked" items, which cause the client to
     downgrade/upgrade
   - introduce per-user version that can update per-user installed dDIs
-  - make transport pluggable, so people can plug casync or
-    similar behind it, instead of http.
 
 - sysusers: allow specifying a path to an inode *and* a literal UID in the UID
   column, so that if the inode exists it is used, and if not the literal UID is

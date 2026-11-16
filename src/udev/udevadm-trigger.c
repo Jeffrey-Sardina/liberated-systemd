@@ -147,7 +147,8 @@ static int exec_list(
                                 RET_GATHER(ret, r);
                         continue;
                 } else
-                        log_device_debug(d, "Triggered device with action '%s'.", action_str);
+                        log_device_debug(d, "Triggered '%s': ACTION=%s, UUID=%s",
+                                         syspath, action_str, SD_ID128_TO_UUID_STRING(id));
 
                 /* If the user asked for it, write event UUID to stdout */
                 if (arg_uuid)
@@ -200,7 +201,7 @@ static int device_monitor_handler(sd_device_monitor *m, sd_device *dev, void *us
                 printf("settle " SD_ID128_UUID_FORMAT_STR "\n", SD_ID128_FORMAT_VAL(id));
 
         if (set_isempty(settle_ids))
-                return sd_event_exit(sd_device_monitor_get_event(m), 0);
+                return sd_event_exit(sd_device_monitor_get_event(m), /* code= */ 0);
 
         return 0;
 }

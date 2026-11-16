@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-id128.h"
 #include "sd-messages.h"
 
 #include "coredumpctl.h"
@@ -15,18 +16,23 @@
 static int add_match(sd_journal *j, const char *match) {
         _cleanup_free_ char *p = NULL;
         const char *field;
+        char id_str[SD_ID128_STRING_MAX];
+        sd_id128_t id;
         int r;
 
         if (strchr(match, '='))
                 field = NULL;
-        else if (is_path(match)) {
+        else if (sd_id128_from_string(match, &id) >= 0) {
+                match = sd_id128_to_string(id, id_str);
+                field = "COREDUMP_ID";
+        } else if (is_path(match)) {
                 r = path_make_absolute_cwd(match, &p);
                 if (r < 0)
                         return log_error_errno(r, "path_make_absolute_cwd(\"%s\"): %m", match);
 
                 match = p;
                 field = "COREDUMP_EXE";
-        } else if (parse_pid(match, NULL) >= 0)
+        } else if (parse_pid(match, /* ret= */ NULL) >= 0)
                 field = "COREDUMP_PID";
         else
                 field = "COREDUMP_COMM";
@@ -53,6 +59,10 @@ static int add_matches(sd_journal *j, char * const *matches) {
         r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_BACKTRACE_STR, SIZE_MAX);
         if (r < 0)
                 return log_error_errno(r, "Failed to add match \"%s\": %m", "MESSAGE_ID=" SD_MESSAGE_BACKTRACE_STR);
+
+        r = sd_journal_add_conjunction(j);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add conjunction: %m");
 
         STRV_FOREACH(match, matches) {
                 r = add_match(j, *match);
@@ -87,7 +97,7 @@ int acquire_journal(sd_journal **ret, char * const *matches) {
                         return log_error_errno(r, "Failed to open journal: %m");
         }
 
-        r = journal_access_check_and_warn(j, arg_quiet, true);
+        r = journal_access_check_and_warn(j, arg_quiet, /* want_other_users= */ true);
         if (r < 0)
                 return r;
 
@@ -105,15 +115,27 @@ int acquire_journal(sd_journal **ret, char * const *matches) {
 }
 
 int focus(sd_journal *j) {
+        usec_t usec;
         int r;
 
-        r = sd_journal_seek_tail(j);
+        if (arg_until != USEC_INFINITY)
+                r = sd_journal_seek_realtime_usec(j, arg_until);
+        else
+                r = sd_journal_seek_tail(j);
         if (r == 0)
                 r = sd_journal_previous(j);
         if (r < 0)
                 return log_error_errno(r, "Failed to search journal: %m");
         if (r == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "No match found.");
+
+        if (arg_since != USEC_INFINITY) {
+                r = sd_journal_get_realtime_usec(j, &usec);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine timestamp: %m");
+                if (usec < arg_since)
+                        return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "No match found.");
+        }
 
         return 0;
 }

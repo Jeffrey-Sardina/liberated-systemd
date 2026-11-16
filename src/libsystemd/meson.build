@@ -111,6 +111,7 @@ sd_path_sources = files(
 
 sd_netlink_sources = files(
         'sd-netlink/netlink-genl.c',
+        'sd-netlink/netlink-message-genl-ethtool.c',
         'sd-netlink/netlink-message-nfnl.c',
         'sd-netlink/netlink-message-rtnl.c',
         'sd-netlink/netlink-message.c',
@@ -161,10 +162,8 @@ libsystemd_static = static_library(
                         userspace],
         build_by_default : false)
 
-libsystemd_dir_path = meson.current_source_dir()
-
 libsystemd_sym = files('libsystemd.sym')
-libsystemd_sym_path = libsystemd_dir_path / 'libsystemd.sym'
+libsystemd_sym_path = relative_source_path / 'src/libsystemd/libsystemd.sym'
 
 static_libsystemd = get_option('static-libsystemd')
 static_libsystemd_pic = static_libsystemd == 'true' or static_libsystemd == 'pic'
@@ -190,13 +189,10 @@ simple_tests += files(
         'sd-event/test-event-future.c',
         'sd-future/test-channel.c',
         'sd-future/test-fiber.c',
-        'sd-future/test-fiber-io.c',
-        'sd-future/test-fiber-ops.c',
         'sd-future/test-future-group.c',
         'sd-hwdb/test-sd-hwdb.c',
         'sd-id128/test-id128.c',
         'sd-journal/test-catalog.c',
-        'sd-journal/test-journal-file.c',
         'sd-journal/test-journal-flush.c',
         'sd-journal/test-journal-init.c',
         'sd-journal/test-journal-interleaving.c',
@@ -221,6 +217,7 @@ libsystemd_tests += [
         },
         {
                 'sources' : files('sd-bus/test-bus-chat.c'),
+                'io_uring' : true,
         },
         {
                 'sources' : files('sd-bus/test-bus-cleanup.c'),
@@ -238,6 +235,7 @@ libsystemd_tests += [
         },
         {
                 'sources' : files('sd-bus/test-bus-peersockaddr.c'),
+                'io_uring' : true,
         },
         {
                 'sources' : files('sd-bus/test-bus-queue-ref-cycle.c'),
@@ -255,6 +253,7 @@ libsystemd_tests += [
         {
                 'sources' : files('sd-bus/test-bus-watch-bind.c'),
                 'timeout' : 120,
+                'io_uring' : true,
         },
         {
                 'sources' : files('sd-device/test-sd-device.c'),
@@ -265,11 +264,27 @@ libsystemd_tests += [
                 'timeout' : 120,
         },
         {
+                'sources' : files('sd-future/test-fiber-io.c'),
+                'io_uring' : true,
+        },
+        {
+                'sources' : files('sd-future/test-fiber-ops.c'),
+                'io_uring' : true,
+        },
+        {
                 'sources' : files('sd-journal/test-journal-enum.c'),
                 'timeout' : 360,
         },
         {
+                'sources' : files('sd-journal/test-journal-file.c'),
+                'export' : files('sd-journal/journal-test-util.c'),
+        },
+        {
                 'sources' : files('sd-journal/test-journal-append.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('sd-journal/test-journal-benchmark.c'),
                 'type' : 'manual',
         },
         {
@@ -306,4 +321,5 @@ simple_fuzzers += files(
         'sd-bus/fuzz-bus-match.c',
         'sd-bus/fuzz-bus-message.c',
         'sd-hwdb/fuzz-hwdb.c',
+        'sd-journal/fuzz-journal-file.c',
 )

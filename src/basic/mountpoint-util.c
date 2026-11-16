@@ -443,7 +443,7 @@ bool fstype_can_discard(const char *fstype) {
                 return true;
 
         /* On new kernels we can just ask the kernel */
-        return mount_option_supported(fstype, "discard", NULL) > 0;
+        return mount_option_supported(fstype, "discard", /* value= */ NULL) > 0;
 }
 
 const char* fstype_norecovery_option(const char *fstype) {
@@ -461,7 +461,7 @@ const char* fstype_norecovery_option(const char *fstype) {
          * it with rescue=nologreplay, so we check for the new name first and fall back to checking for the
          * old name if the new name doesn't work. */
         if (streq(fstype, "btrfs")) {
-                r = mount_option_supported(fstype, "rescue=nologreplay", NULL);
+                r = mount_option_supported(fstype, "rescue=nologreplay", /* value= */ NULL);
                 if (r == -EAGAIN) {
                         log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming old kernel with 'norecovery': %m");
                         return "norecovery";
@@ -473,7 +473,7 @@ const char* fstype_norecovery_option(const char *fstype) {
         }
 
         /* On new kernels we can just ask the kernel */
-        return mount_option_supported(fstype, "norecovery", NULL) > 0 ? "norecovery" : NULL;
+        return mount_option_supported(fstype, "norecovery", /* value= */ NULL) > 0 ? "norecovery" : NULL;
 }
 
 bool fstype_can_fmask_dmask(const char *fstype) {
@@ -607,9 +607,9 @@ int mount_nofollow(
          * Note that this disables following only for the final component of the target, i.e symlinks within
          * the path of the target are honoured, as are symlinks in the source path everywhere. */
 
-        fd = open(target, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+        fd = xopenat(AT_FDCWD, target, O_PATH|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return mount_fd(source, fd, filesystemtype, mountflags, data);
 }
@@ -660,7 +660,7 @@ bool mount_new_api_supported(void) {
                 return cache;
 
         /* This is the newest API among the ones we use, so use it as boundary */
-        r = RET_NERRNO(mount_setattr(-EBADF, NULL, 0, NULL, 0));
+        r = RET_NERRNO(mount_setattr(-EBADF, /* path= */ NULL, /* flags= */ 0, /* attr= */ NULL, /* size= */ 0));
         if (r == 0 || ERRNO_IS_NOT_SUPPORTED(r)) /* This should return an error if it is working properly */
                 return (cache = false);
 
@@ -689,7 +689,7 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
          * fsconfig() with FSCONFIG_SET_STRING/FSCONFIG_SET_FLAG never fail. Which sucks, because we want to
          * use it for testing support, after all. Let's hence do a check if the file system got converted yet
          * first. */
-        if (fsconfig(fd, FSCONFIG_SET_FD, "adefinitelynotexistingmountoption", NULL, fd) < 0) {
+        if (fsconfig(fd, FSCONFIG_SET_FD, "adefinitelynotexistingmountoption", /* value= */ NULL, fd) < 0) {
                 /* If FSCONFIG_SET_FD is not supported for the fs, then the file system was not converted to
                  * the new mount API yet. If it returns EINVAL the mount option doesn't exist, but the fstype
                  * is converted. */
@@ -704,9 +704,9 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
                 return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN), "FSCONFIG_SET_FD worked unexpectedly for '%s', whoa!", fstype);
 
         if (value)
-                r = fsconfig(fd, FSCONFIG_SET_STRING, key, value, 0);
+                r = fsconfig(fd, FSCONFIG_SET_STRING, key, value, /* aux= */ 0);
         else
-                r = fsconfig(fd, FSCONFIG_SET_FLAG, key, NULL, 0);
+                r = fsconfig(fd, FSCONFIG_SET_FLAG, key, /* value= */ NULL, /* aux= */ 0);
         if (r < 0) {
                 if (errno == EINVAL)
                         return false; /* EINVAL means option not supported. */

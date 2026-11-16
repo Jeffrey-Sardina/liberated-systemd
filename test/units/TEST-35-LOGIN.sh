@@ -78,6 +78,145 @@ EOF
     rm -rf /run/systemd/logind.conf.d
 }
 
+teardown_boot_loader_entries_symlink() (
+    set +eux
+
+    rm -rf /run/boot-loader-entries
+
+    return 0
+)
+
+testcase_boot_loader_entries_symlink() {
+    local loader_entries var=/sys/firmware/efi/efivars/LoaderEntries-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+
+    if [[ -e /run/boot-loader-entries ]]; then
+        echo "/run/boot-loader-entries already exists, skipping."
+        return 0
+    fi
+
+    trap teardown_boot_loader_entries_symlink RETURN
+
+    if [[ -e "$var" ]]; then
+        # Skip the attributes, the rest is a list of NUL terminated UTF-16 strings.
+        loader_entries="$(od -An -v -tu2 -j4 "$var" | jq -s -c 'implode | split("\u0000") | map(select(. != "")) | unique')"
+    else
+        loader_entries="[]"
+    fi
+
+    # Symlinks are not allowed in the boot loader entries tree (see #44636). Loading the entries fails,
+    # but reading the properties must not, and the entries reported by the boot loader must be listed.
+    mkdir -p /run/boot-loader-entries/loader.0/entries
+    ln -s loader.0 /run/boot-loader-entries/loader
+
+    assert_eq "$(busctl --json=short get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager BootLoaderEntries | jq -c '.data | unique')" "$loader_entries"
+    busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.DBus.Properties GetAll s org.freedesktop.login1.Manager >/dev/null
+}
+
+test_kill_user_process() {
+    local su=${1:?}
+    local username=${2:?}
+    local should_kill=${3:?}
+    local pid
+
+    pid=$("$su" -l "$username" -c 'nohup sleep 300 </dev/null >/dev/null 2>&1 & echo $!')
+
+    if "$should_kill"; then
+        timeout 30 bash -c "while ps -p $pid >/dev/null; do sleep .5; done"
+    else
+        sleep 2
+        ps -p "$pid" -o pid,args
+        kill -TERM "$pid"
+    fi
+}
+
+testcase_kill_user_processes() {
+    local su="su"
+
+    # su/runuser -l does not propagate LD_PRELOAD.
+    if [[ -v ASAN_OPTIONS ]]; then
+        echo "ASan is enabled, skipping the testcase."
+        return
+    fi
+
+    # Arch does not use pam_systemd.so in su-l pam setting.
+    if ( . /etc/os-release; [[ "$ID" == "arch" ]] ); then
+        su="runuser"
+    fi
+
+    mkdir -p /run/systemd/logind.conf.d
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser root
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    rm -rf /run/systemd/logind.conf.d
+    systemctl reload systemd-logind.service
+}
+
 testcase_sleep_automated() {
     assert_eq "$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager SleepOperation)" 'as 3 "suspend-then-hibernate" "suspend" "hibernate"'
 
@@ -133,6 +272,11 @@ teardown_suspend() (
 
 testcase_suspend_on_lid() {
     local pid input_name lid_dev
+
+    if [[ ! -x /usr/lib/systemd/systemd-sleep ]]; then
+        echo "systemd-sleep is not installed, skipping suspend test"
+        return
+    fi
 
     if systemd-detect-virt --quiet --container; then
         echo "Skipping suspend test in container"
@@ -271,6 +415,9 @@ cleanup_session() (
 
     systemctl stop getty@tty2.service
 
+    rm -rf /run/systemd/system/getty@tty2.service.d
+    systemctl daemon-reload
+
     for s in $(loginctl --no-legend list-sessions | grep -v manager | awk '$3 == "logind-test-user" { print $1 }'); do
         echo "INFO: stopping session $s"
         loginctl terminate-session "$s"
@@ -298,9 +445,6 @@ cleanup_session() (
     if ! timeout 30 bash -c "while systemctl is-active --quiet user-${uid}.slice; do sleep 1; done"; then
         echo "WARNING: user-${uid}.slice is still active, ignoring."
     fi
-
-    rm -rf /run/systemd/system/getty@tty2.service.d
-    systemctl daemon-reload
 
     return 0
 )
@@ -1136,8 +1280,33 @@ testcase_restart() {
     done
 }
 
+testcase_inhibit_default() {
+    local mode what inhibitor_out
+    local -a args
+
+    for mode in delay block; do
+        args=()
+        what='["idle", "shutdown", "sleep"]'
+        if [[ "$mode" == delay ]]; then
+            args=(--mode=delay)
+            what='["shutdown", "sleep"]'
+        fi
+
+        # Query from the inhibited command so the lock is held throughout the query.
+        inhibitor_out=$(systemd-inhibit "${args[@]}" --who="inhibit-default-$mode" \
+            varlinkctl call --more /run/systemd/io.systemd.Login io.systemd.Login.ListInhibitors '{}')
+        echo "$inhibitor_out" | jq --seq --slurp -e --arg mode "$mode" --argjson what "$what" '
+            map(select(.context.Who == ("inhibit-default-" + $mode))) |
+            length == 1 and all(.[]; .context.Mode == $mode and (.context.What | sort) == $what)
+        ' >/dev/null
+    done
+
+    (! systemd-inhibit --mode=delay --what=idle true)
+}
+
 setup_test_user
 test_write_dropin
 run_testcases
+run_subtests
 
 touch /testok

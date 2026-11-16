@@ -13,6 +13,7 @@
 #include "strv.h"
 #include "systemctl.h"
 #include "systemctl-util.h"
+#include "tests.h"
 
 static int verb_noop(int argc, char *argv[], uintptr_t _data, void *userdata) { return 0; }
 _alias_(verb_noop)
@@ -54,6 +55,7 @@ _alias_(verb_noop)
         verb_start_system_special,
         verb_switch_root,
         verb_trivial_method,
+        verb_wait,
         verb_whoami;
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -84,9 +86,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (getenv_bool("SYSTEMD_FUZZ_OUTPUT") <= 0) {
                 orig_stdout_fd = fcntl(fileno(stdout), F_DUPFD_CLOEXEC, 3);
                 if (orig_stdout_fd < 0)
-                        log_warning_errno(orig_stdout_fd, "Failed to duplicate fd 1: %m");
+                        log_warning_errno(errno, "Failed to duplicate fd 1, ignoring: %m");
                 else
-                        assert_se(freopen("/dev/null", "w", stdout));
+                        ASSERT_NOT_NULL(freopen("/dev/null", "w", stdout));
         }
 
         /* We need to reset some global state manually here since libfuzzer feeds a single process with
@@ -103,7 +105,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 log_info(r == 0 ? "Done!" : "Action!");
 
         if (orig_stdout_fd >= 0)
-                assert_se(freopen(FORMAT_PROC_FD_PATH(orig_stdout_fd), "w", stdout));
+                ASSERT_NOT_NULL(freopen(FORMAT_PROC_FD_PATH(orig_stdout_fd), "w", stdout));
 
         release_busses(); /* We open the bus for communication with logind.
                            * It needs to be closed to avoid apparent leaks. */

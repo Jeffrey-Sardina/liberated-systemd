@@ -36,12 +36,12 @@ int device_add_property(sd_device *device, const char *key, const char *value) {
         assert(device);
         assert(key);
 
-        r = device_add_property_aux(device, key, value, false);
+        r = device_add_property_aux(device, key, value, /* db= */ false);
         if (r < 0)
                 return r;
 
         if (key[0] != '.') {
-                r = device_add_property_aux(device, key, value, true);
+                r = device_add_property_aux(device, key, value, /* db= */ true);
                 if (r < 0)
                         return r;
         }
@@ -58,7 +58,7 @@ int device_add_propertyf(sd_device *device, const char *key, const char *format,
         assert(key);
 
         if (!format)
-                return device_add_property(device, key, NULL);
+                return device_add_property(device, key, /* value= */ NULL);
 
         va_start(ap, format);
         r = vasprintf(&value, format, ap);
@@ -282,7 +282,7 @@ static int device_amend(sd_device *device, const char *key, const char *value) {
                 path = strjoina("/sys", value);
 
                 /* the caller must verify or trust this data (e.g., if it comes from the kernel) */
-                r = device_set_syspath(device, path, false);
+                r = device_set_syspath(device, path, /* verify= */ false);
                 if (r < 0)
                         return log_device_debug_errno(device, r, "sd-device: Failed to set syspath to '%s': %m", path);
         } else if (streq(key, "SUBSYSTEM")) {
@@ -346,7 +346,7 @@ static int device_amend(sd_device *device, const char *key, const char *value) {
                         /* udev rules may set escaped strings, and sd-device does not modify the input
                          * strings. So, it is also necessary to keep the strings received through
                          * sd-device-monitor. */
-                        r = extract_first_word(&p, &word, NULL, EXTRACT_RETAIN_ESCAPE);
+                        r = extract_first_word(&p, &word, /* separators= */ NULL, EXTRACT_RETAIN_ESCAPE);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -461,8 +461,6 @@ static int device_verify(sd_device *device) {
                                                       "sd-device: Failed to set driver subsystem: %m");
         }
 
-        device->sealed = true;
-
         return 0;
 }
 
@@ -477,6 +475,8 @@ int device_new_from_strv(sd_device **ret, char **strv) {
         r = device_new_aux(&device);
         if (r < 0)
                 return r;
+
+        device_seal(device);
 
         STRV_FOREACH(key, strv) {
                 r = device_append(device, *key, &major, &minor);
@@ -511,6 +511,8 @@ int device_new_from_nulstr(sd_device **ret, char *nulstr, size_t len) {
         r = device_new_aux(&device);
         if (r < 0)
                 return r;
+
+        device_seal(device);
 
         for (size_t i = 0; i < len; ) {
                 char *key;
@@ -661,10 +663,10 @@ int device_clone_with_db(sd_device *device, sd_device **ret) {
                 return r;
 
         /* Seal device to prevent reading the uevent file, as the device may have been already removed. */
-        dest->sealed = true;
+        device_seal(dest);
 
         /* Copy syspath, then also devname, sysname or sysnum can be obtained. */
-        r = device_set_syspath(dest, device->syspath, false);
+        r = device_set_syspath(dest, device->syspath, /* verify= */ false);
         if (r < 0)
                 return r;
 
@@ -770,7 +772,7 @@ static int device_tag(sd_device *device, const char *tag, bool add) {
         path = strjoina("/run/udev/tags/", tag, "/", id);
 
         if (add)
-                return touch_file(path, true, USEC_INFINITY, UID_INVALID, GID_INVALID, 0444);
+                return touch_file(path, /* parents= */ true, USEC_INFINITY, UID_INVALID, GID_INVALID, 0444);
 
         if (unlink(path) < 0 && errno != ENOENT)
                 return -errno;

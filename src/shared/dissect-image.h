@@ -4,6 +4,7 @@
 #include "sd-id128.h"
 
 #include "architecture.h"
+#include "ask-password-api.h"
 #include "forward.h"
 #include "gpt.h"
 #include "iovec-util.h"
@@ -18,6 +19,7 @@ typedef struct DissectedPartition {
         int partno;                 /* -1 if there was no partition and the images contains a file system directly */
         Architecture architecture;  /* Intended architecture: either native, secondary or unset ARCHITECTURE_INVALID. */
         sd_id128_t uuid;            /* Partition entry UUID as reported by the GPT */
+        sd_id128_t type_uuid;       /* Partition type UUID as reported by the GPT */
         char *fstype;
         char *node;
         char *label;
@@ -81,7 +83,17 @@ typedef enum DissectImageFlags {
         DISSECT_IMAGE_ALLOW_INTERACTIVE_AUTH    = 1 << 27, /* Allow interactive authorization when going through mountfsd */
         DISSECT_IMAGE_FOREIGN_UID               = 1 << 28, /* Request a foreign UID range mapping */
         DISSECT_IMAGE_IDENTITY_UID              = 1 << 29, /* Explicitly request an identity UID range mapping */
+        DISSECT_IMAGE_TPM2_UNLOCK               = 1 << 30, /* If no passphrase is supplied, try unlocking LUKS partitions via a TPM2 token enrolled in the LUKS2 header */
+        DISSECT_IMAGE_VERITY_SHARE_SAME_FILE     = 1U << 31, /* Reused Verity devices must have the same backing image file. */
 } DissectImageFlags;
+
+typedef enum PartitionTableType {
+        PARTITION_GPT,
+        PARTITION_MBR,
+        PARTITION_BARE,            /* No partition table, the image contains a file system directly */
+        _PARTITION_TABLE_TYPE_MAX,
+        _PARTITION_TABLE_TYPE_INVALID = -EINVAL,
+} PartitionTableType;
 
 typedef struct DissectedImage {
         bool encrypted:1;
@@ -89,7 +101,8 @@ typedef struct DissectedImage {
         bool has_verity_sig:1;     /* pkcs#7 signature embedded in image */
         bool verity_ready:1;       /* verity available, fully specified and usable */
         bool verity_sig_ready:1;   /* verity signature logic, fully specified and usable */
-        bool single_file_system:1; /* MBR/GPT or single file system */
+
+        PartitionTableType partition_table_type;
 
         LoopDevice *loop;
         DissectedPartition partitions[_PARTITION_DESIGNATOR_MAX];
@@ -145,6 +158,8 @@ typedef struct ExtensionReleaseData {
         char *os_release_version_id;
         char *os_release_sysext_level;
         char *os_release_confext_level;
+        char *os_release_image_id;
+        char *os_release_image_version;
         char *os_release_extension_scope;
 } ExtensionReleaseData;
 
@@ -157,7 +172,7 @@ int mount_options_to_string(const MountOptions *mount_options, char **ret);
 
 int probe_filesystem_full(int fd, const char *path, uint64_t offset, uint64_t size, bool restrict_fstypes, char **ret_fstype);
 static inline int probe_filesystem(const char *path, char **ret_fstype) {
-        return probe_filesystem_full(-1, path, 0, UINT64_MAX, /* bool restrict_fstypes= */ false, ret_fstype);
+        return probe_filesystem_full(-1, path, /* offset= */ 0, UINT64_MAX, /* restrict_fstypes= */ false, ret_fstype);
 }
 
 int probe_partition_table(int fd, char **ret_pttype);
@@ -174,7 +189,7 @@ DissectedImage* dissected_image_unref(DissectedImage *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(DissectedImage*, dissected_image_unref);
 
 int dissected_image_decrypt(DissectedImage *m, const char *root, const char *passphrase, const VeritySettings *verity, const ImagePolicy *image_policy, DissectImageFlags flags);
-int dissected_image_decrypt_interactively(DissectedImage *m, const char *passphrase, const VeritySettings *verity, const ImagePolicy *image_policy, DissectImageFlags flags);
+int dissected_image_decrypt_interactively(DissectedImage *m, const char *passphrase, AskPasswordFlags ask_password_flags, const VeritySettings *verity, const ImagePolicy *image_policy, DissectImageFlags flags);
 int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift, uid_t uid_range, int userns_fd, DissectImageFlags flags);
 int dissected_image_mount_and_warn(DissectedImage *m, const char *where, uid_t uid_shift, uid_t uid_range, int userns_fd, DissectImageFlags flags);
 
@@ -207,6 +222,7 @@ bool image_filter_test(const ImageFilter *filter, PartitionDesignator d, const c
 int image_filter_parse(const char *s, ImageFilter **ret);
 
 int verity_settings_load(VeritySettings *verity, const char *image, const char *root_hash_path, const char *root_hash_sig_path);
+int verity_validate_signature_userspace(const struct iovec *root_hash, const struct iovec *root_hash_sig, const char *root);
 
 static inline bool verity_settings_set(const VeritySettings *settings) {
         return settings &&
@@ -240,7 +256,18 @@ bool dissected_image_verity_candidate(const DissectedImage *image, PartitionDesi
 bool dissected_image_verity_ready(const DissectedImage *image, PartitionDesignator d);
 bool dissected_image_verity_sig_ready(const DissectedImage *image, PartitionDesignator d);
 
-int mount_image_privately_interactively(const char *image, const ImagePolicy *image_policy, DissectImageFlags flags, char **ret_directory, int *ret_dir_fd, LoopDevice **ret_loop_device);
+int mount_image_privately_full(const char *image, const ImagePolicy *image_policy, DissectImageFlags flags, const char *passphrase, AskPasswordFlags ask_password_flags, char **ret_directory, int *ret_dir_fd, LoopDevice **ret_loop_device);
+static inline int mount_image_privately_interactively(const char *image, const ImagePolicy *image_policy, DissectImageFlags flags, char **ret_directory, int *ret_dir_fd, LoopDevice **ret_loop_device) {
+        return mount_image_privately_full(
+                        image,
+                        image_policy,
+                        flags,
+                        /* passphrase= */ NULL,
+                        /* ask_password_flags= */ 0,
+                        ret_directory,
+                        ret_dir_fd,
+                        ret_loop_device);
+}
 
 int verity_dissect_and_mount(
                 int src_fd,
@@ -287,8 +314,9 @@ int mountfsd_mount_image(sd_varlink *vl, const char *path, int userns_fd, const 
 int mountfsd_mount_directory_fd(sd_varlink *vl, int directory_fd, int userns_fd, DissectImageFlags flags, int *ret_mount_fd);
 int mountfsd_mount_directory(sd_varlink *vl, const char *path, int userns_fd, DissectImageFlags flags, int *ret_mount_fd);
 
-int mountfsd_make_directory_fd(sd_varlink *vl, int parent_fd, const char *name, mode_t mode, DissectImageFlags flags, int *ret_directory_fd);
-int mountfsd_make_directory(sd_varlink *vl, const char *path, mode_t mode, DissectImageFlags flags, int *ret_directory_fd);
+int mkdir_foreign_at_full(int parent_fd, const char *name, mode_t mode, XOpenFlags xopen_flags, int *ret_directory_fd);
+int mkdir_foreign_at(int parent_fd, const char *name, mode_t mode, int *ret_directory_fd);
+int mkdir_foreign(const char *path, mode_t mode, int *ret_directory_fd);
 
 int copy_tree_at_foreign(int source_fd, int target_fd, int userns_fd);
 int remove_tree_foreign(const char *path, int userns_fd);

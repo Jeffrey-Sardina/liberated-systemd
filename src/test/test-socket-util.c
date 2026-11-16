@@ -2,12 +2,18 @@
 
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/if_arp.h>
+#include <linux/if_ether.h>
+#include <linux/if_infiniband.h>
+#include <linux/pidfd.h>
 #include <linux/pkt_sched.h>
 #include <netinet/ip.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fs-util.h"
@@ -15,6 +21,7 @@
 #include "iovec-util.h"
 #include "log.h"
 #include "path-util.h"
+#include "pidfd-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
@@ -45,8 +52,8 @@ TEST(ifname_valid) {
         ASSERT_TRUE(ifname_valid("foo.bar"));
         ASSERT_FALSE(ifname_valid("x:y"));
 
-        ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxx", 0));
-        ASSERT_FALSE(ifname_valid_full("xxxxxxxxxxxxxxxx", 0));
+        ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxx", /* flags= */ 0));
+        ASSERT_FALSE(ifname_valid_full("xxxxxxxxxxxxxxxx", /* flags= */ 0));
         ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
         ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
         ASSERT_FALSE(ifname_valid_full("999", IFNAME_VALID_ALTERNATIVE));
@@ -136,6 +143,35 @@ TEST(sockaddr_un_len) {
         ASSERT_EQ(sockaddr_un_len(&abstract), offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract.sun_path + 1));
 }
 
+TEST(sockaddr_ll_len) {
+        union sockaddr_union sa = {
+                .ll.sll_family = AF_PACKET,
+        };
+
+        /* Without any hardware type or address length, the plain structure size is used. */
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), sizeof(struct sockaddr_ll));
+
+        /* An Ethernet address fits into sll_addr. */
+        sa.ll.sll_hatype = htobe16(ARPHRD_ETHER);
+        sa.ll.sll_halen = ETH_ALEN;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), sizeof(struct sockaddr_ll));
+
+        /* An InfiniBand address runs over sll_addr, and the length must cover it. */
+        sa.ll.sll_hatype = htobe16(ARPHRD_INFINIBAND);
+        sa.ll.sll_halen = INFINIBAND_ALEN;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), offsetof(struct sockaddr_ll, sll_addr) + INFINIBAND_ALEN);
+
+        /* The kernel only looks at sll_halen when sending, hence the length must follow it even when
+         * the hardware type is not set. */
+        sa.ll.sll_hatype = 0;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), offsetof(struct sockaddr_ll, sll_addr) + INFINIBAND_ALEN);
+
+        /* The largest address the helper accepts must still fit into the buffer reserved for it in
+         * sockaddr_union. */
+        sa.ll.sll_halen = HW_ADDR_MAX_SIZE;
+        ASSERT_LE(sockaddr_ll_len(&sa.ll), sizeof(sa.ll_buffer));
+}
+
 TEST(in_addr_is_multicast) {
         union in_addr_union a, b;
         int f;
@@ -156,7 +192,7 @@ TEST(in_addr_is_multicast) {
 TEST(getpeercred_getpeergroups) {
         int r;
 
-        r = ASSERT_OK(pidref_safe_fork("(getpeercred)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(getpeercred)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 static const gid_t gids[] = { 3, 4, 5, 6, 7 };
@@ -200,8 +236,7 @@ TEST(getpeercred_getpeergroups) {
                         r = ASSERT_OK_OR(getpeergroups(pair[0], &peer_groups), -EOPNOTSUPP, -ENOPROTOOPT);
 
                         if (r >= 0) {
-                                ASSERT_EQ((size_t) r, n_test_gids);
-                                ASSERT_EQ(memcmp(peer_groups, test_gids, sizeof(gid_t) * n_test_gids), 0);
+                                ASSERT_MEMEQ_NN(peer_groups, sizeof(gid_t) * (size_t) r, test_gids, sizeof(gid_t) * n_test_gids);
                         }
                 }
 
@@ -217,7 +252,7 @@ TEST(passfd_read) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(passfd_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(passfd_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -226,7 +261,7 @@ TEST(passfd_read) {
                 char tmpfile[] = "/tmp/test-socket-util-passfd-read-XXXXXX";
                 ASSERT_OK_ZERO(write_tmpfile(tmpfile, file_contents));
 
-                _cleanup_close_ int tmpfd = ASSERT_OK_ERRNO(open(tmpfile, O_RDONLY));
+                _cleanup_close_ int tmpfd = ASSERT_OK(xopenat(AT_FDCWD, tmpfile, O_RDONLY));
                 ASSERT_OK_ERRNO(unlink(tmpfile));
 
                 ASSERT_OK_ZERO(send_one_fd(pair[1], tmpfd, MSG_DONTWAIT));
@@ -246,6 +281,31 @@ TEST(passfd_read) {
         ssize_t n = ASSERT_OK_ERRNO(read(fd, buf, sizeof(buf)-1));
         buf[n] = 0;
         ASSERT_STREQ(buf, file_contents);
+
+        /* recvmsg_safe() implies MSG_CMSG_CLOEXEC */
+        int fl = ASSERT_OK_ERRNO(fcntl(fd, F_GETFD));
+        ASSERT_TRUE(FLAGS_SET(fl, FD_CLOEXEC));
+}
+
+TEST(recvmsg_safe_packet) {
+        /* AF_PACKET refuses MSG_CMSG_CLOEXEC with EINVAL, recvmsg_safe() must only pass it for AF_UNIX */
+        _cleanup_close_ int fd = socket(AF_PACKET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+                if (ERRNO_IS_PRIVILEGE(errno) || ERRNO_IS_NOT_SUPPORTED(errno))
+                        return (void) log_tests_skipped_errno(errno, "Failed to create AF_PACKET socket");
+                ASSERT_OK_ERRNO(fd);
+        }
+
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int))) control = {};
+        char buf[1];
+        struct msghdr msg = {
+                .msg_iov = &IOVEC_MAKE(buf, sizeof(buf)),
+                .msg_iovlen = 1,
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
+        };
+
+        ASSERT_ERROR(recvmsg_safe(fd, &msg, MSG_DONTWAIT), EAGAIN);
 }
 
 TEST(passfd_contents_read) {
@@ -256,7 +316,7 @@ TEST(passfd_contents_read) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -267,7 +327,7 @@ TEST(passfd_contents_read) {
 
                 ASSERT_OK_ZERO(write_tmpfile(tmpfile, file_contents));
 
-                _cleanup_close_ int tmpfd = ASSERT_OK_ERRNO(open(tmpfile, O_RDONLY));
+                _cleanup_close_ int tmpfd = ASSERT_OK(xopenat(AT_FDCWD, tmpfile, O_RDONLY));
                 ASSERT_OK_ERRNO(unlink(tmpfile));
 
                 ASSERT_OK_POSITIVE(send_one_fd_iov(pair[1], tmpfd, &iov, 1, MSG_DONTWAIT));
@@ -299,7 +359,7 @@ TEST(receive_nopassfd) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(receive_nopassfd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(receive_nopassfd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -333,7 +393,7 @@ TEST(send_nodata_nofd) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(send_nodata_nofd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(send_nodata_nofd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -363,7 +423,7 @@ TEST(send_emptydata) {
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(send_emptydata)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(send_emptydata)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -476,7 +536,7 @@ TEST(sockaddr_un_set_path) {
         free(j);
         ASSERT_NOT_NULL(j = path_join(t, "sock"));
 
-        ASSERT_OK_ERRNO(fd3 = open(j, O_CLOEXEC|O_PATH|O_NOFOLLOW));
+        ASSERT_OK(fd3 = xopenat(AT_FDCWD, j, O_PATH|O_NOFOLLOW));
         ASSERT_OK(sockaddr_un_set_path(&sa.un, FORMAT_PROC_FD_PATH(fd3))); /* connect via O_PATH instead, circumventing 108ch limit */
 
         ASSERT_OK_ERRNO(connect(fd2, &sa.sa, sockaddr_len(&sa)));
@@ -501,6 +561,75 @@ TEST(getpeerpidref) {
         ASSERT_TRUE(!pidref_equal(&pidref_self, &pidref_pid1));
         ASSERT_TRUE(!pidref_equal(&pidref1, &pidref_pid1));
         ASSERT_TRUE(!pidref_equal(&pidref0, &pidref_pid1));
+}
+
+typedef struct SocketpairThread {
+        int sync_fd;
+        int *fd;
+        pid_t tid;
+} SocketpairThread;
+
+static void* socketpair_thread(void *p) {
+        SocketpairThread *t = ASSERT_PTR(p);
+        char x;
+
+        t->tid = gettid();
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, t->fd));
+
+        /* let main thread know the socket pair exists */
+        ASSERT_OK_EQ_ERRNO(write(t->sync_fd, &(const char) { 'x' }, 1), 1);
+
+        /* stay alive until the main thread is done looking at us */
+        ASSERT_OK_EQ_ERRNO(read(t->sync_fd, &x, 1), 1);
+        return NULL;
+}
+
+TEST(getpeerpidfd_thread) {
+        _cleanup_close_pair_ int sync_fd[2] = EBADF_PAIR, fd[2] = EBADF_PAIR;
+        SocketpairThread t = { .fd = fd };
+        pthread_t thread;
+        char x;
+        int r;
+
+        /* Make some doorbells for chatting with the child thread */
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, sync_fd));
+        t.sync_fd = sync_fd[0];
+
+        _cleanup_close_ int pidfd = getpeerpidfd(sync_fd[0]);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(pidfd))
+                return (void) log_tests_skipped_errno(pidfd, "SO_PEERPIDFD not supported");
+        ASSERT_OK(pidfd);
+
+        /* Have the child thread start to fill out its info and create its own socketpair */
+        ASSERT_EQ(pthread_create(&thread, NULL, &socketpair_thread, &t), 0);
+        ASSERT_OK_EQ_ERRNO(read(sync_fd[1], &x, 1), 1);
+        ASSERT_NE(t.tid, getpid_cached());
+
+        /* Make sure SO_PEERPIDFD returns the thread-group leader still on the child's socketpair */
+        _cleanup_(pidref_done) PidRef leader = PIDREF_NULL, self = PIDREF_NULL;
+        r = ASSERT_OK(getpeerpidfd(fd[0]));
+        ASSERT_OK(pidref_set_pidfd_consume(&leader, r));
+        ASSERT_OK(pidref_set_self(&self));
+        ASSERT_TRUE(pidref_equal(&leader, &self));
+
+        /* Make sure SO_PEERPIDFD_THREAD is returning the thread id on the child's socketpair */
+        _cleanup_(pidref_done) PidRef tidref = PIDREF_NULL;
+        r = getpeerpidfd_full(fd[0], PIDFD_THREAD);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                log_tests_skipped_errno(r, "SO_PEERPIDFD_THREAD not supported");
+        else {
+                ASSERT_OK(r);
+                ASSERT_OK(pidref_set_pidfd_consume(&tidref, r));
+                ASSERT_EQ(tidref.pid, t.tid);
+
+                /* Confirm that the pidfd still shows us as the tgid field */
+                struct pidfd_info info = { .mask = PIDFD_INFO_PID };
+                ASSERT_OK(pidfd_get_info(tidref.fd, &info));
+                ASSERT_EQ((pid_t) info.tgid, getpid_cached());
+        }
+
+        ASSERT_OK_EQ_ERRNO(write(sync_fd[1], &(const char) { 'x' }, 1), 1);
+        ASSERT_EQ(pthread_join(thread, NULL), 0);
 }
 
 TEST(tos_to_priority) {

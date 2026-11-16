@@ -205,7 +205,7 @@ int localtime_or_gmtime_usec(usec_t t, bool utc, struct tm *ret);
 int parse_calendar_date_full(const char *s, bool allow_pre_epoch, usec_t *ret_usec, struct tm *ret_tm);
 
 static inline int parse_calendar_date(const char *s, usec_t *ret) {
-        return parse_calendar_date_full(s, /* allow_pre_epoch= */ false, ret, NULL);
+        return parse_calendar_date_full(s, /* allow_pre_epoch= */ false, ret, /* ret_tm= */ NULL);
 }
 
 /* this is just an empty value used elsewhere. It does not enable surveillance, but is used

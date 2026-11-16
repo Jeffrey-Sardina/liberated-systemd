@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -10,6 +11,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "initrd-util.h"
 #include "label-util.h"
 #include "log.h"
 #include "mkdir.h"
@@ -330,7 +332,7 @@ static int mount_one(const MountPoint *p, bool relabel) {
 
         /* Relabel again, since we now mounted something fresh here */
         if (relabel)
-                (void) label_fix(p->where, 0);
+                (void) label_fix(p->where, /* flags= */ 0);
 
         if (FLAGS_SET(p->mode, MNT_CHECK_WRITABLE))
                 if (access(p->where, W_OK) < 0) {
@@ -390,7 +392,7 @@ static int relabel_cb(
 
         default:
                 /* Otherwise, label it, even if we had trouble stat()ing it and similar. SELinux can figure this out */
-                (void) label_fix(path, 0);
+                (void) label_fix(path, /* flags= */ 0);
                 return RECURSE_DIR_CONTINUE;
         }
 }
@@ -398,7 +400,7 @@ static int relabel_cb(
 static int relabel_tree(const char *path) {
         int r;
 
-        r = recurse_dir_at(AT_FDCWD, path, 0, UINT_MAX, RECURSE_DIR_ENSURE_TYPE|RECURSE_DIR_SAME_MOUNT, relabel_cb, NULL);
+        r = recurse_dir_at(AT_FDCWD, path, /* statx_mask= */ 0, UINT_MAX, RECURSE_DIR_ENSURE_TYPE|RECURSE_DIR_SAME_MOUNT, relabel_cb, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to recursively relabel '%s': %m", path);
 
@@ -417,7 +419,7 @@ static int relabel_extra(void) {
          * possible.
          */
 
-        r = conf_files_list(&files, ".relabel", NULL,
+        r = conf_files_list(&files, ".relabel", /* root= */ NULL,
                             CONF_FILES_FILTER_MASKED | CONF_FILES_REGULAR | CONF_FILES_WARN,
                             "/run/systemd/relabel-extra.d/");
         if (r < 0)
@@ -456,7 +458,7 @@ static int relabel_extra(void) {
                         }
 
                         log_debug("Relabelling additional file/directory '%s'.", line);
-                        (void) label_fix(line, 0);
+                        (void) label_fix(line, /* flags= */ 0);
                         (void) relabel_tree(line);
                         c++;
                 }
@@ -474,7 +476,7 @@ static int relabel_extra(void) {
 }
 #endif
 
-int mount_setup(bool loaded_policy, bool leave_propagation) {
+int mount_setup(bool loaded_policy, bool skip_setup) {
         int r;
 
         r = mount_points_setup(ELEMENTSOF(mount_table), loaded_policy);
@@ -508,7 +510,7 @@ int mount_setup(bool loaded_policy, bool leave_propagation) {
         /* Create a few default symlinks, which are normally created
          * by udevd, but some scripts might need them before we start
          * udevd. */
-        dev_setup(NULL, UID_INVALID, GID_INVALID);
+        dev_setup(/* prefix= */ NULL, UID_INVALID, GID_INVALID);
 
         /* Mark the root directory as shared in regards to mount propagation. The kernel defaults to "private", but we
          * think it makes more sense to have a default of "shared" so that nspawn and the container tools work out of
@@ -516,9 +518,30 @@ int mount_setup(bool loaded_policy, bool leave_propagation) {
          * needed. Note that we set this only when we are invoked directly by the kernel. If we are invoked by a
          * container manager we assume the container manager knows what it is doing (for example, because it set up
          * some directories with different propagation modes). */
-        if (detect_container() <= 0 && !leave_propagation)
-                if (mount(NULL, "/", NULL, MS_REC|MS_SHARED, NULL) < 0)
+        if (detect_container() <= 0 && !skip_setup)
+                if (mount(/* source= */ NULL, "/", /* filesystemtype= */ NULL, MS_REC|MS_SHARED, /* data= */ NULL) < 0)
                         log_warning_errno(errno, "Failed to set up the root directory for shared mount propagation: %m");
+
+        /* The kernel mounts its rootfs as a tmpfs if neither root= nor rootfstype= is specified on the kernel
+         * command line, or if rootfstype= contains "tmpfs". The root directory of a tmpfs has mode 1777 by
+         * default, hence the initrd of a UKI boot runs with a world-writable root directory. chase() with
+         * CHASE_MAX_MODE fails for every path below a directory that is writable for others, hence
+         * systemd-keyring-setup cannot read any certificate in such an initrd. Remove the write bit for
+         * others before any service starts. On the host, tmpfiles.d/root.conf sets the mode of the root
+         * directory. skip_setup is set on daemon-reexec, the mode is not changed then. */
+        if (!skip_setup && in_initrd()) {
+                struct stat st;
+
+                if (stat("/", &st) < 0)
+                        log_warning_errno(errno, "Failed to stat the root directory, ignoring: %m");
+                else if (st.st_mode & S_IWOTH) {
+                        mode_t m = st.st_mode & 07777 & ~S_IWOTH;
+
+                        log_debug("Root directory has mode %04o, changing to %04o.", st.st_mode & 07777, m);
+                        if (chmod("/", m) < 0)
+                                log_warning_errno(errno, "Failed to change the mode of the root directory, ignoring: %m");
+                }
+        }
 
         /* Create a few directories we always want around, Note that sd_booted() checks for /run/systemd/system, so
          * this mkdir really needs to stay for good, otherwise software that copied sd-daemon.c into their sources will

@@ -124,6 +124,38 @@ _public_ int sd_pid_get_cgroup(pid_t pid, char **ret_cgroup) {
         return 0;
 }
 
+_public_ int sd_pid_get_unit_cgroup(pid_t pid, char **ret_cgroup) {
+        int r;
+
+        assert_return(pid >= 0, -EINVAL);
+
+        _cleanup_free_ char *c = NULL;
+        r = cg_pid_get_unit_path(pid, &c);
+        if (r < 0)
+                return IN_SET(r, -ENXIO, -ENOMEDIUM) ? -ENODATA : r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(c);
+
+        return 0;
+}
+
+_public_ int sd_pid_get_user_unit_cgroup(pid_t pid, char **ret_cgroup) {
+        int r;
+
+        assert_return(pid >= 0, -EINVAL);
+
+        _cleanup_free_ char *c = NULL;
+        r = cg_pid_get_user_unit_path(pid, &c);
+        if (r < 0)
+                return IN_SET(r, -ENXIO, -ENOMEDIUM) ? -ENODATA : r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(c);
+
+        return 0;
+}
+
 _public_ int sd_pidfd_get_session(int pidfd, char **ret_session) {
         _cleanup_free_ char *session = NULL;
         pid_t pid;
@@ -316,6 +348,54 @@ _public_ int sd_pidfd_get_cgroup(int pidfd, char **ret_cgroup) {
         return 0;
 }
 
+_public_ int sd_pidfd_get_unit_cgroup(int pidfd, char **ret_cgroup) {
+        _cleanup_free_ char *cgroup = NULL;
+        pid_t pid;
+        int r;
+
+        assert_return(pidfd >= 0, -EBADF);
+
+        r = pidfd_get_pid(pidfd, &pid);
+        if (r < 0)
+                return r;
+
+        r = sd_pid_get_unit_cgroup(pid, &cgroup);
+        if (r < 0)
+                return r;
+
+        r = pidfd_verify_pid(pidfd, pid);
+        if (r < 0)
+                return r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(cgroup);
+        return 0;
+}
+
+_public_ int sd_pidfd_get_user_unit_cgroup(int pidfd, char **ret_cgroup) {
+        _cleanup_free_ char *cgroup = NULL;
+        pid_t pid;
+        int r;
+
+        assert_return(pidfd >= 0, -EBADF);
+
+        r = pidfd_get_pid(pidfd, &pid);
+        if (r < 0)
+                return r;
+
+        r = sd_pid_get_user_unit_cgroup(pid, &cgroup);
+        if (r < 0)
+                return r;
+
+        r = pidfd_verify_pid(pidfd, pid);
+        if (r < 0)
+                return r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(cgroup);
+        return 0;
+}
+
 _public_ int sd_peer_get_session(int fd, char **ret_session) {
         int r;
 
@@ -356,55 +436,55 @@ _public_ int sd_peer_get_unit(int fd, char **ret_unit) {
 }
 
 _public_ int sd_peer_get_user_unit(int fd, char **ret_unit) {
-        struct ucred ucred;
         int r;
 
         assert_return(fd >= 0, -EBADF);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_user_unit(ucred.pid, ret_unit);
+        return cg_pidref_get_user_unit(&pidref, ret_unit);
 }
 
 _public_ int sd_peer_get_machine_name(int fd, char **ret_machine) {
-        struct ucred ucred;
         int r;
 
         assert_return(fd >= 0, -EBADF);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_machine_name(ucred.pid, ret_machine);
+        return cg_pidref_get_machine_name(&pidref, ret_machine);
 }
 
 _public_ int sd_peer_get_slice(int fd, char **ret_slice) {
-        struct ucred ucred;
         int r;
 
         assert_return(fd >= 0, -EBADF);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_slice(ucred.pid, ret_slice);
+        return cg_pidref_get_slice(&pidref, ret_slice);
 }
 
 _public_ int sd_peer_get_user_slice(int fd, char **ret_slice) {
-        struct ucred ucred;
         int r;
 
         assert_return(fd >= 0, -EBADF);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_user_slice(ucred.pid, ret_slice);
+        return cg_pidref_get_user_slice(&pidref, ret_slice);
 }
 
 _public_ int sd_peer_get_cgroup(int fd, char **ret_cgroup) {
@@ -434,6 +514,46 @@ _public_ int sd_peer_get_cgroup(int fd, char **ret_cgroup) {
                 *ret_cgroup = TAKE_PTR(c);
         }
 
+        return 0;
+}
+
+_public_ int sd_peer_get_unit_cgroup(int fd, char **ret_cgroup) {
+        int r;
+
+        assert_return(fd >= 0, -EBADF);
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
+        if (r < 0)
+                return r;
+
+        _cleanup_free_ char *c = NULL;
+        r = cg_pidref_get_unit_path(&pidref, &c);
+        if (r < 0)
+                return IN_SET(r, -ENXIO, -ENOMEDIUM) ? -ENODATA : r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(c);
+        return 0;
+}
+
+_public_ int sd_peer_get_user_unit_cgroup(int fd, char **ret_cgroup) {
+        int r;
+
+        assert_return(fd >= 0, -EBADF);
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
+        if (r < 0)
+                return r;
+
+        _cleanup_free_ char *c = NULL;
+        r = cg_pidref_get_user_unit_path(&pidref, &c);
+        if (r < 0)
+                return IN_SET(r, -ENXIO, -ENOMEDIUM) ? -ENODATA : r;
+
+        if (ret_cgroup)
+                *ret_cgroup = TAKE_PTR(c);
         return 0;
 }
 
@@ -526,7 +646,7 @@ static int file_of_seat(const char *seat, char **ret) {
         } else {
                 _cleanup_free_ char *buf = NULL;
 
-                r = sd_session_get_seat(NULL, &buf);
+                r = sd_session_get_seat(/* session= */ NULL, &buf);
                 if (r < 0)
                         return r;
 
@@ -559,7 +679,7 @@ _public_ int sd_uid_is_on_seat(uid_t uid, int require_active, const char *seat) 
         if (isempty(content))
                 return 0;
 
-        return string_contains_word(content, NULL, FORMAT_UID(uid));
+        return string_contains_word(content, /* separators= */ NULL, FORMAT_UID(uid));
 }
 
 static int uid_get_array(uid_t uid, const char *variable, char ***ret_array) {
@@ -581,7 +701,7 @@ static int uid_get_array(uid_t uid, const char *variable, char ***ret_array) {
         if (r < 0)
                 return r;
 
-        _cleanup_strv_free_ char **a = strv_split(s, NULL);
+        _cleanup_strv_free_ char **a = strv_split(s, /* separators= */ NULL);
         if (!a)
                 return -ENOMEM;
 
@@ -626,7 +746,7 @@ static int file_of_session(const char *session, char **ret) {
         } else {
                 _cleanup_free_ char *buf = NULL;
 
-                r = sd_pid_get_session(0, &buf);
+                r = sd_pid_get_session(/* pid= */ 0, &buf);
                 if (r < 0)
                         return r;
 
@@ -910,7 +1030,7 @@ _public_ int sd_seat_get_sessions(
                 return r;
 
         if (session_line) {
-                sessions = strv_split(session_line, NULL);
+                sessions = strv_split(session_line, /* separators= */ NULL);
                 if (!sessions)
                         return -ENOMEM;
 
@@ -926,7 +1046,7 @@ _public_ int sd_seat_get_sessions(
                 for (const char *p = uid_line;;) {
                         _cleanup_free_ char *word = NULL;
 
-                        r = extract_first_word(&p, &word, NULL, 0);
+                        r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -1071,7 +1191,7 @@ _public_ int sd_get_machine_names(char ***ret_machines) {
 
                 /* Filter out the unit: symlinks */
                 for (a = b = l; *a; a++) {
-                        if (startswith(*a, "unit:") || !hostname_is_valid(*a, 0))
+                        if (startswith(*a, "unit:") || !hostname_is_valid(*a, /* flags= */ 0))
                                 free(*a);
                         else {
                                 *b = *a;
@@ -1098,7 +1218,7 @@ _public_ int sd_machine_get_class(const char *machine, char **ret_clazz) {
                 if (!c)
                         return -ENOMEM;
         } else {
-                if (!hostname_is_valid(machine, 0))
+                if (!hostname_is_valid(machine, /* flags= */ 0))
                         return -EINVAL;
 
                 _cleanup_free_ char *p = path_join("/run/systemd/machines/", machine);
@@ -1124,7 +1244,7 @@ _public_ int sd_machine_get_ifindices(const char *machine, int **ret_ifindices) 
         _cleanup_free_ char *netif_line = NULL, *p = NULL;
         int r;
 
-        assert_return(hostname_is_valid(machine, 0), -EINVAL);
+        assert_return(hostname_is_valid(machine, /* flags= */ 0), -EINVAL);
 
         p = path_join("/run/systemd/machines/", machine);
         if (!p)
@@ -1141,7 +1261,7 @@ _public_ int sd_machine_get_ifindices(const char *machine, int **ret_ifindices) 
                 return 0;
         }
 
-        _cleanup_strv_free_ char **tt = strv_split(netif_line, NULL);
+        _cleanup_strv_free_ char **tt = strv_split(netif_line, /* separators= */ NULL);
         if (!tt)
                 return -ENOMEM;
 

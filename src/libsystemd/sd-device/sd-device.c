@@ -83,12 +83,16 @@ static sd_device* device_free(sd_device *device) {
 
 DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_device, sd_device, device_free);
 
-static bool property_is_valid(const char *key, const char *value) {
-        /* Device properties may be saved to database file, then may be parsed from the file. When if a
-         * property contains spurious characters, then the parser may be confused. Let's refuse spurious
-         * properties, even if it is internal, which will not be saved to database file, for consistency. */
+bool device_property_name_is_valid(const char *name) {
+        return !isempty(name) && in_charset(name, ALPHANUMERICAL "_.");
+}
 
-        if (isempty(key) || !in_charset(key, ALPHANUMERICAL "_."))
+static bool property_is_valid(const char *key, const char *value) {
+        /* Device properties may be saved to database file, then may be parsed from the file. If a property
+         * contains spurious characters, then the parser may be confused. Let's refuse spurious properties,
+         * even if it is internal, which will not be saved to database file, for consistency. */
+
+        if (!device_property_name_is_valid(key))
                 return false;
 
         /* an empty value means unset the property, hence that's fine. */
@@ -178,7 +182,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                 /* The input path maybe a symlink located outside of /sys. Let's try to chase the symlink at first.
                  * The primary use case is that e.g. /proc/device-tree is a symlink to /sys/firmware/devicetree/base.
                  * By chasing symlinks in the path at first, we can call sd_device_new_from_path() with such path. */
-                r = chase(_syspath, NULL, 0, &syspath, &fd);
+                r = chase(_syspath, /* root= */ NULL, /* flags= */ 0, &syspath, &fd);
                 if (r == -ENOENT)
                          /* the device does not exist (any more?) */
                         return log_trace_errno(SYNTHETIC_ERRNO(ENODEV),
@@ -191,7 +195,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                         char *p;
 
                         /* /sys is a symlink to somewhere sysfs is mounted on? In that case, we convert the path to real sysfs to "/sys". */
-                        r = chase("/sys", NULL, 0, &real_sys, NULL);
+                        r = chase("/sys", /* root= */ NULL, /* flags= */ 0, &real_sys, /* ret_fd= */ NULL);
                         if (r < 0)
                                 return log_debug_errno(r, "sd-device: Failed to chase symlink /sys: %m");
 
@@ -382,7 +386,7 @@ _public_ int sd_device_new_from_ifname(sd_device **ret, const char *ifname) {
                         return r;
         }
 
-        r = rtnl_resolve_ifname_full(NULL, RESOLVE_IFNAME_ALTERNATIVE | RESOLVE_IFNAME_NUMERIC, ifname, &main_name, NULL);
+        r = rtnl_resolve_ifname_full(/* rtnl= */ NULL, RESOLVE_IFNAME_ALTERNATIVE | RESOLVE_IFNAME_NUMERIC, ifname, &main_name, /* ret_altnames= */ NULL);
         if (r < 0)
                 return r;
 
@@ -397,7 +401,7 @@ _public_ int sd_device_new_from_ifindex(sd_device **ret, int ifindex) {
         assert_return(ret, -EINVAL);
         assert_return(ifindex > 0, -EINVAL);
 
-        r = rtnl_get_ifname(NULL, ifindex, &ifname);
+        r = rtnl_get_ifname(/* rtnl= */ NULL, ifindex, &ifname);
         if (r < 0)
                 return r;
 
@@ -571,6 +575,17 @@ _public_ int sd_device_new_from_stat_rdev(sd_device **ret, const struct stat *st
         assert_return(st, -EINVAL);
 
         return device_new_from_mode_and_devnum(ret, st->st_mode, st->st_rdev);
+}
+
+_public_ int sd_device_new_from_device_node_fd(sd_device **ret, int fd) {
+        assert_return(ret, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
+
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        return sd_device_new_from_stat_rdev(ret, &st);
 }
 
 static int device_new_from_devname(sd_device **ret, const char *devname, bool strict) {
@@ -917,7 +932,7 @@ int device_get_ifname(sd_device *device, const char **ret) {
         assert_return(device, -EINVAL);
 
         /* First, check if the device is a network interface. */
-        r = sd_device_get_ifindex(device, NULL);
+        r = sd_device_get_ifindex(device, /* ret= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1066,7 +1081,7 @@ static int device_enumerate_children(sd_device *device) {
         if (device->children_enumerated)
                 return 0; /* Already enumerated. */
 
-        r = device_enumerate_children_internal(device, NULL, &stack, &children);
+        r = device_enumerate_children_internal(device, /* subdir= */ NULL, &stack, &children);
         if (r < 0)
                 return r;
 
@@ -1278,7 +1293,7 @@ _public_ int sd_device_get_subsystem(sd_device *device, const char **ret) {
                 else if (!isempty(PATH_STARTSWITH_SET(device->devpath, "/class/", "/bus/")))
                         r = device_set_subsystem(device, "subsystem");
                 else
-                        r = device_set_subsystem(device, NULL);
+                        r = device_set_subsystem(device, /* subsystem= */ NULL);
                 if (r < 0)
                         return log_device_debug_errno(device, r,
                                                       "sd-device: Failed to set subsystem for %s: %m",
@@ -1735,10 +1750,7 @@ static int handle_db_line(sd_device *device, char key, const char *value) {
                 return safe_atoi(value, &device->devlink_priority);
 
         case 'W':
-                /* Deprecated. Previously, watch handle is both saved in database and /run/udev/watch.
-                 * However, the handle saved in database may not be updated when the handle is updated
-                 * or removed. Moreover, it is not necessary to store the handle within the database,
-                 * as its value becomes meaningless when udevd is restarted. */
+                /* Deprecated. Was used for the inotify watch handle. */
                 return 0;
 
         case 'V':
@@ -2051,7 +2063,7 @@ int device_properties_prepare(sd_device *device) {
         if (device->property_devlinks_outdated) {
                 _cleanup_free_ char *devlinks = NULL;
 
-                r = set_strjoin(device->devlinks, " ", false, &devlinks);
+                r = set_strjoin(device->devlinks, " ", /* wrap_with_separator= */ false, &devlinks);
                 if (r < 0)
                         return r;
 
@@ -2067,7 +2079,7 @@ int device_properties_prepare(sd_device *device) {
         if (device->property_tags_outdated) {
                 _cleanup_free_ char *tags = NULL;
 
-                r = set_strjoin(device->all_tags, ":", true, &tags);
+                r = set_strjoin(device->all_tags, ":", /* wrap_with_separator= */ true, &tags);
                 if (r < 0)
                         return r;
 
@@ -2078,7 +2090,7 @@ int device_properties_prepare(sd_device *device) {
                 }
 
                 tags = mfree(tags);
-                r = set_strjoin(device->current_tags, ":", true, &tags);
+                r = set_strjoin(device->current_tags, ":", /* wrap_with_separator= */ true, &tags);
                 if (r < 0)
                         return r;
 
@@ -2207,7 +2219,7 @@ static int device_sysattrs_read_all(sd_device *device) {
         if (device->sysattrs_read)
                 return 0;
 
-        r = device_sysattrs_read_all_internal(device, NULL, &stack);
+        r = device_sysattrs_read_all_internal(device, /* subdir= */ NULL, &stack);
         if (r < 0)
                 return r;
 
@@ -2621,7 +2633,7 @@ cache_result:
 }
 
 _public_ int sd_device_get_sysattr_value(sd_device *device, const char *sysattr, const char **ret) {
-        return sd_device_get_sysattr_value_with_size(device, sysattr, ret, NULL);
+        return sd_device_get_sysattr_value_with_size(device, sysattr, ret, /* ret_size= */ NULL);
 }
 
 int device_get_sysattr_streq(sd_device *device, const char *sysattr, const char *expected) {
@@ -2777,7 +2789,7 @@ _public_ int sd_device_set_sysattr_value(sd_device *device, const char *sysattr,
                 return r;
         }
 
-        r = device_cache_sysattr_value(device, resolved, copied, 0);
+        r = device_cache_sysattr_value(device, resolved, copied, /* error= */ 0);
         if (r < 0)
                 log_device_debug_errno(device, r,
                                        "sd-device: failed to cache written attribute '%s' with '%s', ignoring: %m",
@@ -2872,7 +2884,7 @@ _public_ int sd_device_trigger_with_args(
         return 0;
 }
 
-_public_ int sd_device_open(sd_device *device, int flags) {
+int device_open(sd_device *device, int flags) {
         _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
         const char *devname;
         uint64_t q, diskseq = 0;
@@ -2880,8 +2892,10 @@ _public_ int sd_device_open(sd_device *device, int flags) {
         dev_t devnum;
         int r;
 
-        assert_return(device, -EINVAL);
-        assert_return(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW), -EINVAL);
+        assert(device);
+        assert(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW));
+
+        /* Like sd_device_open(), but O_CLOEXEC is always set */
 
         r = sd_device_get_devname(device, &devname);
         if (r == -ENOENT)
@@ -2895,9 +2909,11 @@ _public_ int sd_device_open(sd_device *device, int flags) {
         if (r < 0)
                 return r;
 
-        fd = open(devname, FLAGS_SET(flags, O_PATH) ? flags : O_CLOEXEC|O_NOFOLLOW|O_PATH);
+        /* With O_PATH open() ignores all but these flags, so must we */
+        fd = xopenat(AT_FDCWD, devname,
+                     FLAGS_SET(flags, O_PATH) ? flags & (O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC) : O_NOFOLLOW|O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (fstat(fd, &st) < 0)
                 return -errno;
@@ -2946,6 +2962,27 @@ _public_ int sd_device_open(sd_device *device, int flags) {
                 return -ENXIO;
 
         return TAKE_FD(fd2);
+}
+
+_public_ int sd_device_open(sd_device *device, int flags) {
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        assert_return(device, -EINVAL);
+        assert_return(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW), -EINVAL);
+
+        fd = device_open(device, flags);
+        if (fd < 0)
+                return fd;
+
+        /* We've historically returned non-cloexec fds. */
+        if (!FLAGS_SET(flags, O_CLOEXEC)) {
+                r = fd_cloexec(fd, /* cloexec= */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        return TAKE_FD(fd);
 }
 
 int device_opendir(sd_device *device, const char *subdir, DIR **ret) {

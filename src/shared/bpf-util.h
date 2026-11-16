@@ -46,6 +46,7 @@ extern DLSYM_PROTOTYPE(bpf_map__name);
 extern DLSYM_PROTOTYPE(bpf_map__set_inner_map_fd);
 extern DLSYM_PROTOTYPE(bpf_map__set_max_entries);
 extern DLSYM_PROTOTYPE(bpf_map__set_pin_path);
+extern DLSYM_PROTOTYPE(bpf_map__set_type);
 extern DLSYM_PROTOTYPE(bpf_map_create);
 extern DLSYM_PROTOTYPE(bpf_map_delete_elem);
 extern DLSYM_PROTOTYPE(bpf_map_get_fd_by_id);
@@ -65,12 +66,16 @@ extern DLSYM_PROTOTYPE(bpf_object__pin_maps);
 extern DLSYM_PROTOTYPE(bpf_program__attach);
 extern DLSYM_PROTOTYPE(bpf_program__attach_cgroup);
 extern DLSYM_PROTOTYPE(bpf_program__attach_lsm);
+extern DLSYM_PROTOTYPE(bpf_program__fd);
 extern DLSYM_PROTOTYPE(bpf_program__name);
 extern DLSYM_PROTOTYPE(bpf_program__set_autoload);
 extern DLSYM_PROTOTYPE(bpf_token_create);
 extern DLSYM_PROTOTYPE(btf__find_by_name_kind);
 extern DLSYM_PROTOTYPE(btf__free);
 extern DLSYM_PROTOTYPE(btf__load_vmlinux_btf);
+extern DLSYM_PROTOTYPE(btf__type_by_id);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(struct btf*, sym_btf__free, NULL);
 extern DLSYM_PROTOTYPE(libbpf_set_print);
 extern DLSYM_PROTOTYPE(ring_buffer__epoll_fd);
 extern DLSYM_PROTOTYPE(ring_buffer__free);
@@ -91,7 +96,7 @@ static inline int compat_bpf_map_create(
                                           value_size, max_entries, opts);
 
         return sym_bpf_create_map(map_type, key_size, value_size, max_entries,
-                                  0 /* opts->map_flags, but opts is always NULL for us so skip build dependency on the type */);
+                                  /* map_flags= */ 0 /* opts->map_flags, but opts is always NULL for us so skip build dependency on the type */);
 }
 
 /* libbpf sometimes returns error codes that make sense only in the kernel, like 524 for EOPNOTSUPP. Use

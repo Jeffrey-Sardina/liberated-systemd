@@ -26,6 +26,7 @@
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
+#include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "time-util.h"
@@ -658,7 +659,7 @@ static int bus_socket_read_auth(sd_bus *b) {
                         .msg_controllen = sizeof(control),
                 };
 
-                k = recvmsg_safe(b->input_fd, &mh, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+                k = recvmsg_safe(b->input_fd, &mh, MSG_DONTWAIT);
                 if (k == -ENOTSOCK) {
                         b->prefer_readv = true;
                         k = readv(b->input_fd, &iov, 1);
@@ -791,11 +792,11 @@ int bus_socket_start_auth(sd_bus *b) {
         bus_set_state(b, BUS_AUTHENTICATING);
         b->auth_timeout = usec_add(now(CLOCK_MONOTONIC), BUS_AUTH_TIMEOUT);
 
-        if (sd_is_socket(b->input_fd, AF_UNIX, 0, 0) <= 0)
+        if (sd_is_socket(b->input_fd, AF_UNIX, /* type= */ 0, /* listening= */ 0) <= 0)
                 b->accept_fd = false;
 
         if (b->output_fd != b->input_fd)
-                if (sd_is_socket(b->output_fd, AF_UNIX, 0, 0) <= 0)
+                if (sd_is_socket(b->output_fd, AF_UNIX, /* type= */ 0, /* listening= */ 0) <= 0)
                         b->accept_fd = false;
 
         if (b->is_server)
@@ -1003,7 +1004,7 @@ static int bind_description(sd_bus *b, int fd, int family) {
          * - a random 64-bit value (to avoid collisions)
          * - our "comm" process name (suppressed if contains "/" to avoid parsing issues)
          * - the description string of the bus connection. */
-        (void) pid_get_comm(0, &comm);
+        (void) pid_get_comm(/* pid= */ 0, &comm);
         if (comm && strchr(comm, '/'))
                 comm = mfree(comm);
 
@@ -1101,7 +1102,7 @@ int bus_socket_connect(sd_bus *b) {
 
                 if (DEBUG_LOGGING) {
                         _cleanup_free_ char *pretty = NULL;
-                        (void) sockaddr_pretty(&b->sockaddr.sa, b->sockaddr_size, false, true, &pretty);
+                        (void) sockaddr_pretty(&b->sockaddr.sa, b->sockaddr_size, /* translate_ipv6= */ false, /* include_port= */ true, &pretty);
                         log_debug("sd-bus: starting bus%s%s by connecting to %s...",
                                   b->description ? " " : "", strempty(b->description), strnull(pretty));
                 }
@@ -1201,7 +1202,7 @@ int bus_socket_exec(sd_bus *b) {
         r = pidref_safe_fork_full(
                         "(sd-busexec)",
                         (int[]) { s[1], s[1], STDERR_FILENO },
-                        NULL, 0,
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REARRANGE_STDIO|FORK_RLIMIT_NOFILE_SAFE,
                         &b->busexec_pidref);
         if (r < 0) {
@@ -1212,9 +1213,9 @@ int bus_socket_exec(sd_bus *b) {
                 /* Child */
 
                 if (b->exec_argv)
-                        execvp(b->exec_path, b->exec_argv);
+                        (void) execvp_safe(b->exec_path, b->exec_argv);
                 else
-                        execvp(b->exec_path, STRV_MAKE(b->exec_path));
+                        (void) execvp_safe(b->exec_path, STRV_MAKE(b->exec_path));
 
                 _exit(EXIT_FAILURE);
         }
@@ -1370,7 +1371,7 @@ static int bus_socket_make_message(sd_bus *bus, size_t size) {
                                     bus->rbuffer, size,
                                     bus->fds, bus->n_fds,
                                     bus->got_ctrunc,
-                                    NULL,
+                                    /* label= */ NULL,
                                     &t);
         if (r == -EBADMSG) {
                 log_debug_errno(r, "Received invalid message from connection %s, dropping.", strna(bus->description));
@@ -1476,11 +1477,10 @@ int bus_socket_read_message(sd_bus *bus) {
 
 int bus_socket_process_opening(sd_bus *b) {
         int error = 0, events, r;
-        socklen_t slen = sizeof(error);
 
         assert(b->state == BUS_OPENING);
 
-        events = fd_wait_for_event(b->output_fd, POLLOUT, 0);
+        events = fd_wait_for_event(b->output_fd, POLLOUT, /* timeout= */ 0);
         if (ERRNO_IS_NEG_TRANSIENT(events))
                 return 0;
         if (events < 0)
@@ -1488,9 +1488,9 @@ int bus_socket_process_opening(sd_bus *b) {
         if (!(events & (POLLOUT|POLLERR|POLLHUP)))
                 return 0;
 
-        r = getsockopt(b->output_fd, SOL_SOCKET, SO_ERROR, &error, &slen);
+        r = getsockopt_int(b->output_fd, SOL_SOCKET, SO_ERROR, &error);
         if (r < 0)
-                b->last_connect_error = errno;
+                b->last_connect_error = -r;
         else if (error != 0)
                 b->last_connect_error = error;
         else if (events & (POLLERR|POLLHUP))

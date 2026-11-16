@@ -115,7 +115,7 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                 if (STR_IN_SET(verb, "mask", "unmask")) {
                         _cleanup_(lookup_paths_done) LookupPaths lp = {};
 
-                        r = lookup_paths_init_or_warn(&lp, arg_runtime_scope, 0, arg_root);
+                        r = lookup_paths_init_or_warn(&lp, arg_runtime_scope, /* flags= */ 0, arg_root);
                         if (r < 0)
                                 return r;
 
@@ -202,7 +202,7 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                                 return bus_log_create_error(r);
                 }
 
-                r = sd_bus_call(bus, m, 0, &error, &reply);
+                r = sd_bus_call(bus, m, /* usec= */ 0, &error, &reply);
                 if (r < 0)
                         return log_error_errno(r, "Failed to %s unit: %s", verb, bus_error_message(&error, r));
 
@@ -260,6 +260,10 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                 r = install_changes_dump(r, verb, changes, n_changes, arg_quiet);
                 if (r < 0)
                         return r;
+
+                r = daemon_reload_after_vendor_install();
+                if (r < 0)
+                        return r;
         }
 
         if (carries_install_info == 0 && !ignore_carries_install_info)
@@ -279,14 +283,23 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                            glyph(GLYPH_BULLET));
 
         if (streq(verb, "disable") && arg_runtime_scope == RUNTIME_SCOPE_USER && !arg_quiet && !arg_no_warn) {
-                /* If some of the units are disabled in user scope but still enabled in global scope,
-                 * we emit a warning for that. */
+                /* A vendor dependency masked in user scope remains enabled in global scope. A unit
+                 * enabled only in the user's other configuration directory is not enabled globally. */
 
                 /* No strv_free here, strings are owned by 'names' */
                 _cleanup_free_ char **enabled_in_global_scope = NULL;
 
                 STRV_FOREACH(name, names) {
                         UnitFileState state;
+
+                        r = unit_file_get_state(RUNTIME_SCOPE_USER, arg_root, *name, &state);
+                        if (r == -ENOENT)
+                                continue;
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to get unit file state for %s: %m", *name);
+
+                        if (!IN_SET(state, UNIT_FILE_ENABLED, UNIT_FILE_ENABLED_RUNTIME))
+                                continue;
 
                         r = unit_file_get_state(RUNTIME_SCOPE_GLOBAL, arg_root, *name, &state);
                         if (r == -ENOENT)
@@ -336,9 +349,13 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                         start_verb = "try-restart";
                         accept_path = true;
                         prohibit_templates = false;
+                } else if (streq(verb, "unmask")) {
+                        start_verb = "start";
+                        accept_path = false;
+                        prohibit_templates = true;
                 } else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "--now can only be used with verb enable, disable, reenable, or mask.");
+                                               "--now can only be used with verb enable, disable, reenable, mask, or unmask.");
 
                 switch (install_client_side()) {
                 case INSTALL_CLIENT_SIDE_NO:
@@ -353,6 +370,8 @@ int verb_enable(int argc, char *argv[], uintptr_t data, void *userdata) {
                         return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "--now cannot be used with --root=.");
                 case INSTALL_CLIENT_SIDE_GLOBAL_SCOPE:
                         return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "--now cannot be used with --global.");
+                case INSTALL_CLIENT_SIDE_VENDOR:
+                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "--now cannot be used with --vendor.");
                 }
 
                 assert(bus);

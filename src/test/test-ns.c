@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "fs-util.h"
 #include "log.h"
 #include "namespace.h"
 #include "tests.h"
@@ -63,8 +64,8 @@ int main(int argc, char *argv[]) {
 
         test_setup_logging(LOG_DEBUG);
 
-        assert_se(mkdtemp(tmp_dir));
-        assert_se(mkdtemp(var_tmp_dir));
+        ASSERT_NOT_NULL(mkdtemp(tmp_dir));
+        ASSERT_NOT_NULL(mkdtemp(var_tmp_dir));
 
         root_directory = getenv("TEST_NS_CHROOT");
         projects_directory = getenv("TEST_NS_PROJECTS");
@@ -81,11 +82,8 @@ int main(int argc, char *argv[]) {
         _cleanup_(pinned_resource_done) PinnedResource pr = PINNED_RESOURCE_NULL;
 
         if (root_directory) {
-                pr.directory_fd = open(root_directory, O_PATH|O_CLOEXEC|O_DIRECTORY);
-                assert_se(pr.directory_fd >= 0);
-
-                pr.directory = strdup(root_directory);
-                assert_se(pr.directory);
+                pr.directory_fd = ASSERT_OK(xopenat(AT_FDCWD, root_directory, O_PATH|O_DIRECTORY));
+                pr.directory = ASSERT_NOT_NULL(strdup(root_directory));
         }
 
         NamespaceParameters p = {
@@ -117,7 +115,7 @@ int main(int argc, char *argv[]) {
                 .proc_subset = PROC_SUBSET_PID,
         };
 
-        r = setup_namespace(&p, NULL);
+        r = setup_namespace(&p, /* reterr_path= */ NULL);
         if (r < 0) {
                 log_error_errno(r, "Failed to set up namespace: %m");
 

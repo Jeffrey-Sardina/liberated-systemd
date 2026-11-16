@@ -3,14 +3,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "sd-journal.h"
+
 #include "argv-util.h"
 #include "chattr-util.h"
+#include "fd-util.h"
+#include "fs-util.h"
 #include "iovec-util.h"
 #include "journal-authenticate.h"
 #include "journal-file-util.h"
 #include "journal-vacuum.h"
 #include "log.h"
 #include "lookup3.h"
+#include "memfd-util.h"
 #include "memory-util.h"
 #include "rm-rf.h"
 #include "stdio-util.h"
@@ -43,19 +48,19 @@ static void test_non_empty_one(void) {
 
         mkdtemp_chdir_chattr(t);
 
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, UINT64_MAX, NULL, m, NULL, &f));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f));
 
         ASSERT_NOT_NULL(dual_timestamp_now(&ts));
         ASSERT_OK_ZERO(sd_id128_randomize(&fake_boot_id));
 
         iovec = IOVEC_MAKE_STRING(test);
-        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, NULL, &iovec, 1, NULL, NULL, NULL, NULL));
+        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, /* boot_id= */ NULL, &iovec, 1, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
 
         iovec = IOVEC_MAKE_STRING(test2);
-        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, NULL, &iovec, 1, NULL, NULL, NULL, NULL));
+        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, /* boot_id= */ NULL, &iovec, 1, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
 
         iovec = IOVEC_MAKE_STRING(test);
-        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, &fake_boot_id, &iovec, 1, NULL, NULL, NULL, NULL));
+        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, &fake_boot_id, &iovec, 1, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
 
         journal_file_auth_append_tag(f);
 
@@ -76,35 +81,35 @@ static void test_non_empty_one(void) {
         ASSERT_EQ(journal_file_next_entry(f, 0, DIRECTION_DOWN, &o, &p), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(1));
 
-        ASSERT_EQ(journal_file_find_data_object(f, test, strlen(test), &d, NULL), 1);
-        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_DOWN, &o, NULL), 1);
+        ASSERT_EQ(journal_file_find_data_object(f, test, strlen(test), &d, /* ret_offset= */ NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(1));
 
-        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_UP, &o, NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_UP, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(3));
 
-        ASSERT_EQ(journal_file_find_data_object(f, test2, strlen(test2), &d, NULL), 1);
-        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_UP, &o, NULL), 1);
+        ASSERT_EQ(journal_file_find_data_object(f, test2, strlen(test2), &d, /* ret_offset= */ NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_UP, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(2));
 
-        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_DOWN, &o, NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_for_data(f, d, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(2));
 
-        ASSERT_OK_ZERO(journal_file_find_data_object(f, "quux", 4, &d, NULL));
+        ASSERT_OK_ZERO(journal_file_find_data_object(f, "quux", 4, &d, /* ret_offset= */ NULL));
 
-        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 1, DIRECTION_DOWN, &o, NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 1, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(1));
 
-        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 3, DIRECTION_DOWN, &o, NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 3, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(3));
 
-        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 2, DIRECTION_DOWN, &o, NULL), 1);
+        ASSERT_EQ(journal_file_move_to_entry_by_seqnum(f, 2, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(2));
 
-        ASSERT_OK_ZERO(journal_file_move_to_entry_by_seqnum(f, 10, DIRECTION_DOWN, &o, NULL));
+        ASSERT_OK_ZERO(journal_file_move_to_entry_by_seqnum(f, 10, DIRECTION_DOWN, &o, /* ret_offset= */ NULL));
 
-        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, NULL);
-        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, NULL);
+        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, /* seqnum_id= */ NULL, /* deferred_closes= */ NULL);
+        journal_file_rotate(&f, m, JOURNAL_SEAL|JOURNAL_COMPRESS, UINT64_MAX, /* seqnum_id= */ NULL, /* deferred_closes= */ NULL);
 
         (void) journal_file_offline_close(f);
 
@@ -113,7 +118,7 @@ static void test_non_empty_one(void) {
         if (arg_keep)
                 log_info("Not removing %s", t);
         else {
-                journal_directory_vacuum(".", 3000000, 0, 0, NULL, true);
+                journal_directory_vacuum(".", 3000000, /* n_max_files= */ 0, /* max_retention_usec= */ 0, /* oldest_usec= */ NULL, /* verbose= */ true);
 
                 ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
         }
@@ -147,36 +152,33 @@ TEST(duplicate_entry_storage) {
                 IOVEC_MAKE_STRING(repeated_two),
         };
         char t[] = "/var/tmp/journal-XXXXXX";
-        uint64_t expected_xor = 0;
+        uint64_t expected_xor = 0, p, n;
         dual_timestamp ts;
         Object *o;
 
         ASSERT_NOT_NULL(m = mmap_cache_new());
         mkdtemp_chdir_chattr(t);
 
-        ASSERT_OK(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, 0, 0666, UINT64_MAX, NULL, m, NULL, &f));
+        ASSERT_OK(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, /* file_flags= */ 0, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f));
 
         ASSERT_NOT_NULL(dual_timestamp_now(&ts));
         FOREACH_ELEMENT(i, iovec)
                 expected_xor ^= jenkins_hash64(i->iov_base, i->iov_len);
 
-        ASSERT_OK(journal_file_append_entry(f, &ts, NULL, iovec, ELEMENTSOF(iovec), NULL, NULL, &o, NULL));
+        ASSERT_OK(journal_file_append_entry(f, &ts, /* boot_id= */ NULL, iovec, ELEMENTSOF(iovec), /* seqnum= */ NULL, /* seqnum_id= */ NULL, &o, &p));
         ASSERT_EQ(le64toh(o->entry.xor_hash), expected_xor);
-        ASSERT_EQ(journal_file_entry_n_items(f, o), 5U);
+        ASSERT_OK(journal_file_entry_n_fields(f, o, p, &n));
+        ASSERT_EQ(n, 5U);
 
-        for (uint64_t i = 0; i < journal_file_entry_n_items(f, o); i++) {
+        for (uint64_t i = 0; i < n; i++) {
                 const void *data;
                 size_t size;
 
-                ASSERT_OK_POSITIVE(journal_file_data_payload(
-                                f,
-                                NULL,
-                                journal_file_entry_item_object_offset(f, o, i),
-                                NULL,
-                                0,
-                                0,
-                                &data,
-                                &size));
+                ASSERT_OK(journal_file_move_to_object(f, OBJECT_ENTRY, p, &o));
+                ASSERT_OK_POSITIVE(journal_file_entry_field_payload(
+                                f, o, p, i,
+                                /* field= */ NULL, /* field_length= */ 0,
+                                &data, &size));
 
                 if (memcmp_nn(data, size, binary, sizeof(binary)) == 0)
                         n_binary++;
@@ -211,10 +213,10 @@ static void test_empty_one(void) {
 
         mkdtemp_chdir_chattr(t);
 
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, 0, 0666, UINT64_MAX, NULL, m, NULL, &f1));
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-compress.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, NULL, m, NULL, &f2));
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-seal.journal", O_RDWR|O_CREAT, JOURNAL_SEAL, 0666, UINT64_MAX, NULL, m, NULL, &f3));
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-seal-compress.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, UINT64_MAX, NULL, m, NULL, &f4));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, /* file_flags= */ 0, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f1));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-compress.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f2));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-seal.journal", O_RDWR|O_CREAT, JOURNAL_SEAL, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f3));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test-seal-compress.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, UINT64_MAX, /* metrics= */ NULL, m, /* template= */ NULL, &f4));
 
         journal_file_print_header(f1);
         puts("");
@@ -230,7 +232,7 @@ static void test_empty_one(void) {
         if (arg_keep)
                 log_info("Not removing %s", t);
         else {
-                journal_directory_vacuum(".", 3000000, 0, 0, NULL, true);
+                journal_directory_vacuum(".", 3000000, /* n_max_files= */ 0, /* max_retention_usec= */ 0, /* oldest_usec= */ NULL, /* verbose= */ true);
 
                 ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
         }
@@ -254,25 +256,31 @@ static bool check_compressed(uint64_t compress_threshold, uint64_t data_size) {
         _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
         dual_timestamp ts;
         JournalFile *f;
-        struct iovec iovec;
         Object *o;
         uint64_t p;
         char t[] = "/var/tmp/journal-XXXXXX";
-        char data[2048] = "FIELD=";
+        const char *field = "FIELD";
         bool is_compressed;
 
-        ASSERT_LE(data_size, sizeof(data));
+        size_t field_length = strlen(field);
+        ASSERT_GT(data_size, field_length);
+        ASSERT_LE(data_size, (uint64_t) SIZE_MAX);
+
+        _cleanup_(iovec_done) struct iovec iovec = {};
+        ASSERT_OK(iovec_alloc(data_size, &iovec));
+        char *q = mempcpy(iovec.iov_base, field, field_length);
+        *q++ = '=';
+        memset(q, 'a', data_size - field_length - 1);
 
         ASSERT_NOT_NULL(m = mmap_cache_new());
 
         mkdtemp_chdir_chattr(t);
 
-        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, compress_threshold, NULL, m, NULL, &f));
+        ASSERT_OK_ZERO(journal_file_open(-EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS|JOURNAL_SEAL, 0666, compress_threshold, /* metrics= */ NULL, m, /* template= */ NULL, &f));
 
         dual_timestamp_now(&ts);
 
-        iovec = IOVEC_MAKE(data, data_size);
-        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, NULL, &iovec, 1, NULL, NULL, NULL, NULL));
+        ASSERT_OK_ZERO(journal_file_append_entry(f, &ts, /* boot_id= */ NULL, &iovec, 1, /* seqnum= */ NULL, /* seqnum_id= */ NULL, /* ret_object= */ NULL, /* ret_offset= */ NULL));
 
         journal_file_auth_append_tag(f);
 
@@ -292,6 +300,32 @@ static bool check_compressed(uint64_t compress_threshold, uint64_t data_size) {
 
         is_compressed = COMPRESSION_FROM_OBJECT(o) != COMPRESSION_NONE;
 
+        sd_journal_data_flags_t flags;
+        FOREACH_ARGUMENT(flags, 0, SD_JOURNAL_DATA_SKIP_FIELD) {
+                size_t skip = FLAGS_SET(flags, SD_JOURNAL_DATA_SKIP_FIELD) ? field_length + 1 : 0;
+
+                struct iovec v;
+                ASSERT_OK_POSITIVE(journal_file_data_payload_full(f, o, p, field, field_length, flags,
+                                                                  -EBADF, (const void**) &v.iov_base, &v.iov_len));
+                ASSERT_IOVEC_EQ(&v, &IOVEC_SHIFT(&iovec, skip));
+
+                _cleanup_close_ int fd = ASSERT_OK(memfd_new("decompress-blob-to-fd-test"));
+                size_t sz;
+                ASSERT_OK_POSITIVE(journal_file_data_payload_full(f, o, p, field, field_length, flags,
+                                                                  fd, /* ret_data= */ NULL, &sz));
+                ASSERT_EQ((uint64_t) sz, data_size - skip);
+
+                uint64_t sz64;
+                ASSERT_OK(memfd_get_size(fd, &sz64));
+                ASSERT_EQ(sz64, data_size - skip);
+
+                _cleanup_(iovec_done) struct iovec w = {};
+                ASSERT_OK(iovec_alloc(sz, &w));
+
+                ASSERT_OK_EQ_ERRNO(pread(fd, w.iov_base, w.iov_len, 0), (ssize_t) w.iov_len);
+                ASSERT_IOVEC_EQ(&w, &IOVEC_SHIFT(&iovec, skip));
+        }
+
         (void) journal_file_offline_close(f);
 
         log_info("Done...");
@@ -299,7 +333,7 @@ static bool check_compressed(uint64_t compress_threshold, uint64_t data_size) {
         if (arg_keep)
                 log_info("Not removing %s", t);
         else {
-                journal_directory_vacuum(".", 3000000, 0, 0, NULL, true);
+                journal_directory_vacuum(".", 3000000, /* n_max_files= */ 0, /* max_retention_usec= */ 0, /* oldest_usec= */ NULL, /* verbose= */ true);
 
                 ASSERT_OK(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL));
         }
@@ -318,11 +352,11 @@ static void test_min_compress_size_one(void) {
         ASSERT_TRUE(check_compressed(UINT64_MAX, 513));
 
         /* compress everything */
-        ASSERT_TRUE(check_compressed(0, 96));
+        ASSERT_TRUE(check_compressed(/* compress_threshold= */ 0, 96));
         ASSERT_TRUE(check_compressed(8, 96));
 
         /* Ensure we don't try to compress less than 8 bytes */
-        ASSERT_FALSE(check_compressed(0, 7));
+        ASSERT_FALSE(check_compressed(/* compress_threshold= */ 0, 7));
 
         /* check boundary conditions */
         ASSERT_TRUE(check_compressed(256, 256));
@@ -543,7 +577,7 @@ static void test_recover_truncated_indexed_one(bool zeroed_tail) {
 
         /* The head of the chain is intact, so a downward seek from the start still finds the first entry. */
         ASSERT_EQ(journal_file_move_to_entry_by_seqnum_for_data(
-                        f, d, 0, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
+                        f, d, /* seqnum= */ 0, DIRECTION_DOWN, &o, /* ret_offset= */ NULL), 1);
         ASSERT_EQ(le64toh(o->entry.seqnum), UINT64_C(1));
 
         (void) journal_file_close(f);
@@ -613,8 +647,8 @@ static void test_recover_truncated_hash_chain_one(bool field, bool zeroed_tail) 
         }
 
         ASSERT_EQ(field ?
-                  journal_file_find_field_object(f, lost_key, strlen(lost_key), NULL, &lost_offset) :
-                  journal_file_find_data_object(f, lost_key, strlen(lost_key), NULL, &lost_offset), 1);
+                  journal_file_find_field_object(f, lost_key, strlen(lost_key), /* ret_object= */ NULL, &lost_offset) :
+                  journal_file_find_data_object(f, lost_key, strlen(lost_key), /* ret_object= */ NULL, &lost_offset), 1);
         file_size = (uint64_t) f->last_stat.st_size;
         ASSERT_GT(file_size, lost_offset);
         (void) journal_file_offline_close(f);
@@ -629,11 +663,11 @@ static void test_recover_truncated_hash_chain_one(bool field, bool zeroed_tail) 
                         /* metrics= */ NULL, m, /* template= */ NULL, &f));
 
         ASSERT_EQ(field ?
-                  journal_file_find_field_object(f, survives_key, strlen(survives_key), NULL, NULL) :
-                  journal_file_find_data_object(f, survives_key, strlen(survives_key), NULL, NULL), 1);
+                  journal_file_find_field_object(f, survives_key, strlen(survives_key), /* ret_object= */ NULL, /* ret_offset= */ NULL) :
+                  journal_file_find_data_object(f, survives_key, strlen(survives_key), /* ret_object= */ NULL, /* ret_offset= */ NULL), 1);
         ASSERT_OK_ZERO(field ?
-                       journal_file_find_field_object(f, lost_key, strlen(lost_key), NULL, NULL) :
-                       journal_file_find_data_object(f, lost_key, strlen(lost_key), NULL, NULL));
+                       journal_file_find_field_object(f, lost_key, strlen(lost_key), /* ret_object= */ NULL, /* ret_offset= */ NULL) :
+                       journal_file_find_data_object(f, lost_key, strlen(lost_key), /* ret_object= */ NULL, /* ret_offset= */ NULL));
 
         (void) journal_file_close(f);
 
@@ -653,6 +687,181 @@ TEST(recover_truncated_hash_chain) {
                 test_recover_truncated_hash_chain_one(/* field= */ false, /* zeroed_tail= */ true);
                 test_recover_truncated_hash_chain_one(/* field= */ true, /* zeroed_tail= */ false);
                 test_recover_truncated_hash_chain_one(/* field= */ true, /* zeroed_tail= */ true);
+        }
+}
+
+static void test_punch_holes_hash_chain_cycle_one(void) {
+        _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        char t[] = "/var/tmp/journal-XXXXXX";
+        const char *field = "CYCLE=x";
+        struct iovec iovec = IOVEC_MAKE_STRING(field);
+        dual_timestamp ts;
+        JournalFile *f;
+        uint64_t p;
+        le64_t self;
+        int fd;
+
+        /* When a journal file is archived, holes are punched into the unused parts of the entry arrays of
+         * all data objects, which follows every data hash chain. A chain that loops back on itself must not
+         * make that spin forever. */
+
+        ASSERT_NOT_NULL(m = mmap_cache_new());
+        mkdtemp_chdir_chattr(t);
+
+        ASSERT_OK_ZERO(journal_file_open(
+                        -EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX,
+                        /* metrics= */ NULL, m, /* template= */ NULL, &f));
+        dual_timestamp_now(&ts);
+        ASSERT_OK_ZERO(journal_file_append_entry(
+                        f, &ts, /* boot_id= */ NULL, &iovec, 1,
+                        /* seqnum= */ NULL, /* seqnum_id= */ NULL,
+                        /* ret_object= */ NULL, /* ret_offset= */ NULL));
+        ASSERT_EQ(journal_file_find_data_object(f, field, strlen(field), /* ret_object= */ NULL, &p), 1);
+        (void) journal_file_offline_close(f);
+
+        /* Make the data object its own successor in the hash chain */
+        self = htole64(p);
+        ASSERT_OK(fd = xopenat(AT_FDCWD, "test.journal", O_RDWR));
+        ASSERT_EQ(pwrite(fd, &self, sizeof(self), p + offsetof(Object, data.next_hash_offset)),
+                  (ssize_t) sizeof(self));
+        ASSERT_OK_ERRNO(close(fd));
+
+        ASSERT_OK_ZERO(journal_file_open(
+                        -EBADF, "test.journal", O_RDWR, JOURNAL_COMPRESS, 0666, UINT64_MAX,
+                        /* metrics= */ NULL, m, /* template= */ NULL, &f));
+        ASSERT_OK(journal_file_archive(f, /* ret_previous_path= */ NULL));
+
+        /* If the cycle is followed this never returns. Fail quickly and visibly then. */
+        alarm(10);
+        (void) journal_file_offline_close(f);
+        alarm(0);
+
+        if (arg_keep)
+                log_info("Not removing %s", t);
+        else
+                ASSERT_OK(rm_rf(t, REMOVE_ROOT | REMOVE_PHYSICAL));
+}
+
+TEST(punch_holes_hash_chain_cycle) {
+        const char *compact;
+
+        FOREACH_ARGUMENT(compact, "0", "1") {
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", compact, 1));
+                test_punch_holes_hash_chain_cycle_one();
+        }
+}
+
+static void test_enumerate_fields_hash_chain_cycle_one(void) {
+        _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        _cleanup_(sd_journal_closep) sd_journal *j = NULL;
+        char t[] = "/var/tmp/journal-XXXXXX";
+        const char *data = "CYCLE=x";
+        struct iovec iovec = IOVEC_MAKE_STRING(data);
+        const char *field;
+        dual_timestamp ts;
+        JournalFile *f;
+        uint64_t p;
+        le64_t self;
+        int fd;
+
+        /* sd_journal_enumerate_fields() follows the field hash chains. A chain that loops back on itself
+         * must be refused, instead of returning the same field over and over again. */
+
+        ASSERT_NOT_NULL(m = mmap_cache_new());
+        mkdtemp_chdir_chattr(t);
+
+        ASSERT_OK_ZERO(journal_file_open(
+                        -EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX,
+                        /* metrics= */ NULL, m, /* template= */ NULL, &f));
+        dual_timestamp_now(&ts);
+        ASSERT_OK_ZERO(journal_file_append_entry(
+                        f, &ts, /* boot_id= */ NULL, &iovec, 1,
+                        /* seqnum= */ NULL, /* seqnum_id= */ NULL,
+                        /* ret_object= */ NULL, /* ret_offset= */ NULL));
+        ASSERT_EQ(journal_file_find_field_object(f, "CYCLE", STRLEN("CYCLE"), /* ret_object= */ NULL, &p), 1);
+        (void) journal_file_offline_close(f);
+
+        /* Make the field object its own successor in the hash chain */
+        self = htole64(p);
+        ASSERT_OK(fd = xopenat(AT_FDCWD, "test.journal", O_RDWR));
+        ASSERT_EQ(pwrite(fd, &self, sizeof(self), p + offsetof(Object, field.next_hash_offset)),
+                  (ssize_t) sizeof(self));
+        ASSERT_OK_ERRNO(close(fd));
+
+        ASSERT_OK(sd_journal_open_directory(&j, t, SD_JOURNAL_ASSUME_IMMUTABLE));
+        ASSERT_ERROR(sd_journal_enumerate_fields(j, &field), EBADMSG);
+        sd_journal_close(TAKE_PTR(j));
+
+        if (arg_keep)
+                log_info("Not removing %s", t);
+        else
+                ASSERT_OK(rm_rf(t, REMOVE_ROOT | REMOVE_PHYSICAL));
+}
+
+TEST(enumerate_fields_hash_chain_cycle) {
+        const char *compact;
+
+        FOREACH_ARGUMENT(compact, "0", "1") {
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", compact, 1));
+                test_enumerate_fields_hash_chain_cycle_one();
+        }
+}
+
+static void test_enumerate_unique_field_list_cycle_one(void) {
+        _cleanup_(mmap_cache_unrefp) MMapCache *m = NULL;
+        _cleanup_(sd_journal_closep) sd_journal *j = NULL;
+        char t[] = "/var/tmp/journal-XXXXXX";
+        const char *data = "CYCLE=x";
+        struct iovec iovec = IOVEC_MAKE_STRING(data);
+        const void *value;
+        dual_timestamp ts;
+        JournalFile *f;
+        size_t size;
+        uint64_t p;
+        le64_t self;
+        int fd;
+
+        /* sd_journal_enumerate_unique() follows the list of data objects of a field. A list that loops back
+         * on itself must be refused, instead of returning the same value over and over again. */
+
+        ASSERT_NOT_NULL(m = mmap_cache_new());
+        mkdtemp_chdir_chattr(t);
+
+        ASSERT_OK_ZERO(journal_file_open(
+                        -EBADF, "test.journal", O_RDWR|O_CREAT, JOURNAL_COMPRESS, 0666, UINT64_MAX,
+                        /* metrics= */ NULL, m, /* template= */ NULL, &f));
+        dual_timestamp_now(&ts);
+        ASSERT_OK_ZERO(journal_file_append_entry(
+                        f, &ts, /* boot_id= */ NULL, &iovec, 1,
+                        /* seqnum= */ NULL, /* seqnum_id= */ NULL,
+                        /* ret_object= */ NULL, /* ret_offset= */ NULL));
+        ASSERT_EQ(journal_file_find_data_object(f, data, strlen(data), /* ret_object= */ NULL, &p), 1);
+        (void) journal_file_offline_close(f);
+
+        /* Make the data object its own successor in the list of its field */
+        self = htole64(p);
+        ASSERT_OK(fd = xopenat(AT_FDCWD, "test.journal", O_RDWR));
+        ASSERT_EQ(pwrite(fd, &self, sizeof(self), p + offsetof(Object, data.next_field_offset)),
+                  (ssize_t) sizeof(self));
+        ASSERT_OK_ERRNO(close(fd));
+
+        ASSERT_OK(sd_journal_open_directory(&j, t, SD_JOURNAL_ASSUME_IMMUTABLE));
+        ASSERT_OK(sd_journal_query_unique(j, "CYCLE"));
+        ASSERT_ERROR(sd_journal_enumerate_unique(j, &value, &size), EBADMSG);
+        sd_journal_close(TAKE_PTR(j));
+
+        if (arg_keep)
+                log_info("Not removing %s", t);
+        else
+                ASSERT_OK(rm_rf(t, REMOVE_ROOT | REMOVE_PHYSICAL));
+}
+
+TEST(enumerate_unique_field_list_cycle) {
+        const char *compact;
+
+        FOREACH_ARGUMENT(compact, "0", "1") {
+                ASSERT_OK_ERRNO(setenv("SYSTEMD_JOURNAL_COMPACT", compact, 1));
+                test_enumerate_unique_field_list_cycle_one();
         }
 }
 

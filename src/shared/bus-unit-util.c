@@ -5,6 +5,7 @@
 
 #include "sd-bus.h"
 
+#include "af-list.h"
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
@@ -507,7 +508,7 @@ static int bus_try_append_parse_cgroup_io_limit(sd_bus_message *m, const char *f
         else {
                 const char *e = strchr(eq, ' ');
                 if (!e)
-                        return parse_log_error(0, field, eq);
+                        return parse_log_error(/* error= */ 0, field, eq);
 
                 const char *bandwidth = e + 1;
                 _cleanup_free_ char *path = strndup(eq, e - eq);
@@ -539,7 +540,7 @@ static int bus_append_parse_io_device_weight(sd_bus_message *m, const char *fiel
         else {
                 const char *e = strchr(eq, ' ');
                 if (!e)
-                        return parse_log_error(0, field, eq);
+                        return parse_log_error(/* error= */ 0, field, eq);
 
                 const char *weight = e + 1;
                 _cleanup_free_ char *path = strndup(eq, e - eq);
@@ -568,7 +569,7 @@ static int bus_append_parse_io_device_latency(sd_bus_message *m, const char *fie
         else {
                 const char *e = strchr(eq, ' ');
                 if (!e)
-                        return parse_log_error(0, field, eq);
+                        return parse_log_error(/* error= */ 0, field, eq);
 
                 const char *target = e + 1;
                 _cleanup_free_ char *path = strndup(eq, e - eq);
@@ -596,7 +597,7 @@ static int bus_append_bpf_program(sd_bus_message *m, const char *field, const ch
         else {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&eq, &word, ":", 0);
+                r = extract_first_word(&eq, &word, ":", /* flags= */ 0);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
 
@@ -731,7 +732,7 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
         if (FLAGS_SET(flags, EXEC_COMMAND_VIA_SHELL))
                 path = _PATH_BSHELL;
         else if (explicit_path) {
-                r = extract_first_word(&eq, &_path, NULL, EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE);
+                r = extract_first_word(&eq, &_path, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -741,7 +742,7 @@ static int bus_append_exec_command(sd_bus_message *m, const char *field, const c
                 path = _path;
         }
 
-        r = strv_split_full(&cmdline, eq, NULL, EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE);
+        r = strv_split_full(&cmdline, eq, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE);
         if (r < 0)
                 return parse_log_error(r, field, eq);
 
@@ -879,11 +880,11 @@ static int bus_append_parse_ip_address_filter(sd_bus_message *m, const char *fie
         if (streq(eq, "any")) {
                 /* "any" is a shortcut for 0.0.0.0/0 and ::/0 */
 
-                r = bus_append_ip_address_access(m, AF_INET, &prefix, 0);
+                r = bus_append_ip_address_access(m, AF_INET, &prefix, /* prefixlen= */ 0);
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = bus_append_ip_address_access(m, AF_INET6, &prefix, 0);
+                r = bus_append_ip_address_access(m, AF_INET6, &prefix, /* prefixlen= */ 0);
                 if (r < 0)
                         return bus_log_create_error(r);
 
@@ -934,7 +935,7 @@ static int bus_append_parse_ip_address_filter(sd_bus_message *m, const char *fie
                 for (;;) {
                         _cleanup_free_ char *word = NULL;
 
-                        r = extract_first_word(&eq, &word, NULL, 0);
+                        r = extract_first_word(&eq, &word, /* separators= */ NULL, /* flags= */ 0);
                         if (r < 0)
                                 return parse_log_error(r, field, eq);
                         if (r == 0)
@@ -1016,18 +1017,18 @@ static int bus_append_nft_set(sd_bus_message *m, const char *field, const char *
                 const char *q = NULL;
                 int source, nfproto;
 
-                r = extract_first_word(&p, &tuple, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&p, &tuple, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
                         break;
                 if (isempty(tuple))
-                        return parse_log_error(0, field, eq);
+                        return parse_log_error(/* error= */ 0, field, eq);
 
                 q = tuple;
                 r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE, &source_str, &nfproto_str, &table, &set);
                 if (r != 4 || !isempty(q))
-                        return parse_log_error(0, field, tuple);
+                        return parse_log_error(/* error= */ 0, field, tuple);
 
                 assert(source_str);
                 assert(nfproto_str);
@@ -1271,7 +1272,7 @@ static int bus_append_refresh_on_reload(sd_bus_message *m, const char *field, co
         for (const char *p = eq + invert;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -1297,14 +1298,18 @@ static int bus_append_refresh_on_reload(sd_bus_message *m, const char *field, co
         return 1;
 }
 
-static int bus_append_log_extra_fields(sd_bus_message *m, const char *field, const char *eq) {
+int bus_append_log_extra_fields_strv(sd_bus_message *m, char * const *fields) {
         int r;
+
+        assert(m);
+
+        /* Appends a single "LogExtraFields" (sv) property entry carrying all the specified fields */
 
         r = sd_bus_message_open_container(m, 'r', "sv");
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_message_append_basic(m, 's', field);
+        r = sd_bus_message_append_basic(m, 's', "LogExtraFields");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1316,9 +1321,11 @@ static int bus_append_log_extra_fields(sd_bus_message *m, const char *field, con
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_message_append_array(m, 'y', eq, strlen(eq));
-        if (r < 0)
-                return bus_log_create_error(r);
+        STRV_FOREACH(f, fields) {
+                r = sd_bus_message_append_array(m, 'y', *f, strlen(*f));
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
 
         r = sd_bus_message_close_container(m);
         if (r < 0)
@@ -1333,6 +1340,12 @@ static int bus_append_log_extra_fields(sd_bus_message *m, const char *field, con
                 return bus_log_create_error(r);
 
         return 1;
+}
+
+static int bus_append_log_extra_fields(sd_bus_message *m, const char *field, const char *eq) {
+        assert(streq(field, "LogExtraFields"));
+
+        return bus_append_log_extra_fields_strv(m, STRV_MAKE(eq));
 }
 
 static int bus_append_log_filter_patterns(sd_bus_message *m, const char *field, const char *eq) {
@@ -1370,7 +1383,7 @@ static int bus_append_standard_input_text(sd_bus_message *m, const char *field, 
         _cleanup_free_ char *unescaped = NULL;
         ssize_t l;
 
-        l = cunescape(eq, 0, &unescaped);
+        l = cunescape(eq, /* flags= */ 0, &unescaped);
         if (l < 0)
                 return log_error_errno(l, "Failed to unescape value for %s=: %s", field, eq);
 
@@ -1476,7 +1489,7 @@ static int bus_append_cpu_affinity(sd_bus_message *m, const char *field, const c
                 r = sd_bus_message_append(m, "(sv)", "CPUAffinityFromNUMA", "b", true);
                 if (r < 0)
                         return bus_log_create_error(r);
-                return r;
+                return 1;
         }
 
         return bus_append_parse_cpu_set(m, field, eq);
@@ -1505,14 +1518,54 @@ static int bus_append_numa_mask(sd_bus_message *m, const char *field, const char
         return bus_append_byte_array(m, field, array, allocated);
 }
 
-static int bus_append_filter_list(sd_bus_message *m, const char *field, const char *eq) {
+static int bus_append_filter_list_full(
+                sd_bus_message *m,
+                const char *field,
+                const char *eq,
+                bool address_families) {
+
+        _cleanup_strv_free_ char **l = NULL;
         int allow_list = 1;
         const char *p = eq;
         int r;
 
-        if (*p == '~') {
+        if (address_families && streq(eq, "none"))
+                /* "none" is an empty allow list, i.e. everything is denied. This is also how the manager
+                 * serializes an empty allow list. */
+                p = "";
+        else if (address_families && isempty(eq))
+                /* Conversely, an empty deny list is what the manager treats as a reset, matching the meaning
+                 * of the empty string in unit files. */
+                allow_list = 0;
+        else if (*p == '~') {
                 allow_list = 0;
                 p++;
+        }
+
+        /* Parse everything first, so that the message is not left with open containers on failure. */
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&p, &word, /* separators= */ WHITESPACE ",", EXTRACT_UNQUOTE);
+                if (r < 0)
+                        return parse_log_error(r, field, eq);
+                if (r == 0)
+                        break;
+
+                if (address_families) {
+                        /* Resolve the name here and send the canonical form, so that the manager understands it
+                         * even if it does not know about the short forms yet, and so that unknown names are
+                         * reported with a useful message. */
+                        int af = af_from_name(word);
+                        if (af < 0)
+                                return log_error_errno(af, "Failed to parse %s= value '%s': unknown address family %s",
+                                                       field, eq, word);
+
+                        r = strv_extend(&l, ASSERT_PTR(af_to_name(af)));
+                } else
+                        r = strv_consume(&l, TAKE_PTR(word));
+                if (r < 0)
+                        return log_oom();
         }
 
         r = sd_bus_message_open_container(m, SD_BUS_TYPE_STRUCT, "sv");
@@ -1535,25 +1588,7 @@ static int bus_append_filter_list(sd_bus_message *m, const char *field, const ch
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_message_open_container(m, 'a', "s");
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        for (;;) {
-                _cleanup_free_ char *word = NULL;
-
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
-                if (r < 0)
-                        return parse_log_error(r, field, eq);
-                if (r == 0)
-                        break;
-
-                r = sd_bus_message_append_basic(m, 's', word);
-                if (r < 0)
-                        return bus_log_create_error(r);
-        }
-
-        r = sd_bus_message_close_container(m);
+        r = sd_bus_message_append_strv(m, l);
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1570,6 +1605,14 @@ static int bus_append_filter_list(sd_bus_message *m, const char *field, const ch
                 return bus_log_create_error(r);
 
         return 1;
+}
+
+static int bus_append_filter_list(sd_bus_message *m, const char *field, const char *eq) {
+        return bus_append_filter_list_full(m, field, eq, /* address_families= */ false);
+}
+
+static int bus_append_address_families(sd_bus_message *m, const char *field, const char *eq) {
+        return bus_append_filter_list_full(m, field, eq, /* address_families= */ true);
 }
 
 static int bus_append_namespace_list(sd_bus_message *m, const char *field, const char *eq) {
@@ -1658,7 +1701,7 @@ static int bus_append_bind_paths(sd_bus_message *m, const char *field, const cha
                         if (p && p[-1] == ':') {
                                 _cleanup_free_ char *options = NULL;
 
-                                r = extract_first_word(&p, &options, NULL, EXTRACT_UNQUOTE);
+                                r = extract_first_word(&p, &options, /* separators= */ NULL, EXTRACT_UNQUOTE);
                                 if (r < 0)
                                         return parse_log_error(r, field, p);
 
@@ -1717,7 +1760,7 @@ static int bus_append_temporary_file_system(sd_bus_message *m, const char *field
                 _cleanup_free_ char *word = NULL, *path = NULL;
                 const char *w;
 
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, EXTRACT_UNQUOTE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -1863,7 +1906,7 @@ static int bus_append_mount_images(sd_bus_message *m, const char *field, const c
                 const char *q = NULL, *source = NULL;
                 bool permissive = false;
 
-                r = extract_first_word(&p, &tuple, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&p, &tuple, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -1969,7 +2012,7 @@ static int bus_append_extension_images(sd_bus_message *m, const char *field, con
                 const char *q = NULL, *s = NULL;
                 bool permissive = false;
 
-                r = extract_first_word(&p, &tuple, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&p, &tuple, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -2048,8 +2091,11 @@ static int bus_append_extension_images(sd_bus_message *m, const char *field, con
 
 static int bus_append_directory(sd_bus_message *m, const char *field, const char *eq) {
         _cleanup_strv_free_ char **symlinks = NULL, **symlinks_ro = NULL, **sources = NULL, **sources_ro = NULL;
+        ExecDirectoryType type;
         const char *p = eq;
         int r;
+
+        assert_se((type = exec_directory_type_from_string(field)) >= 0);
 
         /* Adding new directories is supported from both *DirectorySymlink methods and the
          * older ones, so first parse the input, and if we are given a new-style src:dst
@@ -2058,7 +2104,7 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
         for (;;) {
                 _cleanup_free_ char *tuple = NULL, *source = NULL, *dest = NULL, *flags = NULL;
 
-                r = extract_first_word(&p, &tuple, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&p, &tuple, /* separators= */ NULL, EXTRACT_UNQUOTE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -2070,6 +2116,10 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
                         return parse_log_error(r, field, eq);
 
                 path_simplify(source);
+
+                if (!isempty(dest) && type == EXEC_DIRECTORY_CONFIGURATION)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Symlink destination is not supported for %s=: '%s'", field, tuple);
 
                 if (isempty(dest) && isempty(flags)) {
                         r = strv_consume(&sources, TAKE_PTR(source));
@@ -2083,7 +2133,8 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
                 } else {
                         ExecDirectoryFlags exec_directory_flags = exec_directory_flags_from_string(flags);
                         if (exec_directory_flags < 0 || (exec_directory_flags & ~_EXEC_DIRECTORY_FLAGS_PUBLIC) != 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse flags for %s=: '%s'", field, flags);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Failed to parse flags for %s=: '%s'", field, flags);
 
                         if (!isempty(dest)) {
                                 path_simplify(dest);
@@ -2095,7 +2146,11 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
                 }
         }
 
-        if (!strv_isempty(sources)) {
+        bool have_new = !strv_isempty(symlinks) || !strv_isempty(symlinks_ro) || !strv_isempty(sources_ro);
+
+        /* Send the old property if we have plain sources, and also if we parsed nothing at all: an empty
+         * assignment resets the list, and only the old property can express that. */
+        if (!strv_isempty(sources) || !have_new) {
                 r = sd_bus_message_open_container(m, SD_BUS_TYPE_STRUCT, "sv");
                 if (r < 0)
                         return bus_log_create_error(r);
@@ -2121,26 +2176,16 @@ static int bus_append_directory(sd_bus_message *m, const char *field, const char
                         return bus_log_create_error(r);
         }
 
-        /* For State and Runtime directories we support an optional destination parameter, which
-         * will be used to create a symlink to the source. But it is new so we cannot change the
-         * old DBUS signatures, so append a new message type. */
-        if (!strv_isempty(symlinks) || !strv_isempty(symlinks_ro) || !strv_isempty(sources_ro)) {
-                const char *symlink_field;
+        /* For State, Runtime, Cache and Logs directories we support an optional destination parameter,
+         * which will be used to create a symlink to the source. Additionally all directory types support
+         * a flags parameter. But these are new so we cannot change the old D-Bus signatures, hence append
+         * a new message type. */
+        if (have_new) {
+                const char *symlink_field = exec_directory_type_symlink_to_string(type);
 
                 r = sd_bus_message_open_container(m, SD_BUS_TYPE_STRUCT, "sv");
                 if (r < 0)
                         return bus_log_create_error(r);
-
-                if (streq(field, "StateDirectory"))
-                        symlink_field = "StateDirectorySymlink";
-                else if (streq(field, "RuntimeDirectory"))
-                        symlink_field = "RuntimeDirectorySymlink";
-                else if (streq(field, "CacheDirectory"))
-                        symlink_field = "CacheDirectorySymlink";
-                else if (streq(field, "LogsDirectory"))
-                        symlink_field = "LogsDirectorySymlink";
-                else
-                        assert_not_reached();
 
                 r = sd_bus_message_append_basic(m, SD_BUS_TYPE_STRING, symlink_field);
                 if (r < 0)
@@ -2226,7 +2271,7 @@ static int bus_append_protect_hostname(sd_bus_message *m, const char *field, con
                 const char *colon = strchr(eq, ':');
                 if (colon) {
                         if (isempty(colon + 1))
-                                return parse_log_error(0, field, eq);
+                                return parse_log_error(/* error= */ 0, field, eq);
 
                         _cleanup_free_ char *p = strndup(eq, colon - eq);
                         if (!p)
@@ -2277,7 +2322,7 @@ static int bus_append_exit_status(sd_bus_message *m, const char *field, const ch
         for (const char *p = eq;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, EXTRACT_UNQUOTE);
                 if (r < 0)
                         return parse_log_error(r, field, eq);
                 if (r == 0)
@@ -2605,7 +2650,6 @@ static const BusProperty execute_properties[] = {
         { "NoExecPaths",                           bus_append_strv                               },
         { "ExecSearchPath",                        bus_append_strv_colon                         },
         { "ExtensionDirectories",                  bus_append_strv                               },
-        { "ConfigurationDirectory",                bus_append_strv                               },
         { "SupplementaryGroups",                   bus_append_strv                               },
         { "SystemCallArchitectures",               bus_append_strv                               },
         { "SyslogLevel",                           bus_append_log_level_from_string              },
@@ -2656,11 +2700,12 @@ static const BusProperty execute_properties[] = {
         { "CPUAffinity",                           bus_append_cpu_affinity                       },
         { "NUMAPolicy",                            bus_append_mpol_from_string                   },
         { "NUMAMask",                              bus_append_numa_mask                          },
-        { "RestrictAddressFamilies",               bus_append_filter_list                        },
+        { "RestrictAddressFamilies",               bus_append_address_families                   },
         { "RestrictFileSystems",                   bus_append_filter_list                        },
         { "SystemCallFilter",                      bus_append_filter_list                        },
         { "SystemCallLog",                         bus_append_filter_list                        },
         { "RestrictNetworkInterfaces",             bus_append_filter_list                        },
+        { "IOUringFilter",                         bus_append_filter_list                        },
         { "RestrictNamespaces",                    bus_append_namespace_list                     },
         { "DelegateNamespaces",                    bus_append_namespace_list                     },
         { "BindPaths",                             bus_append_bind_paths                         },
@@ -2675,6 +2720,7 @@ static const BusProperty execute_properties[] = {
         { "RuntimeDirectory",                      bus_append_directory                          },
         { "CacheDirectory",                        bus_append_directory                          },
         { "LogsDirectory",                         bus_append_directory                          },
+        { "ConfigurationDirectory",                bus_append_directory                          },
         { "ProtectHostname",                       bus_append_protect_hostname                   },
         { "ProtectHostnameEx",                     bus_append_protect_hostname                   }, /* compat */
         { "PrivateTmp",                            bus_append_boolean_or_ex_string               },
@@ -3148,7 +3194,7 @@ int bus_deserialize_and_dump_unit_file_changes(sd_bus_message *m, bool quiet) {
         if (r < 0)
                 return r;
 
-        install_changes_dump(0, NULL, changes, n_changes, quiet);
+        install_changes_dump(/* error= */ 0, /* verb= */ NULL, changes, n_changes, quiet);
 
         return 0;
 }
@@ -3208,7 +3254,7 @@ int bus_service_manager_reload(sd_bus *bus) {
                 return bus_log_create_error(r);
 
         /* Reloading the daemon may take long, hence set a longer timeout here */
-        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
+        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, /* ret_reply= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to reload service manager: %s", bus_error_message(&error, r));
 
@@ -3293,11 +3339,11 @@ static int unit_freezer_action(UnitFreezer *f, bool freeze) {
 }
 
 int unit_freezer_freeze(UnitFreezer *f) {
-        return unit_freezer_action(f, true);
+        return unit_freezer_action(f, /* freeze= */ true);
 }
 
 int unit_freezer_thaw(UnitFreezer *f) {
-        return unit_freezer_action(f, false);
+        return unit_freezer_action(f, /* freeze= */ false);
 }
 
 ExecDirectoryFlags exec_directory_flags_from_string(const char *s) {
@@ -3308,4 +3354,14 @@ ExecDirectoryFlags exec_directory_flags_from_string(const char *s) {
                 return EXEC_DIRECTORY_READ_ONLY;
 
         return _EXEC_DIRECTORY_FLAGS_INVALID;
+}
+
+const char* exec_directory_flags_to_string(uint64_t flags) {
+        if (flags == 0)
+                return "";
+
+        if (flags == EXEC_DIRECTORY_READ_ONLY)
+                return "ro";
+
+        return NULL;
 }

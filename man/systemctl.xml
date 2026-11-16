@@ -571,6 +571,45 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           </listitem>
         </varlistentry>
         <varlistentry>
+          <term><command>wait <replaceable>UNIT</replaceable></command></term>
+
+          <listitem>
+            <para>Wait for the specified unit to terminate, i.e. to enter the <literal>inactive</literal> or
+            <literal>failed</literal> state. If the unit already terminated (or was not started yet), this
+            returns immediately. A unit that does not exist is treated like a unit that terminated
+            successfully, and a message about this is shown.</para>
+
+            <para>On exit, unless <option>--quiet</option> is specified, terse information about the unit's
+            runtime is shown, including total runtime (as well as CPU, memory, IO, and IP accounting data, if
+            the corresponding cgroup accounting settings are enabled) and the exit code and status of the
+            main process, similar to <command>systemd-run</command>'s <option>--wait</option> switch. Combine
+            with <option>--verbose</option> to also show the unit's log output while waiting.</para>
+
+            <para>The exit status of the unit is propagated: 0 is returned if the unit terminated
+            successfully, the exit status of the unit's main process if it failed with a non-zero exit code,
+            255 if it was terminated by a signal without dumping core, and a non-zero value otherwise (for
+            example if it dumped core, timed out, or was terminated via the watchdog logic). If the timeout
+            specified with <option>--wait-timeout=</option> elapses before the unit terminates, 124 is
+            returned. Note that this cannot be distinguished from a unit whose main process exited with
+            status 124.</para>
+
+            <para>Note that while waiting, the unit is referenced with the service manager (so that its final
+            state remains queryable after it terminated), which requires privileges, similarly to the other
+            unit lifecycle commands.</para>
+
+            <para>Use <option>--wait-timeout=</option> to limit how long to wait for the unit to terminate.
+            </para>
+
+            <para>If invoked as the main process of a service with <varname>Type=notify</varname>, a
+            <literal>READY=1</literal> notification is sent once the command is fully subscribed to the unit's
+            state changes, i.e. from that point on no state change of the unit will be missed. See
+            <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+            for details.</para>
+
+            <xi:include href="version-info.xml" xpointer="v263"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
           <term><command>kill <replaceable>PATTERN</replaceable>…</command></term>
 
           <listitem>
@@ -594,7 +633,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
             for details. It may also be used to clear the file descriptor store as enabled via
             <varname>FileDescriptorStoreMax=</varname>, see
             <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-            for details.  For timer units this may be used to clear out the persistent timestamp data if
+            for details. Clearing the store also removes copies of its file descriptors propagated to enclosing
+            service managers. For timer units this may be used to clear out the persistent timestamp data if
             <varname>Persistent=</varname> is used and <option>--what=state</option> is selected, see
             <citerefentry><refentrytitle>systemd.timer</refentrytitle><manvolnum>5</manvolnum></citerefentry>. This
             command only applies to units that use either of these settings. If <option>--what=</option> is
@@ -939,6 +979,11 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
             account.
             </para>
 
+            <para>This command also removes the <filename>/dev/null</filename> entries that a prior
+            <command>disable</command> placed in the unit configuration directory to shadow the symlinks the
+            vendor enabled the unit with below <filename>/usr/</filename>, see <command>disable</command>
+            below.</para>
+
             <para>When using this operation on units without install information, a warning about it is shown.
             <option>--no-warn</option> can be used to suppress the warning.</para>
 
@@ -969,6 +1014,19 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
             <command>link</command>. Note that while <command>disable</command> undoes the effect of
             <command>enable</command>, the two commands are otherwise not symmetric, as <command>disable</command> may
             remove more symlinks than a prior <command>enable</command> invocation of the same unit created.</para>
+
+            <para>A unit the vendor enabled with a <filename>.wants/</filename>, <filename>.requires/</filename>
+            or <filename>.upholds/</filename> symlink below <filename>/usr/</filename> is turned off by
+            placing a symlink to <filename>/dev/null</filename> with the same name in the unit configuration
+            directory. The service manager ignores a dependency entry that resolves to
+            <filename>/dev/null</filename>, so the entry shadows the vendor's symlink. The vendor's symlink
+            itself stays: <filename>/usr/</filename> is frequently read-only, and the next image update
+            would restore it. Only the symlinks that <command>enable</command> would create are shadowed,
+            i.e. the ones in the directories that <varname>WantedBy=</varname>,
+            <varname>RequiredBy=</varname> and <varname>UpheldBy=</varname> in the [Install] section name.
+            Any other dependency symlink below <filename>/usr/</filename> is a static dependency and stays in
+            effect. Existing masks stay too, including the masks of instances when a template unit is
+            disabled.</para>
 
             <para>This command expects valid unit names only, it does not accept paths to unit files.</para>
 
@@ -1032,9 +1090,24 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
             <para>Use <option>--preset-mode=</option> to control whether units shall be
             enabled and disabled, or only enabled, or only disabled.</para>
 
+            <para>A preset policy of <literal>disable</literal> removes the symlinks in the unit
+            configuration directory. Unlike <command>disable</command>, it leaves the symlinks the vendor
+            enabled a unit with below <filename>/usr/</filename> in effect. Preset files do not need to name
+            the units the vendor enabled.</para>
+
             <para>If the unit carries no install information, it will be silently ignored
             by this command. <replaceable>UNIT</replaceable> must be the real unit name,
             any alias names are ignored silently.</para>
+
+            <para>Where the vendor already provides the same symlink below
+            <filename>/usr/</filename>, be it a <filename>.wants/</filename>,
+            <filename>.requires/</filename> or <filename>.upholds/</filename> entry or an
+            <varname>Alias=</varname> name pointing at this unit, none is written to
+            <filename>/etc/systemd/system/</filename>: presetting re-asserts a policy rather than
+            recording a decision of the administrator, so there is nothing to record. This keeps
+            <filename>/etc/</filename> empty on images built with <option>--vendor</option>. Note that
+            <command>enable</command> does not behave this way, on purpose: an explicitly enabled unit
+            should stay enabled even if a later image drops the vendor symlink.</para>
 
             <para>For more information on the preset policy format, see
             <citerefentry><refentrytitle>systemd.preset</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
@@ -1087,7 +1160,7 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
                 <tbody>
                   <row>
                     <entry><literal>enabled</literal></entry>
-                    <entry morerows='1'>Enabled via <filename>.wants/</filename>, <filename>.requires/</filename> or <varname>Alias=</varname> symlinks (permanently in <filename>/etc/systemd/system/</filename>, or transiently in <filename>/run/systemd/system/</filename>).</entry>
+                    <entry morerows='1'>Enabled via <filename>.wants/</filename>, <filename>.requires/</filename> or <varname>Alias=</varname> symlinks (permanently in <filename>/etc/systemd/system/</filename>, or transiently in <filename>/run/systemd/system/</filename>). Units the vendor enabled with a <filename>.wants/</filename>, <filename>.requires/</filename> or <filename>.upholds/</filename> symlink below <filename>/usr/</filename>, in a directory the [Install] section of the unit names, are reported as <literal>enabled</literal> too: the service manager acts on those the same way.</entry>
                     <entry morerows='1'>0</entry>
                   </row>
                   <row>
@@ -1193,7 +1266,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
 
           <listitem>
             <para>Unmask one or more unit files, as specified on the command line. This will undo the effect of
-            <command>mask</command>. This command expects valid unit names only, it does not accept unit file
+            <command>mask</command>. Since version 263, the <option>--now</option> option may be used to
+            start the unmasked unit. This command expects valid unit names only, it does not accept unit file
             paths.</para>
 
             <xi:include href="version-info.xml" xpointer="v238"/>
@@ -2391,7 +2465,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
         <term><option>--verbose</option></term>
 
         <listitem>
-          <para>Display unit log output while executing unit operations.</para>
+          <para>Display unit log output while executing unit operations, or while waiting with
+          <command>wait</command>.</para>
 
           <xi:include href="version-info.xml" xpointer="v258"/>
         </listitem>
@@ -2458,6 +2533,21 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           this will wait forever if any given unit never terminates.</para>
 
           <xi:include href="version-info.xml" xpointer="v232"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--wait-timeout=</option><replaceable>SEC</replaceable></term>
+
+        <listitem>
+          <para>When used with <command>wait</command>, specifies the maximum time to wait for the unit to
+          terminate. Takes a time span, see
+          <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+          for details on the syntax. If the unit has not terminated when the timeout elapses,
+          <command>systemctl</command> gives up waiting and exits with status 124. By default, no timeout is
+          applied.</para>
+
+          <xi:include href="version-info.xml" xpointer="v263"/>
         </listitem>
       </varlistentry>
 
@@ -2648,8 +2738,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
 
         <listitem>
           <para>When used with <command>enable</command>, <command>disable</command>, <command>mask</command>,
-          or <command>reenable</command>, also start/stop/try-restart the units after the specified
-          unit file operations succeed.</para>
+          <command>unmask</command> or <command>reenable</command>, also start/stop/try-restart the units
+          after the specified unit file operations succeed.</para>
 
           <xi:include href="version-info.xml" xpointer="v220"/>
         </listitem>
@@ -2703,6 +2793,67 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
           <command>set-property</command>, make changes only
           temporarily, so that they are lost on the next
           reboot.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--vendor</option></term>
+
+        <listitem>
+          <para>When used with <command>enable</command>, <command>disable</command>,
+          <command>reenable</command>, <command>preset</command> or <command>preset-all</command>, operate on
+          the vendor unit directory <filename>/usr/lib/systemd/system/</filename> instead of
+          <filename>/etc/systemd/system/</filename> (with <option>--global</option>,
+          <filename>/usr/lib/systemd/user/</filename> instead of <filename>/etc/systemd/user/</filename>).
+          The service manager acts on the enablement symlinks in <filename>/usr/</filename> like on the ones
+          in <filename>/etc/</filename>, so units enabled this way are reported as <literal>enabled</literal>
+          and start at boot.</para>
+
+          <para>This option is intended for building OS images. Applying the preset policy to
+          <filename>/usr/</filename> at build time leaves <filename>/etc/</filename> empty. The administrator
+          can then use <filename>/etc/</filename> for local configuration only, and a factory reset only has
+          to remove <filename>/etc/</filename>. The option is normally used together with
+          <option>--root=</option>. It also works without it where <filename>/usr/</filename> is writable,
+          such as inside an image build container.</para>
+
+          <para><command>disable --vendor</command> removes the symlinks below <filename>/usr/</filename>.
+          Without <option>--vendor</option>, <command>disable</command> shadows them with a symlink to
+          <filename>/dev/null</filename> in <filename>/etc/</filename> instead, see
+          <command>disable</command> above.</para>
+
+          <para><command>preset --vendor</command> and <command>preset-all --vendor</command> remove the
+          symlinks below <filename>/usr/</filename> of units that the preset policy disables. With a catch-all
+          <literal>disable *</literal> rule, a unit the vendor enabled below <filename>/usr/</filename> stays
+          enabled only if an earlier rule enables it.</para>
+
+          <para>A dependency symlink below <filename>/usr/</filename> is a static dependency unless the
+          [Install] section names it through <varname>WantedBy=</varname>, <varname>RequiredBy=</varname>,
+          <varname>UpheldBy=</varname> or a legacy <varname>Alias=</varname> path. Neither
+          <command>disable</command> nor a preset policy removes static dependencies.</para>
+
+          <para><varname>Alias=</varname> symlinks are treated as names rather than as switches, since
+          removing one takes the name away from everything that refers to the unit by it instead of merely
+          turning the unit off. In the vendor unit directories only the names that an <literal>[Install]</literal>
+          section asks for are considered to belong to <command>systemctl</command> at all, so the
+          compatibility and slot names distributions install there, such as
+          <filename>default.target</filename> or the <filename>runlevel*.target</filename> symlinks, are left
+          alone. Of those, only an explicit <command>disable --vendor</command> removes any; a preset policy
+          never does, just like a preset into <filename>/etc/</filename> never does. For the same reason an
+          <varname>Alias=</varname> symlink below <filename>/usr/</filename> does not by itself make a unit
+          report as <literal>enabled</literal>. A unit whose <literal>[Install]</literal> section contains
+          nothing but <varname>Alias=</varname> is therefore reported as <literal>disabled</literal> once its
+          alias is installed below <filename>/usr/</filename>, even though the alias is in effect and the
+          unit is reachable under it.</para>
+
+          <para>This option may not be combined with <option>--runtime</option>, <option>--now</option>,
+          <option>--host=</option> or <option>--machine=</option>, and it is not available for
+          <option>--user</option>. <command>systemctl</command> always makes the changes itself rather than
+          asking the service manager to. For changes to system units on the running system,
+          <command>systemctl</command> reloads the service manager afterwards unless
+          <option>--no-reload</option> is given. With <option>--global</option>, <command>systemctl</command>
+          does not reload running user service managers.</para>
+
+          <xi:include href="version-info.xml" xpointer="v263"/>
         </listitem>
       </varlistentry>
 
@@ -2951,8 +3102,8 @@ Jan 12 10:46:45 example.com bluetoothd[8900]: gatt-time-server: Input/output err
         <listitem>
           <para>When used with <command>halt</command>, <command>poweroff</command>, <command>reboot</command>
           or <command>kexec</command>, schedule the action to be performed at the given timestamp,
-          which should adhere to the syntax documented in <citerefentry
-          project='man-pages'><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+          which should adhere to the syntax documented in
+          <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>
           section "PARSING TIMESTAMPS". Specially, if <literal>show</literal> is given, the currently scheduled
           action will be shown, which can be canceled by passing an empty string or <literal>cancel</literal>.
           <literal>auto</literal> will schedule the action according to maintenance window or one minute in
@@ -3061,6 +3212,10 @@ EOF
     <para>The mapping of LSB service states to systemd unit states is imperfect, so it is better to
     not rely on those return values but to look for specific unit states and substates instead.
     </para>
+
+    <para>The <command>wait</command> command does not use the LSB codes: it propagates the exit status of
+    the waited-for unit, in the same way <command>systemd-run</command>'s <option>--wait</option> switch
+    does. See above for details.</para>
   </refsect1>
 
   <refsect1>

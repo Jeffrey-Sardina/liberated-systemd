@@ -18,6 +18,9 @@ struct libmnt_monitor;
 
 /* Enforce upper limit on how many names we allow */
 #define MANAGER_MAX_NAMES 131072 /* 128K */
+/* Unprivileged callers have to be authorized for every unit of a batch separately, which takes one polkit
+ * round trip per unit. Only allow so many units for them, and don't let a huge batch keep PID 1 busy. */
+#define MANAGER_MAX_POLKIT_NAMES 1024
 
 /* Enforce upper limit on the number of patterns/states requested over IPC */
 #define MANAGER_MAX_PATTERNS_PER_CALL 4096U
@@ -493,6 +496,8 @@ typedef struct Manager {
         unsigned notifygen;
 
         sd_varlink_server *varlink_server;
+        /* Varlink clients streaming a job, by job id, carried across a reload since connections can't be serialized */
+        Hashmap *stashed_varlink_job_clients;
         /* When we're a system manager, this object manages the subscription from systemd-oomd to PID1 that's
          * used to report changes in ManagedOOM settings (systemd server - oomd client). When
          * we're a user manager, this object manages the client connection from the user manager to
@@ -514,8 +519,12 @@ typedef struct Manager {
         int restrict_fsaccess_link_fds[_RESTRICT_FILESYSTEM_ACCESS_LINK_MAX];
         int restrict_fsaccess_bss_map_fd;
 
-        /* Whether the ptrace seccomp filter is installed in this process; it survives execve() */
+        /* Whether the ptrace and personality seccomp filters are installed in this process; they survive
+         * execve() */
         bool restrict_fsaccess_ptrace_filter;
+        bool restrict_fsaccess_personality_filter;
+        /* The link FDs came from an older version, whose .bss layout differs from ours. */
+        bool restrict_fsaccess_foreign_bss;
 
         /* Allow users to configure a rate limit for Reload()/Reexecute() operations */
         RateLimit reload_reexec_ratelimit;

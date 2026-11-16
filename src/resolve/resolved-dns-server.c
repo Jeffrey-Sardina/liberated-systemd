@@ -11,6 +11,7 @@
 #include "fd-util.h"
 #include "hash-funcs.h"
 #include "json-util.h"
+#include "resolve-util.h"
 #include "resolved-bus.h"
 #include "resolved-dns-cache.h"
 #include "resolved-dns-delegate.h"
@@ -30,9 +31,6 @@
 /* The amount of time to wait before retrying with a full feature set */
 #define DNS_SERVER_FEATURE_GRACE_PERIOD_MAX_USEC (6 * USEC_PER_HOUR)
 #define DNS_SERVER_FEATURE_GRACE_PERIOD_MIN_USEC (5 * USEC_PER_MINUTE)
-
-/* The number of times we will attempt a certain feature set before degrading */
-#define DNS_SERVER_FEATURE_RETRY_ATTEMPTS 3
 
 int dns_server_new(
                 Manager *m,
@@ -271,9 +269,11 @@ static void dns_server_verified(DnsServer *s, DnsServerFeatureLevel level) {
                           dns_server_feature_level_to_string(level),
                           strna(dns_server_string_full(s)));
                 s->verified_feature_level = level;
-        }
 
-        assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+                /* Restart the grace period, but only when a new level was verified, not on every reply, or
+                 * it never elapses on a server in continuous use. See also dns_server_reset_counters(). */
+                assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+        }
 }
 
 static void dns_server_reset_counters(DnsServer *s) {
@@ -284,7 +284,13 @@ static void dns_server_reset_counters(DnsServer *s) {
         s->n_failed_tls = 0;
         s->packet_truncated = false;
         s->packet_invalid = false;
-        s->verified_usec = 0;
+
+        /* Restart the grace period, on the event loop's clock like dns_server_grace_period_expired(). This
+         * also runs from dns_server_new(), before the manager has an event loop, hence the fallback. */
+        if (s->manager->event)
+                assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
+        else
+                s->verified_usec = now(CLOCK_BOOTTIME);
 
         /* Note that we do not reset s->packet_bad_opt and s->packet_rrsig_missing here. We reset them only when the
          * grace period ends, but not when lowering the possible feature level, as a lower level feature level should
@@ -444,9 +450,6 @@ static bool dns_server_grace_period_expired(DnsServer *s) {
 
         assert(s);
         assert(s->manager);
-
-        if (s->verified_usec == 0)
-                return false;
 
         assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &ts) >= 0);
 
@@ -685,7 +688,7 @@ int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeature
 
         log_debug("Announcing packet size %zu in egress EDNS(0) packet.", packet_size);
 
-        return dns_packet_append_opt(packet, packet_size, edns_do, /* include_rfc6975= */ true, NULL, 0, NULL);
+        return dns_packet_append_opt(packet, packet_size, edns_do, /* include_rfc6975= */ true, /* nsid= */ NULL, /* rcode= */ 0, /* ret_start= */ NULL);
 }
 
 int dns_server_ifindex(const DnsServer *s) {
@@ -938,7 +941,7 @@ int manager_parse_dns_server_string_and_warn(Manager *m, DnsServerType type, con
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&string, &word, NULL, 0);
+                r = extract_first_word(&string, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r <= 0)
                         return r;
 
@@ -995,7 +998,7 @@ int manager_parse_search_domains_and_warn(Manager *m, const char *string) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&string, &word, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&string, &word, /* separators= */ NULL, EXTRACT_UNQUOTE);
                 if (r <= 0)
                         return r;
 
@@ -1080,7 +1083,7 @@ DnsServer *manager_get_dns_server(Manager *m) {
 
         while (m->current_dns_server &&
                manager_server_is_stub(m, m->current_dns_server)) {
-                manager_next_dns_server(m, NULL);
+                manager_next_dns_server(m, /* if_current= */ NULL);
                 if (m->current_dns_server == m->dns_servers)
                         manager_set_dns_server(m, NULL);
         }

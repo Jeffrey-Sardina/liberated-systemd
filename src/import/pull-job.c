@@ -5,13 +5,18 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include "sd-event.h"
+#include "sd-varlink.h"
+
 #include "alloc-util.h"
 #include "compress.h"
 #include "crypto-util.h"
 #include "curl-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "hexdecoct.h"
+#include "import-common.h"
 #include "io-util.h"
 #include "log.h"
 #include "parse-util.h"
@@ -20,6 +25,8 @@
 #include "strv.h"
 #include "sync-util.h"
 #include "time-util.h"
+#include "uapi16-manifest.h"
+#include "web-util.h"
 #include "xattr-util.h"
 
 static int http_status_ok(CURLcode status) {
@@ -46,6 +53,14 @@ void pull_job_close_disk_fd(PullJob *j) {
         j->disk_fd = -EBADF;
 }
 
+static void pull_job_provider_done(PullJob *j) {
+        assert(j);
+
+        j->provider_source = sd_event_source_disable_unref(j->provider_source);
+        j->provider_link = sd_varlink_close_unref(j->provider_link);
+        j->provider_fd = safe_close(j->provider_fd);
+}
+
 PullJob* pull_job_unref(PullJob *j) {
         if (!j)
                 return NULL;
@@ -53,7 +68,10 @@ PullJob* pull_job_unref(PullJob *j) {
         pull_job_close_disk_fd(j);
 
         curl_slot_unref(j->slot);
-        sym_curl_slist_free_all(j->request_header);
+        pull_job_provider_done(j);
+        if (j->request_header) /* libcurl might not even be loaded if we never had a curl transfer */
+                sym_curl_slist_free_all(j->request_header);
+        sd_event_unref(j->event);
 
         j->compress = compressor_free(j->compress);
 
@@ -61,6 +79,8 @@ PullJob* pull_job_unref(PullJob *j) {
                 sym_EVP_MD_CTX_free(j->checksum_ctx);
 
         free(j->url);
+        free(j->main_filename);
+        uapi16_certificates_free(j->uapi16_certificates, j->n_uapi16_certificates);
         free(j->etag);
         strv_free(j->old_etags);
         iovec_done(&j->payload);
@@ -89,6 +109,12 @@ static int pull_job_finish(PullJob *j, int ret) {
 
         if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return 0;
+
+        /* Stop listening for further data and release the connection, if we are using the Varlink
+         * transport. This matters if we finish early (i.e. once we acquired the requested source range),
+         * since otherwise the provider would remain blocked writing to us until the job is freed. The curl
+         * transport similarly aborts the transfer in that case. */
+        pull_job_provider_done(j);
 
         if (ret == 0) {
                 j->state = PULL_JOB_DONE;
@@ -124,6 +150,8 @@ int pull_job_restart(PullJob *j, const char *new_url) {
         iovec_done(&j->payload);
         j->written_compressed = 0;
         j->written_uncompressed = 0;
+        j->decoded_total = 0;
+        j->range_requested = j->range_applied = false;
         j->content_length = UINT64_MAX;
         j->etag = mfree(j->etag);
         j->etag_exists = false;
@@ -138,6 +166,7 @@ int pull_job_restart(PullJob *j, const char *new_url) {
         }
 
         j->slot = curl_slot_unref(j->slot);
+        pull_job_provider_done(j);
 
         j->compress = compressor_free(j->compress);
 
@@ -170,6 +199,29 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
         assert(p);
         assert(sz > 0);
 
+        /* Only pass on the requested range of the decoded data, i.e. skip over everything before it and
+         * drop everything after it. Note that the dropped data is still covered by the checksum of the
+         * download, as that is calculated from the encoded data. */
+        if (j->decoded_total > UINT64_MAX - sz)
+                return log_error_errno(SYNTHETIC_ERRNO(EOVERFLOW), "File too large, overflow");
+
+        uint64_t pos = j->decoded_total;
+        j->decoded_total += sz;
+
+        if (j->decoded_total <= j->source_offset)
+                return 0;
+        if (pos < j->source_offset) {
+                p = (const uint8_t*) p + (j->source_offset - pos);
+                sz -= j->source_offset - pos;
+        }
+
+        if (j->source_size != UINT64_MAX) {
+                if (j->written_uncompressed >= j->source_size)
+                        return 0;
+
+                sz = MIN(sz, j->source_size - j->written_uncompressed);
+        }
+
         if (j->written_uncompressed > UINT64_MAX - sz)
                 return log_error_errno(SYNTHETIC_ERRNO(EOVERFLOW), "File too large, overflow");
 
@@ -184,6 +236,8 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
                                                                      * already, we might as well write it to
                                                                      * disk to the max */
         }
+
+        import_digest_update(&j->decoded_digest, p, sz);
 
         if (j->disk_fd >= 0) {
 
@@ -280,6 +334,9 @@ static int pull_job_open_disk(PullJob *j) {
                 }
         }
 
+        /* Start from scratch, in case we are restarted */
+        import_digest_reset(&j->decoded_digest);
+
         if (j->calc_checksum) {
                 r = dlopen_libcrypto(LOG_ERR);
                 if (r < 0)
@@ -289,7 +346,7 @@ static int pull_job_open_disk(PullJob *j) {
                 if (!j->checksum_ctx)
                         return log_oom();
 
-                r = sym_EVP_DigestInit_ex(j->checksum_ctx, sym_EVP_sha256(), NULL);
+                r = sym_EVP_DigestInit_ex(j->checksum_ctx, sym_EVP_sha256(), /* impl= */ NULL);
                 if (r == 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Failed to initialize hash context.");
@@ -321,95 +378,30 @@ static int pull_job_begin_running(PullJob *j) {
         return 0;
 }
 
-static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result, void *userdata) {
-        PullJob *j = ASSERT_PTR(userdata);
-        char *scheme = NULL;
-        CURLcode code;
+static bool pull_job_source_range_done(PullJob *j) {
+        assert(j);
+
+        /* Returns true if we have written out the complete requested source range, and the rest of the
+         * download is of no interest to us, since we need no checksum of it as a whole */
+
+        return j->state == PULL_JOB_RUNNING &&
+                !j->checksum_ctx &&
+                j->source_size != UINT64_MAX &&
+                j->written_uncompressed >= j->source_size;
+}
+
+static int pull_job_complete(PullJob *j, bool early) {
         int r;
 
-        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
-                return 0;
+        assert(j);
 
-        code = sym_curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
-        if (code != CURLE_OK || !scheme)
-                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme."));
-
-        if (strcaseeq(scheme, "FILE") && result == CURLE_FILE_COULDNT_READ_FILE && j->on_not_found) {
-                _cleanup_free_ char *new_url = NULL;
-
-                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
-                r = j->on_not_found(j, &new_url);
-                if (r < 0)
-                        return pull_job_finish(j, r);
-                if (r > 0) { /* A new url to use */
-                        assert(new_url);
-
-                        r = pull_job_restart(j, new_url);
-                        if (r < 0)
-                                return pull_job_finish(j, r);
-
-                        return 0;
-                }
-
-                /* if this didn't work, handle like any other error below */
-        }
-
-        if (result != CURLE_OK)
-                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", sym_curl_easy_strerror(result)));
-
-        if (STRCASE_IN_SET(scheme, "HTTP", "HTTPS")) {
-                long status;
-
-                code = sym_curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-                if (code != CURLE_OK)
-                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
-
-                if (http_status_etag_exists(status)) {
-                        log_info("Image already downloaded. Skipping download.");
-                        j->etag_exists = true;
-                        return pull_job_finish(j, 0);
-                } else if (http_status_need_authentication(status)) {
-                        log_info("Access to image requires authentication.");
-                        return pull_job_finish(j, -ENOKEY);
-                } else if (status >= 300) {
-
-                        if (status == 404 && j->on_not_found) {
-                                _cleanup_free_ char *new_url = NULL;
-
-                                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
-                                r = j->on_not_found(j, &new_url);
-                                if (r < 0)
-                                        return pull_job_finish(j, r);
-
-                                if (r > 0) { /* A new url to use */
-                                        assert(new_url);
-
-                                        r = pull_job_restart(j, new_url);
-                                        if (r < 0)
-                                                return pull_job_finish(j, r);
-
-                                        code = sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status);
-                                        if (code != CURLE_OK)
-                                                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
-
-                                        if (status == 0)
-                                                return 0;
-                                }
-                        }
-
-                        return pull_job_finish(j, log_notice_errno(
-                                        status == 404 ? SYNTHETIC_ERRNO(ENOMEDIUM) : SYNTHETIC_ERRNO(EIO), /* Make the most common error recognizable */
-                                        "HTTP request to %s failed with code %li.", j->url, status));
-                } else if (status < 200)
-                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "HTTP request to %s finished with unexpected code %li.", j->url, status));
-        }
+        /* Called once the transport delivered all data of the download: finalizes decompression, verifies
+         * the size and checksum, and finishes off the target file. Returns 0 like pull_job_finish(). */
 
         if (j->state == PULL_JOB_ANALYZING) {
-                /* When curl finished the download while we were still looking for a compression magic
-                 * header the content isn't compressed but should be written out as is. */
-                assert(result == CURLE_OK);
-
-                r = decompressor_force_off(&j->compress);
+                /* When the transfer finished while we were still looking for a compression magic header, use
+                 * the configured algorithm, or assume the content isn't compressed and write it out as is. */
+                r = decompressor_force(&j->compress, j->compression >= 0 ? j->compression : COMPRESSION_NONE);
                 if (r < 0)
                         return pull_job_finish(j, r);
 
@@ -421,15 +413,23 @@ static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result
         if (j->state != PULL_JOB_RUNNING)
                 return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Premature connection termination."));
 
-        /* Finalize decompressor. */
-        r = decompressor_push(j->compress, /* data= */ NULL, /* size= */ 0, pull_job_write_uncompressed, j);
-        if (r < 0)
-                return pull_job_finish(j, r);
+        /* If we stop early, after the requested source range, the stream is incomplete by design, hence
+         * neither finalize the decompressor nor check the length in that case. */
+        if (!early) {
+                /* Finalize decompressor. */
+                r = decompressor_push(j->compress, /* data= */ NULL, /* size= */ 0, pull_job_write_uncompressed, j);
+                if (r < 0)
+                        return pull_job_finish(j, r);
 
-        uint64_t cl = pull_job_content_length_effective(j);
-        if (cl != UINT64_MAX &&
-            cl != j->written_compressed)
-                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Download truncated."));
+                if (j->decoded_total < j->source_offset ||
+                    (j->source_size != UINT64_MAX && j->written_uncompressed < j->source_size))
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Decoded data of %s ends before the requested range does, refusing.", pull_job_description(j)));
+
+                uint64_t cl = pull_job_content_length_effective(j);
+                if (cl != UINT64_MAX &&
+                    cl != j->written_compressed)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Download truncated."));
+        }
 
         if (j->checksum_ctx) {
                 unsigned checksum_len;
@@ -456,6 +456,16 @@ static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result
                 if (iovec_is_set(&j->expected_checksum) &&
                     !iovec_equal(&j->checksum, &j->expected_checksum))
                         return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Checksum of downloaded resource does not match expected checksum, yikes."));
+        }
+
+        r = import_digest_verify(&j->decoded_digest);
+        if (r < 0)
+                return pull_job_finish(j, r);
+
+        if (j->disk_fd >= 0 && j->zero_fill) {
+                r = import_zero_fill(j->disk_fd, j->offset, j->uncompressed_max, j->written_uncompressed);
+                if (r < 0)
+                        return pull_job_finish(j, r);
         }
 
         /* Do a couple of finishing disk operations, but only if we are the sole owner of the file (i.e. no
@@ -508,13 +518,134 @@ static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result
 
         log_info("Acquired %s for %s.", FORMAT_BYTES(j->written_uncompressed), pull_job_description(j));
 
-        return pull_job_finish(j, 0);
+        return pull_job_finish(j, /* ret= */ 0);
+}
+
+static int pull_job_curl_on_finished(CurlSlot *slot, CURL *curl, CURLcode result, void *userdata) {
+        PullJob *j = ASSERT_PTR(userdata);
+        char *scheme = NULL;
+        CURLcode code;
+        int r;
+
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
+                return 0;
+
+        code = sym_curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
+        if (code != CURLE_OK || !scheme)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme."));
+
+        if (strcaseeq(scheme, "FILE") && result == CURLE_FILE_COULDNT_READ_FILE && j->on_not_found) {
+                _cleanup_free_ char *new_url = NULL;
+
+                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
+                r = j->on_not_found(j, &new_url);
+                if (r < 0)
+                        return pull_job_finish(j, r);
+                if (r > 0) { /* A new url to use */
+                        assert(new_url);
+
+                        r = pull_job_restart(j, new_url);
+                        if (r < 0)
+                                return pull_job_finish(j, r);
+
+                        return 0;
+                }
+
+                /* if this didn't work, handle like any other error below */
+        }
+
+        if (result != CURLE_OK)
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", sym_curl_easy_strerror(result)));
+
+        if (STRCASE_IN_SET(scheme, "HTTP", "HTTPS")) {
+                long status;
+
+                code = sym_curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+                if (code != CURLE_OK)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
+
+                if (http_status_etag_exists(status)) {
+                        log_info("Image already downloaded. Skipping download.");
+                        j->etag_exists = true;
+                        return pull_job_finish(j, /* ret= */ 0);
+                } else if (http_status_need_authentication(status)) {
+                        log_info("Access to image requires authentication.");
+                        return pull_job_finish(j, -ENOKEY);
+                } else if (status >= 300) {
+
+                        if (status == 404 && j->on_not_found) {
+                                _cleanup_free_ char *new_url = NULL;
+
+                                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
+                                r = j->on_not_found(j, &new_url);
+                                if (r < 0)
+                                        return pull_job_finish(j, r);
+
+                                if (r > 0) { /* A new url to use */
+                                        assert(new_url);
+
+                                        r = pull_job_restart(j, new_url);
+                                        if (r < 0)
+                                                return pull_job_finish(j, r);
+
+                                        code = sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status);
+                                        if (code != CURLE_OK)
+                                                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve response code: %s", sym_curl_easy_strerror(code)));
+
+                                        if (status == 0)
+                                                return 0;
+                                }
+                        }
+
+                        return pull_job_finish(j, log_notice_errno(
+                                        status == 404 ? SYNTHETIC_ERRNO(ENOMEDIUM) : SYNTHETIC_ERRNO(EIO), /* Make the most common error recognizable */
+                                        "HTTP request to %s failed with code %li.", j->url, status));
+                } else if (status < 200)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "HTTP request to %s finished with unexpected code %li.", j->url, status));
+        }
+
+        return pull_job_complete(j, /* early= */ false);
+}
+
+static bool pull_job_http_status_ok(PullJob *j) {
+        long status;
+
+        assert(j);
+
+        /* Returns false if this is an HTTP transfer and the response so far isn't a 2xx one */
+
+        if (!j->slot)
+                return true;
+
+        if (sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status) != CURLE_OK)
+                return true;
+
+        return status == 0 || http_status_ok(status);
 }
 
 static int pull_job_detect_compression(PullJob *j) {
         int r;
 
         assert(j);
+
+        if (j->compression >= 0) {
+                /* The body of an HTTP error response (e.g. a 404 page) is not encoded with the algorithm we
+                 * expect, hence don't feed it into the decompressor, but drop it. The job will fail with the
+                 * HTTP error once the transfer finished. */
+                if (!pull_job_http_status_ok(j)) {
+                        iovec_done(&j->payload);
+                        return 0;
+                }
+
+                /* We were told which algorithm to expect, hence don't guess from the data, but strictly use
+                 * that one. */
+                r = decompressor_force(&j->compress, j->compression);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to initialize decompressor: %m");
+
+                log_debug("Using configured compression: %s", compression_to_string(j->compression));
+                return pull_job_begin_running(j);
+        }
 
         r = decompressor_detect(&j->compress, j->payload.iov_base, j->payload.iov_len);
         if (r < 0)
@@ -527,6 +658,48 @@ static int pull_job_detect_compression(PullJob *j) {
         return pull_job_begin_running(j);
 }
 
+static int pull_job_process_data(PullJob *j, const void *p, size_t sz) {
+        int r;
+
+        assert(j);
+        assert(p || sz == 0);
+
+        /* Feeds a chunk of downloaded data into the job, regardless of the transport it arrived through */
+
+        switch (j->state) {
+
+        case PULL_JOB_ANALYZING:
+                /* Let's first check what it actually is */
+                if (!iovec_append(&j->payload, &IOVEC_MAKE((void*) p, sz)))
+                        return log_oom();
+
+                return pull_job_detect_compression(j);
+
+        case PULL_JOB_RUNNING:
+                r = pull_job_write_compressed(j, &IOVEC_MAKE((void*) p, sz));
+                if (r < 0)
+                        return r;
+
+                /* Once we have the requested source range, there's no need to download (and decode) the
+                 * rest, unless we need the checksum of the whole download. Don't do this for HTTP error
+                 * responses though, whose body is not what we asked for: such a transfer has to run to
+                 * its end, so that it fails with the HTTP error. */
+                if (pull_job_http_status_ok(j) && pull_job_source_range_done(j)) {
+                        log_debug("Acquired requested range of %s, ending transfer.", pull_job_description(j));
+                        return pull_job_complete(j, /* early= */ true);
+                }
+
+                return 0;
+
+        case PULL_JOB_DONE:
+        case PULL_JOB_FAILED:
+                return -ESTALE;
+
+        default:
+                assert_not_reached();
+        }
+}
+
 static size_t pull_job_write_callback(void *contents, size_t size, size_t nmemb, void *userdata) {
         PullJob *j = ASSERT_PTR(userdata);
         size_t sz = size * nmemb;
@@ -534,42 +707,47 @@ static size_t pull_job_write_callback(void *contents, size_t size, size_t nmemb,
 
         assert(contents);
 
-        switch (j->state) {
+        /* If the server replied with partial content we must know where it starts. (If it replied with the
+         * full content instead, we cut out the range ourselves.) */
+        if (j->range_requested && !j->range_applied) {
+                long status;
 
-        case PULL_JOB_ANALYZING:
-                /* Let's first check what it actually is */
-                if (!iovec_append(&j->payload, &IOVEC_MAKE(contents, sz))) {
-                        r = log_oom();
-                        goto fail;
+                if (sym_curl_easy_getinfo(curl_slot_get_easy(j->slot), CURLINFO_RESPONSE_CODE, &status) == CURLE_OK &&
+                    status == 206) {
+                        pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EPROTO), "Server returned partial content without range information for %s, refusing.", pull_job_description(j)));
+                        return 0;
                 }
-
-                r = pull_job_detect_compression(j);
-                if (r < 0)
-                        goto fail;
-
-                break;
-
-        case PULL_JOB_RUNNING:
-                r = pull_job_write_compressed(j, &IOVEC_MAKE(contents, sz));
-                if (r < 0)
-                        goto fail;
-
-                break;
-
-        case PULL_JOB_DONE:
-        case PULL_JOB_FAILED:
-                r = -ESTALE;
-                goto fail;
-
-        default:
-                assert_not_reached();
         }
 
-        return sz;
+        r = pull_job_process_data(j, contents, sz);
+        if (r < 0) {
+                pull_job_finish(j, r);
+                return 0;
+        }
 
-fail:
-        pull_job_finish(j, r);
-        return 0;
+        /* If we are done already (because we have everything we need), abort the transfer */
+        if (PULL_JOB_IS_COMPLETE(j))
+                return 0;
+
+        return sz;
+}
+
+static bool pull_job_content_range_ok(PullJob *j, uint64_t start, uint64_t end, uint64_t total) {
+        assert(j);
+
+        /* Checks whether the range the server returned is the one we asked for */
+
+        if (!j->range_requested || start != j->source_offset)
+                return false;
+
+        /* For an open-ended request the server must return everything up to the end of the source,
+         * which we can only tell if it tells us the total size */
+        if (j->source_size == UINT64_MAX)
+                return total != UINT64_MAX && end == total - 1;
+
+        /* For a closed range it must not return more than we asked for. (If it returns less, because the
+         * source is shorter, we'll notice once the download finished.) */
+        return end <= j->source_offset + j->source_size - 1;
 }
 
 static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb, void *userdata) {
@@ -608,6 +786,35 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
                 return sz;
         }
 
+        if (status == 206) {
+                _cleanup_free_ char *range = NULL;
+
+                r = curl_header_strdup(contents, sz, "Content-Range:", &range);
+                if (r < 0) {
+                        log_oom();
+                        goto fail;
+                }
+                if (r > 0) {
+                        /* The server sent us only the range we asked for, hence the data we receive starts
+                         * at its beginning rather than at the start of the source. */
+                        uint64_t start, end, total;
+                        r = parse_content_range(range, &start, &end, &total);
+                        if (r == -ENOMEM) {
+                                log_oom();
+                                goto fail;
+                        }
+                        if (r < 0 || !pull_job_content_range_ok(j, start, end, total)) {
+                                r = log_error_errno(SYNTHETIC_ERRNO(EPROTO), "Server returned unexpected range '%s' for %s, refusing.", range, pull_job_description(j));
+                                goto fail;
+                        }
+
+                        log_debug("Server honoured range request for %s, starting at offset %" PRIu64 ".", pull_job_description(j), start);
+                        j->decoded_total = start;
+                        j->range_applied = true;
+                        return sz;
+                }
+        }
+
         if (http_status_ok(status) || http_status_etag_exists(status)) {
                 /* Check Etag on OK and etag exists responses. */
 
@@ -622,7 +829,7 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
                         if (strv_contains(j->old_etags, j->etag)) {
                                 log_info("Image already downloaded. Skipping download. (%s)", j->etag);
                                 j->etag_exists = true;
-                                pull_job_finish(j, 0);
+                                pull_job_finish(j, /* ret= */ 0);
                                 return sz;
                         }
 
@@ -693,32 +900,36 @@ fail:
         return 0;
 }
 
-static int pull_job_progress_callback(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
-        PullJob *j = ASSERT_PTR(userdata);
+static void pull_job_report_progress(PullJob *j, uint64_t total, uint64_t current) {
         unsigned percent;
         usec_t n;
 
-        if (dltotal <= 0)
-                return 0;
+        assert(j);
 
-        percent = ((100 * dlnow) / dltotal);
+        /* Reports download progress, regardless of the transport. 'total' may be UINT64_MAX or zero if the
+         * total size is unknown, in which case nothing is reported. */
+
+        if (total <= 0 || total == UINT64_MAX || current > total)
+                return;
+
+        percent = ((100 * current) / total);
         n = now(CLOCK_MONOTONIC);
 
         if (n > j->last_status_usec + USEC_PER_SEC &&
             percent != j->progress_percent &&
-            dlnow < dltotal) {
+            current < total) {
 
-                if (n - j->start_usec > USEC_PER_SEC && dlnow > 0) {
+                if (n - j->start_usec > USEC_PER_SEC && current > 0) {
                         usec_t left, done;
 
                         done = n - j->start_usec;
-                        left = (usec_t) (((double) done * (double) dltotal) / dlnow) - done;
+                        left = (usec_t) (((double) done * (double) total) / current) - done;
 
                         log_info("Got %u%% of %s. %s left at %s/s.",
                                  percent,
                                  pull_job_description(j),
                                  FORMAT_TIMESPAN(left, USEC_PER_SEC),
-                                 FORMAT_BYTES((uint64_t) ((double) dlnow / ((double) done / (double) USEC_PER_SEC))));
+                                 FORMAT_BYTES((uint64_t) ((double) current / ((double) done / (double) USEC_PER_SEC))));
                 } else
                         log_info("Got %u%% of %s.", percent, pull_job_description(j));
 
@@ -728,13 +939,22 @@ static int pull_job_progress_callback(void *userdata, curl_off_t dltotal, curl_o
                 if (j->on_progress)
                         j->on_progress(j);
         }
+}
 
+static int pull_job_progress_callback(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+        PullJob *j = ASSERT_PTR(userdata);
+
+        if (dltotal <= 0 || dlnow < 0)
+                return 0;
+
+        pull_job_report_progress(j, (uint64_t) dltotal, (uint64_t) dlnow);
         return 0;
 }
 
 int pull_job_new(
                 PullJob **ret,
                 const char *url,
+                sd_event *event,
                 CurlGlue *glue,
                 void *userdata) {
 
@@ -742,7 +962,8 @@ int pull_job_new(
         _cleanup_free_ char *u = NULL;
 
         assert(url);
-        assert(glue);
+        assert(event);
+        assert(!glue || curl_glue_get_event(glue) == event);
         assert(ret);
 
         u = strdup(url);
@@ -756,8 +977,11 @@ int pull_job_new(
         *j = (PullJob) {
                 .state = PULL_JOB_INIT,
                 .disk_fd = -EBADF,
+                .compression = _COMPRESSION_INVALID,
                 .close_disk_fd = true,
+                .provider_fd = -EBADF,
                 .userdata = userdata,
+                .event = sd_event_ref(event),
                 .glue = glue,
                 .content_length = UINT64_MAX,
                 .start_usec = now(CLOCK_MONOTONIC),
@@ -765,6 +989,7 @@ int pull_job_new(
                 .uncompressed_max = 64LLU * 1024LLU * 1024LLU * 1024LLU, /* 64GB safety limit */
                 .url = TAKE_PTR(u),
                 .offset = UINT64_MAX,
+                .source_size = UINT64_MAX,
                 .sync = true,
                 .expected_content_length = UINT64_MAX,
         };
@@ -795,6 +1020,180 @@ int pull_job_add_request_header(PullJob *j, const char *hdr) {
         return 0;
 }
 
+static int pull_job_provider_on_io(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        PullJob *j = ASSERT_PTR(userdata);
+        uint8_t buffer[32 * 1024];
+        ssize_t n;
+        int r;
+
+        assert(fd >= 0);
+
+        n = read(fd, buffer, sizeof(buffer));
+        if (n < 0) {
+                if (ERRNO_IS_TRANSIENT(errno))
+                        return 0;
+
+                return pull_job_finish(j, log_error_errno(errno, "Failed to read from resource provider for %s: %m", j->url));
+        }
+        if (n == 0) /* EOF: the provider has sent everything */
+                return pull_job_complete(j, /* early= */ false);
+
+        r = pull_job_process_data(j, buffer, (size_t) n);
+        if (r < 0)
+                return pull_job_finish(j, r);
+        if (PULL_JOB_IS_COMPLETE(j)) /* We have everything we need already */
+                return 0;
+
+        pull_job_report_progress(j, pull_job_content_length_effective(j), j->written_compressed);
+        return 0;
+}
+
+static int pull_job_provider_on_upgrade(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        _cleanup_close_ int in = input_fd, out = output_fd; /* We own these now */
+        PullJob *j = ASSERT_PTR(userdata);
+        int r;
+
+        assert(link);
+
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
+                return 0;
+
+        /* The provider accepted the request, from now on the connection carries the raw resource data. We
+         * only ever read from it, hence close the output side right-away. */
+        out = safe_close(out);
+
+        r = fd_nonblock(in, /* nonblock= */ true);
+        if (r < 0)
+                return pull_job_finish(j, log_error_errno(r, "Failed to make resource provider connection non-blocking: %m"));
+
+        r = sd_event_add_io(j->event, &j->provider_source, in, EPOLLIN, pull_job_provider_on_io, j);
+        if (r < 0)
+                return pull_job_finish(j, log_error_errno(r, "Failed to add resource provider connection to event loop: %m"));
+
+        (void) sd_event_source_set_description(j->provider_source, "pull-provider-io");
+
+        j->provider_fd = TAKE_FD(in);
+        return 0;
+}
+
+static int pull_job_provider_on_reply(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                const char *error_id,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        PullJob *j = ASSERT_PTR(userdata);
+        int r;
+
+        assert(link);
+
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
+                return 0;
+
+        if (error_id) {
+                if (streq(error_id, "io.systemd.ResourceProvider.NoSuchResource")) {
+
+                        if (j->on_not_found) {
+                                _cleanup_free_ char *new_url = NULL;
+
+                                /* This resource wasn't found, but the implementer wants to maybe let us know a new URL, query for it. */
+                                r = j->on_not_found(j, &new_url);
+                                if (r < 0)
+                                        return pull_job_finish(j, r);
+                                if (r > 0) { /* A new url to use */
+                                        assert(new_url);
+
+                                        r = pull_job_restart(j, new_url);
+                                        if (r < 0)
+                                                return pull_job_finish(j, r);
+
+                                        return 0;
+                                }
+                        }
+
+                        return pull_job_finish(j, log_notice_errno(SYNTHETIC_ERRNO(ENOMEDIUM), "Resource provider request for %s failed: resource does not exist.", j->url));
+                }
+
+                return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EIO), "Resource provider request for %s failed: %s", j->url, error_id));
+        }
+
+        /* The provider may announce the size of the resource, which we use for progress reporting and to detect truncation */
+        struct {
+                uint64_t size;
+        } p = {
+                .size = UINT64_MAX,
+        };
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "size", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64, voffsetof(p, size), 0 },
+                {},
+        };
+
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &p);
+        if (r < 0)
+                return pull_job_finish(j, log_error_errno(r, "Resource provider returned invalid reply for %s: %m", j->url));
+
+        if (p.size != UINT64_MAX) {
+                j->content_length = p.size;
+
+                uint64_t cl = pull_job_content_length_effective(j);
+                if (cl != UINT64_MAX && cl > j->compressed_max)
+                        return pull_job_finish(j, log_error_errno(SYNTHETIC_ERRNO(EFBIG), "Resource too large: %" PRIu64 " bytes.", cl));
+        }
+
+        /* The upgrade callback is invoked next, and takes it from there */
+        return 0;
+}
+
+static int pull_job_begin_provider(PullJob *j) {
+        _cleanup_free_ char *socket_path = NULL, *resource = NULL;
+        int r;
+
+        assert(j);
+
+        /* Transport for "provider:[/path/to/socket]/resource" URLs: connect to the specified Varlink service,
+         * request the resource with a protocol upgrade, and then read the raw data from the connection. */
+
+        r = provider_url_parse(j->url, &socket_path, &resource);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse provider URL '%s': %m", j->url);
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        r = sd_varlink_connect_address(&vl, socket_path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to connect to resource provider '%s': %m", socket_path);
+
+        (void) sd_varlink_set_description(vl, socket_path);
+        sd_varlink_set_userdata(vl, j);
+
+        r = sd_varlink_attach_event(vl, j->event, SD_EVENT_PRIORITY_NORMAL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach resource provider connection to event loop: %m");
+
+        r = sd_varlink_bind_reply(vl, pull_job_provider_on_reply);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind reply callback: %m");
+
+        r = sd_varlink_bind_upgrade(vl, pull_job_provider_on_upgrade);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind upgrade callback: %m");
+
+        r = sd_varlink_invoke_and_upgradebo(
+                        vl,
+                        "io.systemd.ResourceProvider.AcquireResource",
+                        SD_JSON_BUILD_PAIR_STRING("name", resource));
+        if (r < 0)
+                return log_error_errno(r, "Failed to request resource '%s' from '%s': %m", resource, socket_path);
+
+        log_debug("Requesting resource '%s' from resource provider '%s'.", resource, socket_path);
+
+        j->provider_link = TAKE_PTR(vl);
+        j->state = PULL_JOB_ANALYZING;
+
+        return 0;
+}
+
 int pull_job_begin(PullJob *j) {
         int r;
 
@@ -802,6 +1201,12 @@ int pull_job_begin(PullJob *j) {
 
         if (j->state != PULL_JOB_INIT)
                 return -EBUSY;
+
+        if (provider_url_is_valid(j->url))
+                return pull_job_begin_provider(j);
+
+        /* Everything else is transported via curl */
+        assert(j->glue);
 
         _cleanup_(curl_easy_cleanupp) CURL *easy = NULL;
         r = curl_glue_make(&easy, j->url);
@@ -827,6 +1232,31 @@ int pull_job_begin(PullJob *j) {
         if (j->request_header) {
                 if (sym_curl_easy_setopt(easy, CURLOPT_HTTPHEADER, j->request_header) != CURLE_OK)
                         return -EIO;
+        }
+
+        /* If we only need a range of the data, let's ask the server for just that. This is only possible if
+         * the data is not encoded (as we cannot decode from the middle of a stream), and if we don't have to
+         * verify the download as a whole. Only do this for HTTP, where we can tell from the response whether
+         * the server complied, and fall back to cutting out the range ourselves if it did not. */
+        if (j->allow_range_request &&
+            j->compression == COMPRESSION_NONE &&
+            (j->source_offset > 0 || j->source_size != UINT64_MAX) &&
+            j->source_size != 0 &&
+            http_url_is_valid(j->url)) {
+                _cleanup_free_ char *range = NULL;
+
+                if (j->source_size == UINT64_MAX)
+                        r = asprintf(&range, "%" PRIu64 "-", j->source_offset);
+                else
+                        r = asprintf(&range, "%" PRIu64 "-%" PRIu64, j->source_offset, j->source_offset + j->source_size - 1);
+                if (r < 0)
+                        return -ENOMEM;
+
+                if (sym_curl_easy_setopt(easy, CURLOPT_RANGE, range) != CURLE_OK)
+                        return -EIO;
+
+                log_debug("Requesting range %s of %s.", range, pull_job_description(j));
+                j->range_requested = true;
         }
 
         if (sym_curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, pull_job_write_callback) != CURLE_OK)

@@ -113,6 +113,7 @@ int sd_varlink_wait(sd_varlink *v, uint64_t timeout);
 
 int sd_varlink_is_idle(sd_varlink *v);
 int sd_varlink_is_connected(sd_varlink *v);
+int sd_varlink_wants_reply(sd_varlink *v);
 
 int sd_varlink_flush(sd_varlink *v);
 int sd_varlink_close(sd_varlink *v);
@@ -161,6 +162,15 @@ int sd_varlink_invoke(sd_varlink *v, const char *method, sd_json_variant *parame
 int sd_varlink_invokeb(sd_varlink *v, const char *method, ...);
 #define sd_varlink_invokebo(v, method, ...)                                \
         sd_varlink_invokeb((v), (method), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
+
+/* Enqueue method call with upgrade request. The reply is delivered to the reply callback. If the server
+ * accepted the upgrade, the connection is disconnected from the Varlink protocol afterwards and its fds are
+ * handed to the upgrade callback, see sd_varlink_bind_upgrade(). The asynchronous counterpart of
+ * sd_varlink_call_and_upgrade(). */
+int sd_varlink_invoke_and_upgrade(sd_varlink *v, const char *method, sd_json_variant *parameters);
+int sd_varlink_invoke_and_upgradeb(sd_varlink *v, const char *method, ...);
+#define sd_varlink_invoke_and_upgradebo(v, method, ...)                    \
+        sd_varlink_invoke_and_upgradeb((v), (method), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
 
 /* Enqueue method call, expect a reply now, and possibly more later, which are all delivered to the reply callback */
 int sd_varlink_observe(sd_varlink *v, const char *method, sd_json_variant *parameters);
@@ -260,6 +270,22 @@ const char* sd_varlink_get_description(sd_varlink *v);
 /* Automatically mark the parameters part of incoming messages as security sensitive */
 int sd_varlink_set_input_sensitive(sd_varlink *v);
 
+/* Serialize/deserialize a connection's state (buffered input and output, passed fds, the pending method
+ * call, …), for passing it on across execve(). The returned data is opaque, the fds are duplicates owned by
+ * the caller. On success sd_varlink_deserialize() takes possession of all passed fds (and sets the array
+ * entries to -EBADF). Userdata, callbacks, event loop attachment and similar settings are not serialized,
+ * and need to be restored by the caller. */
+int sd_varlink_serialize(sd_varlink *v, void **ret_data, size_t *ret_size, int **ret_fds, size_t *ret_n_fds);
+int sd_varlink_deserialize(sd_varlink **ret, const void *data, size_t size, int *fds, size_t n_fds);
+
+/* Returns an identifier for the connection that remains stable across execve(). The returned string is
+ * owned by the connection object, and remains valid until the connection is closed. */
+int sd_varlink_get_connection_id(sd_varlink *v, const char **ret);
+
+/* Keep the method call currently pending on this server side connection across serialization. If not
+ * set, connections with pending method calls are disconnected on serialization. */
+int sd_varlink_set_serialize_pending(sd_varlink *v, int b);
+
 /* Create a varlink server */
 int sd_varlink_server_new(sd_varlink_server **ret, sd_varlink_server_flags_t flags);
 _SD_DECLARE_TRIVIAL_REF_UNREF_FUNC(sd_varlink_server);
@@ -318,6 +344,14 @@ int sd_varlink_server_set_connections_max(sd_varlink_server *s, unsigned m);
 unsigned sd_varlink_server_current_connections(sd_varlink_server *s);
 
 int sd_varlink_server_set_description(sd_varlink_server *s, const char *description);
+
+/* Serialize/deserialize all connections of a server (but not its listening sockets). After deserialization,
+ * connections with a pending method call need to be claimed by the program, the ones remaining unclaimed
+ * can be disconnected with sd_varlink_server_disconnect_unclaimed_connections(). */
+int sd_varlink_server_serialize(sd_varlink_server *s, void **ret_data, size_t *ret_size, int **ret_fds, size_t *ret_n_fds);
+int sd_varlink_server_deserialize(sd_varlink_server *s, const void *data, size_t size, int *fds, size_t n_fds);
+int sd_varlink_server_claim_connection(sd_varlink_server *s, const char *id, sd_varlink **ret);
+int sd_varlink_server_disconnect_unclaimed_connections(sd_varlink_server *s);
 
 int sd_varlink_invocation(sd_varlink_invocation_flags_t flags);
 

@@ -65,6 +65,7 @@ extern bool arg_show_transaction;
 extern int arg_force;
 extern bool arg_ask_password;
 extern bool arg_runtime;
+extern bool arg_vendor;
 extern UnitFilePresetMode arg_preset_mode;
 extern char **arg_wall;
 extern const char *arg_kill_whom;
@@ -98,6 +99,7 @@ extern bool arg_marked;
 extern const char *arg_drop_in;
 extern ImagePolicy *arg_image_policy;
 extern char *arg_kill_subgroup;
+extern usec_t arg_wait_timeout_usec;
 
 static inline const char* arg_job_mode(void) {
         return _arg_job_mode ?: "replace";

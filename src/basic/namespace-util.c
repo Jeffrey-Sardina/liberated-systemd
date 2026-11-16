@@ -14,15 +14,18 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "log.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
 #include "parse-util.h"
+#include "path-util.h"
 #include "pidfd-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
+#include "string-util.h"
 #include "uid-range.h"
 #include "unaligned.h"
 #include "user-util.h"
@@ -86,7 +89,7 @@ static int pidref_namespace_open_by_type_internal(const PidRef *pidref, Namespac
         const char *p;
 
         p = pid_namespace_path(pidref->pid, type);
-        nsfd = RET_NERRNO(open(p, O_RDONLY|O_NOCTTY|O_CLOEXEC));
+        nsfd = xopenat(AT_FDCWD, p, O_RDONLY|O_NOCTTY);
         if (nsfd == -ENOENT) {
                 r = proc_mounted();
                 if (r == 0)
@@ -117,7 +120,7 @@ static int pidref_namespace_open_by_type_internal(const PidRef *pidref, Namespac
 }
 
 int pidref_namespace_open_by_type(const PidRef *pidref, NamespaceType type) {
-        return pidref_namespace_open_by_type_internal(pidref, type, NULL);
+        return pidref_namespace_open_by_type_internal(pidref, type, /* need_verify= */ NULL);
 }
 
 int namespace_open_by_type(NamespaceType type) {
@@ -179,7 +182,7 @@ int pidref_namespace_open(
                 const char *root;
 
                 root = procfs_file_alloca(pidref->pid, "root");
-                root_fd = RET_NERRNO(open(root, O_CLOEXEC|O_DIRECTORY));
+                root_fd = xopenat(AT_FDCWD, root, O_DIRECTORY);
                 if (root_fd == -ENOENT && proc_mounted() == 0)
                         return -ENOSYS;
                 if (root_fd < 0)
@@ -300,15 +303,16 @@ int namespace_enter_full(
                 /* If we don't have CAP_SYS_ADMIN in our own user namespace, our best bet is to enter the
                  * user namespace first (if we got one) to get CAP_SYS_ADMIN within the child user namespace,
                  * and then hope the other namespaces are owned by the child user namespace. If they aren't,
-                 * we'll just get an EPERM later on when trying to setns() to them. */
+                 * we'll just get an EPERM later on when trying to setns() to them. If there's no namespace
+                 * left to join, there's nothing to need privileges for. */
 
-                if (userns_fd < 0)
+                if (userns_fd >= 0) {
+                        if (setns(userns_fd, CLONE_NEWUSER) < 0)
+                                return -errno;
+                } else if (pidns_fd >= 0 || mntns_fd >= 0 || netns_fd >= 0 || root_fd >= 0)
                         return log_debug_errno(
                                         SYNTHETIC_ERRNO(EPERM),
                                         "Need CAP_SYS_ADMIN or a child user namespace to enter namespaces.");
-
-                if (setns(userns_fd, CLONE_NEWUSER) < 0)
-                        return -errno;
         }
 
         if (pidns_fd >= 0)
@@ -375,8 +379,29 @@ int fd_is_namespace(int fd, NamespaceType type) {
                 return true;
 
         int clone_flag = ioctl(fd, NS_GET_NSTYPE);
-        if (clone_flag < 0)
-                return -errno;
+        if (clone_flag < 0) {
+                if (errno != ENOTTY)
+                        return -errno;
+
+                // FIXME: This compatibility code path shall be removed once kernel 6.3
+                //        becomes the new minimal baseline
+                /* Before Linux 6.3, nsfs ioctls lack 32-bit compat support on 64-bit kernels.
+                 * The nsfs link name also identifies the type, e.g. "mnt:[4026531841]". */
+                _cleanup_free_ char *path = NULL;
+                r = fd_get_path(fd, &path);
+                if (r < 0)
+                        return r;
+
+                /* Bind-mounted namespaces expose their mount path instead of the nsfs link name. */
+                if (path_is_absolute(path))
+                        return -ENOTTY;
+
+                const char *p = startswith(path, namespace_info[type].proc_name);
+                if (!p)
+                        return false;
+
+                return startswith(p, ":[") != NULL;
+        }
 
         NamespaceType found_type = clone_flag_to_namespace_type(clone_flag);
         if (found_type < 0)
@@ -392,16 +417,24 @@ int is_our_namespace(int fd, NamespaceType type) {
         assert(type >= 0 && type < _NAMESPACE_TYPE_MAX);
 
         r = fd_is_namespace(fd, type);
-        if (r < 0)
+        /* If neither the ioctl nor the nsfs link name identifies the type, we can still recognize our own
+         * namespace by inode. */
+        if (r < 0 && r != -ENOTTY)
                 return r;
         if (r == 0) /* Not a namespace or not of the right type? */
                 return -EUCLEAN;
+
+        bool type_verified = r > 0;
 
         _cleanup_close_ int our_ns = namespace_open_by_type(type);
         if (our_ns < 0)
                 return our_ns;
 
-        return fd_inode_same(fd, our_ns);
+        r = fd_inode_same(fd, our_ns);
+        if (r == 0 && !type_verified)
+                return -ENOTTY;
+
+        return r;
 }
 
 int are_our_namespaces(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, int root_fd) {
@@ -591,10 +624,10 @@ int detach_mount_namespace(void) {
         if (unshare(CLONE_NEWNS) < 0)
                 return log_debug_errno(errno, "Failed to acquire mount namespace: %m");
 
-        if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL) < 0)
+        if (mount(/* source= */ NULL, "/", /* filesystemtype= */ NULL, MS_SLAVE | MS_REC, /* data= */ NULL) < 0)
                 return log_debug_errno(errno, "Failed to set mount propagation to MS_SLAVE for all mounts: %m");
 
-        if (mount(NULL, "/", NULL, MS_SHARED | MS_REC, NULL) < 0)
+        if (mount(/* source= */ NULL, "/", /* filesystemtype= */ NULL, MS_SHARED | MS_REC, /* data= */ NULL) < 0)
                 return log_debug_errno(errno, "Failed to set mount propagation back to MS_SHARED for all mounts: %m");
 
         return 0;
@@ -636,16 +669,16 @@ int detach_mount_namespace_harder(uid_t target_uid, gid_t target_gid) {
         if (unshare(CLONE_NEWUSER) < 0)
                 return log_debug_errno(errno, "Failed to acquire user namespace: %m");
 
-        r = write_string_filef("/proc/self/uid_map", 0,
+        r = write_string_filef("/proc/self/uid_map", /* flags= */ 0,
                                UID_FMT " " UID_FMT " 1\n", target_uid, from_uid);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write uid map: %m");
 
-        r = write_string_file("/proc/self/setgroups", "deny", 0);
+        r = write_string_file("/proc/self/setgroups", "deny", /* flags= */ 0);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write setgroups file: %m");
 
-        r = write_string_filef("/proc/self/gid_map", 0,
+        r = write_string_filef("/proc/self/gid_map", /* flags= */ 0,
                                GID_FMT " " GID_FMT " 1\n", target_gid, from_gid);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write gid map: %m");
@@ -887,7 +920,7 @@ int userns_has_root_mapping(int userns_fd) {
                 return log_debug_errno(SYNTHETIC_ERRNO(ENODATA),
                                        "User namespace has no UID/GID mapping yet.");
 
-        return uid_range_contains(uid_range, 0) && uid_range_contains(gid_range, 0);
+        return uid_range_contains(uid_range, /* uid= */ 0) && uid_range_contains(gid_range, /* uid= */ 0);
 }
 
 int process_is_owned_by_uid(const PidRef *pidref, uid_t uid) {
@@ -1040,7 +1073,7 @@ int is_idmapping_supported(const char *path) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to acquire new user namespace for checking if '%s' supports ID-mapping: %m", path);
 
-        dir_fd = r = RET_NERRNO(open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        dir_fd = r = xopenat(AT_FDCWD, path, O_RDONLY | O_NOFOLLOW);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return false;
         if (r < 0)

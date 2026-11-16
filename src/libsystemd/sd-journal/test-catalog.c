@@ -68,7 +68,7 @@ static void test_catalog_import_one(void) {
 "\n" \
 "payload\n";
 
-        h = test_import(input, -1, 0);
+        h = test_import(input, -1, /* code= */ 0);
         ASSERT_EQ(ordered_hashmap_size(h), 1u);
 
         ORDERED_HASHMAP_FOREACH(payload, h) {
@@ -103,7 +103,7 @@ static void test_catalog_import_merge(void) {
 "\n" \
 "override payload\n";
 
-        h = test_import(input, -1, 0);
+        h = test_import(input, -1, /* code= */ 0);
         ASSERT_EQ(ordered_hashmap_size(h), 1u);
 
         ORDERED_HASHMAP_FOREACH(payload, h)
@@ -134,7 +134,7 @@ static void test_catalog_import_merge_no_body(void) {
 "\n" \
 "payload\n";
 
-        h = test_import(input, -1, 0);
+        h = test_import(input, -1, /* code= */ 0);
         ASSERT_EQ(ordered_hashmap_size(h), 1u);
 
         ORDERED_HASHMAP_FOREACH(payload, h)
@@ -143,14 +143,14 @@ static void test_catalog_import_merge_no_body(void) {
 
 static void test_catalog_update(const char *database) {
         /* Test what happens if there are no files. */
-        ASSERT_OK_ZERO(catalog_update(database, NULL, NULL));
+        ASSERT_OK_ZERO(catalog_update(database, /* root= */ NULL, /* dirs= */ NULL));
 
         /* Test what happens if there are no files in the directory. */
-        ASSERT_OK_ZERO(catalog_update(database, NULL, no_catalog_dirs));
+        ASSERT_OK_ZERO(catalog_update(database, /* root= */ NULL, no_catalog_dirs));
 
         /* Make sure that we at least have some files loaded or the
          * catalog_list below will fail. */
-        ASSERT_OK_ZERO(catalog_update(database, NULL, (const char * const *) catalog_dirs));
+        ASSERT_OK_ZERO(catalog_update(database, /* root= */ NULL, (const char * const *) catalog_dirs));
 }
 
 static void test_catalog_file_lang(void) {
@@ -184,7 +184,7 @@ static void test_catalog_file_lang(void) {
 static void test_catalog_oob_offset_one(uint64_t item_offset, size_t strings_size) {
         /* Builds a hostile single-item catalog database and verifies the reader rejects it instead of
          * chasing the item's string offset out of the mapping. The blob is laid out from the real struct
-         * offsets so it keeps matching open_mmap() if CatalogHeader/CatalogItem ever change. */
+         * offsets so it keeps matching catalog_file_open() if CatalogHeader/CatalogItem ever change. */
         _cleanup_(unlink_tempfilep) char db[] = "/tmp/test-catalog.XXXXXX";
         _cleanup_close_ int fd = -EBADF;
         _cleanup_free_ char *text = NULL;
@@ -228,7 +228,7 @@ static void test_catalog_oob_offset_one(uint64_t item_offset, size_t strings_siz
 
                 ASSERT_NOT_NULL(f = memstream_init(&m));
                 ASSERT_OK(catalog_list(f, db, oneline));
-                ASSERT_OK(memstream_finalize(&m, &out, NULL));
+                ASSERT_OK(memstream_finalize(&m, &out, /* ret_size= */ NULL));
                 ASSERT_NULL(strstr(out, SD_ID128_TO_STRING(id)));
         }
 }
@@ -239,6 +239,54 @@ static void test_catalog_oob_offset(void) {
 
         /* Offset is in bounds but its string runs to EOF with no terminator: rejected by memchr(). */
         test_catalog_oob_offset_one(/* item_offset= */ 0, /* strings_size= */ 16);
+}
+
+static void test_catalog_file(const char *database) {
+        _cleanup_(catalog_file_freep) CatalogFile *c = NULL;
+        _cleanup_free_ char *text = NULL;
+        const char *a, *b;
+
+        ASSERT_ERROR(catalog_file_open("/nonexistent/catalog.db", &c), ENOENT);
+        ASSERT_NULL(c);
+
+        ASSERT_OK(catalog_file_open(database, &c));
+        ASSERT_NOT_NULL(c);
+
+        /* Repeated lookups on the same object return the same string, and pointers stay valid across
+         * lookups, since they point into the mapping. */
+        ASSERT_OK(catalog_file_lookup(c, SD_MESSAGE_COREDUMP, &a));
+        ASSERT_OK(catalog_file_lookup(c, SD_MESSAGE_COREDUMP, &b));
+        ASSERT_PTR_EQ(a, b);
+
+        ASSERT_ERROR(catalog_file_lookup(c, SD_ID128_NULL, &b), ENOENT);
+        ASSERT_PTR_EQ(b, a); /* not touched on failure */
+
+        ASSERT_OK(catalog_get(database, SD_MESSAGE_COREDUMP, &text));
+        ASSERT_STREQ(a, text);
+}
+
+static void test_catalog_fallback_language(const char *database) {
+        _cleanup_free_ char *saved = NULL;
+
+        /* Regardless of LC_MESSAGES, a lookup must fall back to the untranslated entry if there's no
+         * matching translation, including for locales whose language part has no "_" separator. */
+
+        ASSERT_NOT_NULL(saved = strdup(ASSERT_PTR(setlocale(LC_MESSAGES, NULL))));
+
+        FOREACH_STRING(loc, "C", "C.UTF-8", "POSIX", "de_DE.UTF-8", "en_US.UTF-8") {
+                _cleanup_free_ char *text = NULL;
+
+                if (!setlocale(LC_MESSAGES, loc)) {
+                        log_info("Locale %s not available, skipping.", loc);
+                        continue;
+                }
+
+                log_info("Looking up catalog entry with LC_MESSAGES=%s", loc);
+                ASSERT_OK(catalog_get(database, SD_MESSAGE_COREDUMP, &text));
+                ASSERT_NOT_NULL(text);
+        }
+
+        ASSERT_NOT_NULL(setlocale(LC_MESSAGES, saved));
 }
 
 int main(int argc, char *argv[]) {
@@ -271,12 +319,15 @@ int main(int argc, char *argv[]) {
 
         test_catalog_update(database);
 
-        ASSERT_OK(catalog_list(NULL, database, true));
+        ASSERT_OK(catalog_list(NULL, database, /* oneline= */ true));
 
-        ASSERT_OK(catalog_list(NULL, database, false));
+        ASSERT_OK(catalog_list(NULL, database, /* oneline= */ false));
 
         ASSERT_OK(catalog_get(database, SD_MESSAGE_COREDUMP, &text));
         printf(">>>%s<<<\n", text);
+
+        test_catalog_file(database);
+        test_catalog_fallback_language(database);
 
         return 0;
 }

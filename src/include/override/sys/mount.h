@@ -28,13 +28,13 @@ enum
 };
 
 /* Mount a filesystem.  */
-extern int mount(const char *__special_file, const char *__dir, const char *__fstype, unsigned long int __rwflag, const void *__data);
+extern int mount(const char *source, const char *target, const char *filesystemtype, unsigned long int mountflags, const void *data);
 
 /* Unmount a filesystem.  */
-extern int umount(const char *__special_file);
+extern int umount(const char *target);
 
 /* Unmount a filesystem.  Force unmounting if FLAGS is set to MNT_FORCE.  */
-extern int umount2(const char *__special_file, int __flags);
+extern int umount2(const char *target, int flags);
 
 /* Open the filesystem referenced by FS_NAME so it can be configured for mounting. */
 /* Defined since glibc-2.36.
@@ -46,7 +46,7 @@ int fsopen_shim(const char *fsname, unsigned flags);
    FLAGS with ATTR_FLAGS describing how the mount is to be performed.  */
 /* Defined since glibc-2.36.
  * Supported since kernel v5.2 (93766fbd2696c2c4453dd8e1070977e9cd4e6b6d). */
-int fsmount_shim(int fd, unsigned flags, unsigned ms_flags);
+int fsmount_shim(int fsfd, unsigned flags, unsigned attr_flags);
 #define fsmount fsmount_shim
 
 /* Add the mounted FROM_DFD referenced by FROM_PATHNAME filesystem returned

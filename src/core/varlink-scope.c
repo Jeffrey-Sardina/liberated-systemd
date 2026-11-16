@@ -1,10 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
 #include "sd-json.h"
 
+#include "alloc-util.h"
 #include "json-util.h"
+#include "pidref.h"
 #include "scope.h"
+#include "unit.h"
+#include "varlink-common.h"
 #include "varlink-scope.h"
+#include "varlink-util.h"
+
+/* Read side of the Scope context and runtime for List. */
 
 int scope_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
         Scope *s = ASSERT_PTR(SCOPE(userdata));
@@ -23,4 +31,184 @@ int scope_runtime_build_json(sd_json_variant **ret, const char *name, void *user
         return sd_json_buildo(
                         ASSERT_PTR(ret),
                         JSON_BUILD_PAIR_ENUM("Result", scope_result_to_string(s->result)));
+}
+
+/* Write side of the Scope context for StartTransient. */
+
+struct TransientScopeParameters {
+        OOMPolicy oom_policy;
+        usec_t runtime_max_usec;
+        bool runtime_max_usec_set;
+        usec_t runtime_rand_extra_usec;
+        bool runtime_rand_extra_usec_set;
+        usec_t timeout_stop_usec;
+        bool timeout_stop_usec_set;
+        PidRef *pids;
+        size_t n_pids;
+
+        sd_bus_error bus_error; /* For errors mapped through D-Bus machinery instead of InvalidParameter. */
+        char *bad_field; /* Field path for error propagation. */
+};
+
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_oom_policy, OOMPolicy, oom_policy_from_string);
+static DEFINE_VARLINK_APPLY_ENUM(oom_policy, OOMPolicy, oom_policy_to_string);
+
+TransientScopeParameters* transient_scope_parameters_free(TransientScopeParameters *p) {
+        if (!p)
+                return NULL;
+
+        pidref_array_free(p->pids, p->n_pids);
+        free(p->bad_field);
+        sd_bus_error_free(&p->bus_error);
+        return mfree(p);
+}
+
+static int dispatch_scope_pids(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        TransientScopeParameters *p = ASSERT_PTR(userdata);
+        PidRef *pids = NULL;
+        size_t n = 0;
+        int r;
+
+        CLEANUP_ARRAY(pids, n, pidref_array_free);
+
+        if (!sd_json_variant_is_array(variant))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Expected JSON array for %s.", name);
+
+        if (sd_json_variant_elements(variant) == 0)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Expected at least one PID in %s.", name);
+
+        pids = new(PidRef, sd_json_variant_elements(variant));
+        if (!pids)
+                return -ENOMEM;
+
+        sd_json_variant *json_pid;
+        JSON_VARIANT_ARRAY_FOREACH(json_pid, variant) {
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+                r = json_dispatch_pidref(name, json_pid, flags|SD_JSON_STRICT|SD_JSON_RELAX, &pidref);
+                if (r == -ESRCH)
+                        return sd_bus_error_set_errno(&p->bus_error, r);
+                if (r < 0)
+                        return r;
+
+                pids[n++] = TAKE_PIDREF(pidref);
+        }
+
+        pidref_array_free(p->pids, p->n_pids);
+        p->pids = TAKE_PTR(pids);
+        p->n_pids = n;
+        return 0;
+}
+
+static DEFINE_VARLINK_DISPATCH_SETTABLE(runtime_max_usec,        TransientScopeParameters, sd_json_dispatch_uint64);
+static DEFINE_VARLINK_DISPATCH_SETTABLE(runtime_rand_extra_usec, TransientScopeParameters, sd_json_dispatch_uint64);
+static DEFINE_VARLINK_DISPATCH_SETTABLE(timeout_stop_usec,       TransientScopeParameters, sd_json_dispatch_uint64);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(TransientScopeParameters*, transient_scope_parameters_free);
+
+int transient_scope_dispatch(
+                sd_json_variant *variant,
+                TransientScopeParameters **ret,
+                char **reterr_bad_field,
+                sd_bus_error *reterr_bus_error) {
+
+        static const sd_json_dispatch_field scope_dispatch[] = {
+                { "OOMPolicy",                  SD_JSON_VARIANT_STRING,        dispatch_oom_policy,                               offsetof(TransientScopeParameters, oom_policy), SD_JSON_NULLABLE },
+                { "RuntimeMaxUSec",             _SD_JSON_VARIANT_TYPE_INVALID, varlink_dispatch_settable_runtime_max_usec,        0,                                              SD_JSON_NULLABLE },
+                { "RuntimeRandomizedExtraUSec", _SD_JSON_VARIANT_TYPE_INVALID, varlink_dispatch_settable_runtime_rand_extra_usec, 0,                                              SD_JSON_NULLABLE },
+                { "TimeoutStopUSec",            _SD_JSON_VARIANT_TYPE_INVALID, varlink_dispatch_settable_timeout_stop_usec,       0,                                              SD_JSON_NULLABLE },
+                { "PIDs",                       SD_JSON_VARIANT_ARRAY,         dispatch_scope_pids,                               0,                                              SD_JSON_MANDATORY },
+                {}
+        };
+
+        const char *bad_field = NULL;
+        int r;
+
+        assert(ret);
+
+        if (sd_json_variant_is_null(variant)) {
+                *ret = NULL;
+                return 0;
+        }
+
+        _cleanup_(transient_scope_parameters_freep) TransientScopeParameters *p = NULL;
+        p = new(TransientScopeParameters, 1);
+        if (!p)
+                return -ENOMEM;
+
+        *p = (TransientScopeParameters) {
+                .oom_policy = _OOM_POLICY_INVALID,
+        };
+
+        r = sd_json_dispatch_full(variant, scope_dispatch, /* bad= */ NULL, /* flags= */ 0, p, &bad_field);
+        if (r < 0) {
+                sd_bus_error_move(reterr_bus_error, &p->bus_error);
+                if (bad_field)
+                        varlink_propagate_bad_field(bad_field, p->bad_field, reterr_bad_field);
+                return r;
+        }
+
+        *ret = TAKE_PTR(p);
+        return r;
+}
+
+static int apply_scope_pids(Scope *s, TransientScopeParameters *p, sd_varlink *link, sd_bus_error *reterr_bus_error) {
+        Unit *u = UNIT(ASSERT_PTR(s));
+        int r;
+
+        if (!p || p->n_pids == 0)
+                return -EINVAL; /* Scope.PIDs is required! */
+
+        /* Reject unsuitable PIDs before registering any processes with the scope. */
+        FOREACH_ARRAY(pidref, p->pids, p->n_pids) {
+                if (pidref_is_automatic(pidref)) {
+                        _cleanup_(pidref_done) PidRef peer_pidref = PIDREF_NULL;
+
+                        r = varlink_get_peer_pidref(link, &peer_pidref);
+                        if (r < 0)
+                                return r;
+
+                        pidref_done(pidref);
+                        *pidref = TAKE_PIDREF(peer_pidref);
+                }
+
+                r = unit_pid_attachable(u, pidref, reterr_bus_error);
+                if (r < 0)
+                        return r;
+        }
+
+        FOREACH_ARRAY(pidref, p->pids, p->n_pids) {
+                r = unit_watch_pidref(u, pidref, /* exclusive= */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+int transient_scope_apply_properties(
+                Scope *s,
+                TransientScopeParameters *sp,
+                sd_varlink *link,
+                char **reterr_bad_field,
+                sd_bus_error *reterr_bus_error) {
+
+        Unit *u = UNIT(ASSERT_PTR(s));
+        int r;
+
+        r = apply_scope_pids(s, sp, link, reterr_bus_error);
+        if (r < 0)
+                return varlink_propagate_bad_field_errno(r, "PIDs", /* child_bad_field= */ NULL, reterr_bad_field);
+
+        if (sp) {
+                varlink_apply_enum_oom_policy(u, "OOMPolicy", &s->oom_policy, sp->oom_policy,
+                                              /* refuse= */ NULL, UNIT_RUNTIME|UNIT_PRIVATE);
+                if (sp->runtime_max_usec_set)
+                        varlink_apply_usec_per_msec(u, "RuntimeMaxSec", &s->runtime_max_usec, sp->runtime_max_usec, UNIT_RUNTIME|UNIT_PRIVATE);
+                if (sp->runtime_rand_extra_usec_set)
+                        varlink_apply_usec_per_msec(u, "RuntimeRandomizedExtraSec", &s->runtime_rand_extra_usec, sp->runtime_rand_extra_usec, UNIT_RUNTIME|UNIT_PRIVATE);
+                if (sp->timeout_stop_usec_set)
+                        varlink_apply_usec_per_msec(u, "TimeoutStopSec", &s->timeout_stop_usec, sp->timeout_stop_usec, UNIT_RUNTIME|UNIT_PRIVATE);
+        }
+
+        return 0;
 }

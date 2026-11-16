@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "copy.h"
 #include "data-fd-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "memfd-util.h"
@@ -16,17 +18,33 @@
 /* If memfd didn't work out, then let's use a file in /tmp up to a size of 1M. If it's large than that use /var/tmp/ instead. */
 #define DATA_FD_TMP_LIMIT (1U * U64_MB)
 
-int copy_data_fd(int fd) {
+static int memfd_seal_and_reopen(int fd, int mode) {
+        int r;
+
+        assert(fd >= 0);
+
+        /* Seals the memfd and returns a new fd to it with the specified access mode, positioned at the
+         * beginning of the file. */
+
+        r = memfd_set_sealed(fd);
+        if (r < 0)
+                return r;
+
+        return fd_reopen(fd, mode);
+}
+
+int copy_data_fd_full(int fd, uint64_t max_size) {
         _cleanup_close_ int copy_fd = -EBADF, tmp_fd = -EBADF;
         const char *td;
         struct stat st;
+        uint64_t n;
         int r;
 
         /* Creates a 'data' fd from the specified source fd, containing all the same data in a read-only
          * fashion, but independent of it (i.e. the source fd can be closed and unmounted after this call
          * succeeded). Tries to be somewhat smart about where to place the data. In the best case uses a
          * memfd(). For larger data will use an unlinked file in /tmp/, and for even larger data one in
-         * /var/tmp/. */
+         * /var/tmp/. Fails with -EFBIG if the source contains more than max_size bytes. */
 
         if (fstat(fd, &st) < 0)
                 return -errno;
@@ -39,6 +57,11 @@ int copy_data_fd(int fd) {
         if (!S_ISREG(st.st_mode) && !S_ISSOCK(st.st_mode) && !S_ISFIFO(st.st_mode) && !S_ISCHR(st.st_mode))
                 return -EBADFD;
 
+        /* copy_bytes() returns a positive value when it copies max_bytes bytes, even if it reached EOF at
+         * the same time. We copy up to one byte more than max_size, so that we can tell input of exactly
+         * max_size bytes from larger input. */
+        uint64_t remaining = max_size == UINT64_MAX ? UINT64_MAX : max_size + 1;
+
         /* If we have reason to believe the data is bounded in size, then let's use memfds as backing
          * fd. Note that we use the reported regular file size only as a hint, given that there are plenty
          * special files in /proc/ and /sys/ which report a zero file size but can be read from. */
@@ -50,29 +73,30 @@ int copy_data_fd(int fd) {
                 if (copy_fd < 0)
                         return copy_fd;
 
-                r = copy_bytes(fd, copy_fd, DATA_FD_MEMORY_LIMIT, /* copy_flags= */ 0);
+                n = MIN(DATA_FD_MEMORY_LIMIT, remaining);
+                r = copy_bytes(fd, copy_fd, n, /* copy_flags= */ 0);
                 if (r < 0)
                         return r;
+                if (r > 0 && n == remaining)
+                        return -EFBIG;
+                if (remaining != UINT64_MAX)
+                        remaining -= n;
+
+                if (r == 0)
+                        /* Did it fit into the limit? If so, we are done. (Reopening positions the new fd
+                         * at the beginning of the file, no need to seek.) */
+                        return memfd_seal_and_reopen(copy_fd, O_RDONLY);
 
                 off_t f = lseek(copy_fd, 0, SEEK_SET);
                 if (f < 0)
                         return -errno;
                 if (f != 0)
                         return -EIO;
-
-                if (r == 0) {
-                        /* Did it fit into the limit? If so, we are done. */
-                        r = memfd_set_sealed(copy_fd);
-                        if (r < 0)
-                                return r;
-
-                        return TAKE_FD(copy_fd);
-                }
         }
 
         /* If we have reason to believe this will fit fine in /tmp, then use that as first fallback. */
         if ((!S_ISREG(st.st_mode) || (uint64_t) st.st_size < DATA_FD_TMP_LIMIT)) {
-                tmp_fd = open_tmpfile_unlinkable(NULL /* NULL as directory means /tmp */, O_RDWR|O_CLOEXEC);
+                tmp_fd = open_tmpfile_unlinkable(/* directory= */ NULL /* NULL as directory means /tmp */, O_RDWR);
                 if (tmp_fd < 0)
                         return tmp_fd;
 
@@ -87,11 +111,16 @@ int copy_data_fd(int fd) {
                         assert(r == 0);
                 }
 
-                r = copy_bytes(fd, tmp_fd, DATA_FD_TMP_LIMIT - DATA_FD_MEMORY_LIMIT, /* copy_flags= */ 0);
+                n = MIN(DATA_FD_TMP_LIMIT - DATA_FD_MEMORY_LIMIT, remaining);
+                r = copy_bytes(fd, tmp_fd, n, /* copy_flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
                         goto finish;  /* Yay, it fit in */
+                if (n == remaining)
+                        return -EFBIG;
+                if (remaining != UINT64_MAX)
+                        remaining -= n;
 
                 /* It didn't fit in. Let's not forget to use what we already used */
                 off_t f = lseek(tmp_fd, 0, SEEK_SET);
@@ -108,7 +137,7 @@ int copy_data_fd(int fd) {
         if (r < 0)
                 return r;
 
-        tmp_fd = open_tmpfile_unlinkable(td, O_RDWR|O_CLOEXEC);
+        tmp_fd = open_tmpfile_unlinkable(td, O_RDWR);
         if (tmp_fd < 0)
                 return tmp_fd;
 
@@ -123,17 +152,55 @@ int copy_data_fd(int fd) {
         }
 
         /* Copy in the rest */
-        r = copy_bytes(fd, tmp_fd, UINT64_MAX, /* copy_flags= */ 0);
+        r = copy_bytes(fd, tmp_fd, remaining, /* copy_flags= */ 0);
         if (r < 0)
                 return r;
-
-        assert(r == 0);
+        if (r > 0)
+                return -EFBIG;
 
 finish:
         /* Now convert the O_RDWR file descriptor into an O_RDONLY one (and as side effect seek to the beginning of the
          * file again */
 
-        return fd_reopen(tmp_fd, O_RDONLY|O_CLOEXEC);
+        return fd_reopen(tmp_fd, O_RDONLY);
+}
+
+int seekable_data_fd(int fd, uint64_t max_size) {
+        struct stat st;
+
+        assert(fd >= 0);
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        if (S_ISDIR(st.st_mode))
+                return -EISDIR;
+
+        /* Files in /proc/ and /sys/ report a size of zero even though they contain data. Callers use the
+         * size from fstat() to know how much to read. So we copy regular files with a size of zero. */
+        if (S_ISREG(st.st_mode) && st.st_size > 0) {
+                if ((uint64_t) st.st_size > max_size)
+                        return -EFBIG;
+
+                return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
+        }
+
+        /* pread() fails on pipes and sockets, so we copy their contents. We refuse devices. Reading
+         * /dev/zero or /dev/full never reaches EOF, so we would copy max_size bytes before we fail. */
+        if (!S_ISREG(st.st_mode) && !S_ISFIFO(st.st_mode) && !S_ISSOCK(st.st_mode))
+                return -EBADFD;
+
+        return copy_data_fd_full(fd, max_size);
+}
+
+int open_seekable_data_fd(int dir_fd, const char *path, uint64_t max_size) {
+        _cleanup_close_ int fd = -EBADF;
+
+        fd = xopenat(dir_fd, path, O_RDONLY|O_NOCTTY);
+        if (fd < 0)
+                return fd;
+
+        return seekable_data_fd(fd, max_size);
 }
 
 int memfd_clone_fd(int fd, const char *name, int mode) {
@@ -158,7 +225,6 @@ int memfd_clone_fd(int fd, const char *name, int mode) {
         exec = st.st_mode & 0111;
 
         mfd = memfd_create_wrapper(name,
-                                   ((FLAGS_SET(mode, O_CLOEXEC) || ro) ? MFD_CLOEXEC : 0) |
                                    (ro ? MFD_ALLOW_SEALING : 0) |
                                    (exec ? MFD_EXEC : MFD_NOEXEC_SEAL));
         if (mfd < 0)
@@ -168,17 +234,29 @@ int memfd_clone_fd(int fd, const char *name, int mode) {
         if (r < 0)
                 return r;
 
-        if (ro) {
-                r = memfd_set_sealed(mfd);
-                if (r < 0)
-                        return r;
-
-                return fd_reopen(mfd, mode);
-        }
+        if (ro)
+                return memfd_seal_and_reopen(mfd, mode);
 
         off_t f = lseek(mfd, 0, SEEK_SET);
         if (f < 0)
                 return -errno;
 
         return TAKE_FD(mfd);
+}
+
+int data_fd_from_iovec(const char *name, const struct iovec *iov) {
+        _cleanup_close_ int fd = -EBADF;
+
+        /* Places the specified data in a sealed memfd and returns a read-only fd to it, positioned at the
+         * beginning of the file. This is useful for passing literal data to other processes, for example as
+         * standard input. Unlike copy_data_fd() this never falls back to temporary files, the data is in
+         * memory already after all. */
+
+        assert(iov);
+
+        fd = memfd_new_and_seal(name, iov->iov_base, iov->iov_len);
+        if (fd < 0)
+                return fd;
+
+        return fd_reopen(fd, O_RDONLY);
 }

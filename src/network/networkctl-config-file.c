@@ -351,7 +351,7 @@ static int add_config_to_edit(
         }
 
         if (!arg_drop_in)
-                return edit_files_add(context, new_path ?: path, path, NULL);
+                return edit_files_add(context, new_path ?: path, path, /* comment_paths= */ NULL);
 
         bool need_new_dropin;
 
@@ -497,7 +497,7 @@ int verb_edit(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         if (!path)
                                 return log_oom();
 
-                        r = edit_files_add(&context, path, NULL, NULL);
+                        r = edit_files_add(&context, path, /* original_path= */ NULL, /* comment_paths= */ NULL);
                         if (r < 0)
                                 return r;
                         continue;
@@ -585,7 +585,7 @@ int verb_cat(int argc, char *argv[], uintptr_t _data, void *userdata) {
         pager_open(arg_pager_flags);
 
         if (strv_isempty(args))
-                return conf_files_cat(NULL, "systemd/networkd.conf", CAT_FORMAT_HAS_SECTIONS);
+                return conf_files_cat(/* root= */ NULL, "systemd/networkd.conf", CAT_FORMAT_HAS_SECTIONS);
 
         bool first = true;
         STRV_FOREACH(name, args) {
@@ -727,7 +727,7 @@ int verb_unmask(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         continue;
 
                 if (path_startswith(path, "/usr"))
-                        return log_error_errno(r, "Cannot unmask network config under /usr/: %s", path);
+                        return log_error_errno(SYNTHETIC_ERRNO(EROFS), "Cannot unmask network config under /usr/: %s", path);
 
                 if (unlink(path) < 0) {
                         if (errno == ENOENT)

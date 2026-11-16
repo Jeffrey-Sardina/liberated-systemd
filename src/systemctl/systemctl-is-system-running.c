@@ -19,7 +19,7 @@ static int match_startup_finished(sd_bus_message *m, void *userdata, sd_bus_erro
         char **state = ASSERT_PTR(userdata);
         int r;
 
-        r = bus_get_property_string(sd_bus_message_get_bus(m), bus_systemd_mgr, "SystemState", NULL, state);
+        r = bus_get_property_string(sd_bus_message_get_bus(m), bus_systemd_mgr, "SystemState", /* reterr_error= */ NULL, state);
 
         sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), r);
         return 0;
@@ -46,17 +46,41 @@ int verb_is_system_running(int argc, char *argv[], uintptr_t _data, void *userda
         if (arg_wait) {
                 r = sd_event_default(&event);
                 if (r >= 0)
-                        r = sd_bus_attach_event(bus, event, 0);
+                        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
                 if (r >= 0)
                         r = bus_match_signal_async(
                                         bus,
                                         &slot_startup_finished,
                                         bus_systemd_mgr,
                                         "StartupFinished",
-                                        match_startup_finished, NULL, &state);
+                                        match_startup_finished, /* install_callback= */ NULL, &state);
                 if (r < 0) {
-                        log_warning_errno(r, "Failed to request match for StartupFinished: %m");
+                        log_warning_errno(
+                                        r,
+                                        "Failed to acquire match for StartupFinished, "
+                                        "will not wait for startup completion: %m");
                         arg_wait = false;
+                } else {
+                        /* On the API bus PID 1 only emits manager signals while at least one client is
+                         * subscribed, so subscribe explicitly. This is a NOP on direct connections, which
+                         * receive signals unconditionally. Do this before querying the state below so that
+                         * we cannot miss StartupFinished in between. */
+                        r = bus_call_method(
+                                        bus,
+                                        bus_systemd_mgr,
+                                        "Subscribe",
+                                        &error,
+                                        /* ret_reply= */ NULL,
+                                        /* types= */ NULL);
+                        if (r < 0) {
+                                log_warning_errno(
+                                                r,
+                                                "Failed to enable service manager subscription, "
+                                                "will not wait for startup completion: %s",
+                                                bus_error_message(&error, r));
+                                sd_bus_error_free(&error);
+                                arg_wait = false;
+                        }
                 }
         }
 

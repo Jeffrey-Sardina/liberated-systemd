@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <limits.h>
 #include <linux/capability.h>
 
 #include "sd-bus.h"
@@ -278,7 +279,7 @@ static int node_callbacks_run(
 
                 c->last_iteration = bus->iteration_counter;
 
-                r = sd_bus_message_rewind(m, true);
+                r = sd_bus_message_rewind(m, /* complete= */ true);
                 if (r < 0)
                         return r;
 
@@ -444,11 +445,11 @@ static int method_callbacks_run(
 
         c->last_iteration = bus->iteration_counter;
 
-        r = sd_bus_message_rewind(m, true);
+        r = sd_bus_message_rewind(m, /* complete= */ true);
         if (r < 0)
                 return r;
 
-        signature = sd_bus_message_get_signature(m, true);
+        signature = sd_bus_message_get_signature(m, /* complete= */ true);
         if (!signature)
                 return -EINVAL;
 
@@ -534,7 +535,7 @@ static int method_callbacks_run(
         }
 
         /* If the method callback is NULL, make this a successful NOP */
-        r = sd_bus_reply_method_return(m, NULL);
+        r = sd_bus_reply_method_return(m, /* types= */ NULL);
         if (r < 0)
                 return r;
 
@@ -583,7 +584,7 @@ static int invoke_property_get(
         if (streq(v->x.property.signature, "as"))
                 return sd_bus_message_append_strv(reply, *(char***) userdata);
 
-        assert(signature_is_single(v->x.property.signature, false));
+        assert(signature_is_single(v->x.property.signature, /* allow_dict_entry= */ false));
         assert(bus_type_is_basic(v->x.property.signature[0]));
 
         switch (v->x.property.signature[0]) {
@@ -643,7 +644,7 @@ static int invoke_property_set(
 
         /* Automatic handling if no callback is defined. */
 
-        assert(signature_is_single(v->x.property.signature, false));
+        assert(signature_is_single(v->x.property.signature, /* allow_dict_entry= */ false));
         assert(bus_type_is_basic(v->x.property.signature[0]));
 
         switch (v->x.property.signature[0]) {
@@ -801,7 +802,7 @@ static int property_get_set_callbacks_run(
                         return r;
         }
 
-        r = sd_bus_send(bus, reply, NULL);
+        r = sd_bus_send(bus, reply, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -987,7 +988,7 @@ static int property_get_all_callbacks_run(
         if (r < 0)
                 return r;
 
-        r = sd_bus_send(bus, reply, NULL);
+        r = sd_bus_send(bus, reply, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1025,7 +1026,7 @@ static int bus_node_exists(
                 if (require_fallback && !c->is_fallback)
                         continue;
 
-                r = node_vtable_get_userdata(bus, path, c, NULL, &error);
+                r = node_vtable_get_userdata(bus, path, c, /* userdata= */ NULL, &error);
                 if (r != 0)
                         return r;
                 if (bus->nodes_modified)
@@ -1056,7 +1057,7 @@ int introspect_path(
                         return -ENOENT;
         }
 
-        r = get_child_nodes(bus, path, n, 0, &s, reterr_error);
+        r = get_child_nodes(bus, path, n, /* flags= */ 0, &s, reterr_error);
         if (r < 0)
                 return r;
         if (bus->nodes_modified && !ignore_nodes_modified)
@@ -1076,7 +1077,7 @@ int introspect_path(
                 if (require_fallback && !c->is_fallback)
                         continue;
 
-                r = node_vtable_get_userdata(bus, path, c, NULL, reterr_error);
+                r = node_vtable_get_userdata(bus, path, c, /* userdata= */ NULL, reterr_error);
                 if (r < 0)
                         return r;
                 if (bus->nodes_modified && !ignore_nodes_modified)
@@ -1135,7 +1136,7 @@ static int process_introspect(
         assert(n);
         assert(found_object);
 
-        r = introspect_path(bus, m->path, n, require_fallback, false, found_object, &s, &error);
+        r = introspect_path(bus, m->path, n, require_fallback, /* ignore_nodes_modified= */ false, found_object, &s, &error);
         if (r < 0)
                 return bus_maybe_reply_error(m, r, &error);
         if (r == 0)
@@ -1150,7 +1151,7 @@ static int process_introspect(
         if (r < 0)
                 return r;
 
-        r = sd_bus_send(bus, reply, NULL);
+        r = sd_bus_send(bus, reply, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1315,7 +1316,7 @@ static int object_manager_serialize_path_and_fallbacks(
         assert(reterr_error);
 
         /* First, add all vtables registered for this path */
-        r = object_manager_serialize_path(bus, reply, path, path, false, &found_object_manager, reterr_error);
+        r = object_manager_serialize_path(bus, reply, path, path, /* require_fallback= */ false, &found_object_manager, reterr_error);
         if (r < 0)
                 return r;
         if (bus->nodes_modified)
@@ -1329,7 +1330,7 @@ static int object_manager_serialize_path_and_fallbacks(
                 return -ENOMEM;
 
         OBJECT_PATH_FOREACH_PREFIX(prefix, path) {
-                r = object_manager_serialize_path(bus, reply, prefix, path, true, &found_object_manager, reterr_error);
+                r = object_manager_serialize_path(bus, reply, prefix, path, /* require_fallback= */ true, &found_object_manager, reterr_error);
                 if (r < 0)
                         return r;
                 if (bus->nodes_modified)
@@ -1391,7 +1392,7 @@ static int process_get_managed_objects(
         if (r < 0)
                 return r;
 
-        r = sd_bus_send(bus, reply, NULL);
+        r = sd_bus_send(bus, reply, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1450,7 +1451,7 @@ static int object_find_and_run(
 
                 if (get || streq(m->member, "Set")) {
 
-                        r = sd_bus_message_rewind(m, true);
+                        r = sd_bus_message_rewind(m, /* complete= */ true);
                         if (r < 0)
                                 return r;
 
@@ -1470,7 +1471,7 @@ static int object_find_and_run(
                 } else if (streq(m->member, "GetAll")) {
                         const char *iface;
 
-                        r = sd_bus_message_rewind(m, true);
+                        r = sd_bus_message_rewind(m, /* complete= */ true);
                         if (r < 0)
                                 return r;
 
@@ -1488,7 +1489,7 @@ static int object_find_and_run(
 
         } else if (sd_bus_message_is_method_call(m, "org.freedesktop.DBus.Introspectable", "Introspect")) {
 
-                if (!isempty(sd_bus_message_get_signature(m, true)))
+                if (!isempty(sd_bus_message_get_signature(m, /* complete= */ true)))
                         return sd_bus_reply_method_errorf(m, SD_BUS_ERROR_INVALID_ARGS, "Expected no parameters");
 
                 r = process_introspect(bus, m, n, require_fallback, found_object);
@@ -1497,7 +1498,7 @@ static int object_find_and_run(
 
         } else if (sd_bus_message_is_method_call(m, "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")) {
 
-                if (!isempty(sd_bus_message_get_signature(m, true)))
+                if (!isempty(sd_bus_message_get_signature(m, /* complete= */ true)))
                         return sd_bus_reply_method_errorf(m, SD_BUS_ERROR_INVALID_ARGS, "Expected no parameters");
 
                 r = process_get_managed_objects(bus, m, n, require_fallback, found_object);
@@ -1555,7 +1556,7 @@ int bus_process_object(sd_bus *bus, sd_bus_message *m) {
         do {
                 bus->nodes_modified = false;
 
-                r = object_find_and_run(bus, m, m->path, false, &found_object);
+                r = object_find_and_run(bus, m, m->path, /* require_fallback= */ false, &found_object);
                 if (r != 0)
                         return r;
 
@@ -1565,7 +1566,7 @@ int bus_process_object(sd_bus *bus, sd_bus_message *m) {
                         if (bus->nodes_modified)
                                 break;
 
-                        r = object_find_and_run(bus, m, prefix, true, &found_object);
+                        r = object_find_and_run(bus, m, prefix, /* require_fallback= */ true, &found_object);
                         if (r != 0)
                                 return r;
                 }
@@ -1579,7 +1580,7 @@ int bus_process_object(sd_bus *bus, sd_bus_message *m) {
             sd_bus_message_is_method_call(m, "org.freedesktop.DBus.Properties", "Set")) {
                 const char *interface = NULL, *property = NULL;
 
-                (void) sd_bus_message_rewind(m, true);
+                (void) sd_bus_message_rewind(m, /* complete= */ true);
                 (void) sd_bus_message_read_basic(m, 's', &interface);
                 (void) sd_bus_message_read_basic(m, 's', &property);
 
@@ -1767,7 +1768,7 @@ _public_ int sd_bus_add_object(
                 sd_bus_message_handler_t callback,
                 void *userdata) {
 
-        return bus_add_object(bus, ret_slot, false, path, callback, userdata);
+        return bus_add_object(bus, ret_slot, /* fallback= */ false, path, callback, userdata);
 }
 
 _public_ int sd_bus_add_fallback(
@@ -1777,7 +1778,7 @@ _public_ int sd_bus_add_fallback(
                 sd_bus_message_handler_t callback,
                 void *userdata) {
 
-        return bus_add_object(bus, ret_slot, true, prefix, callback, userdata);
+        return bus_add_object(bus, ret_slot, /* fallback= */ true, prefix, callback, userdata);
 }
 
 static void vtable_member_hash_func(const BusVTableMember *m, struct siphash *state) {
@@ -1918,6 +1919,7 @@ static int add_object_vtable_internal(
         BusNodeVTable *existing = NULL;
         const sd_bus_vtable *v;
         BusNode *n;
+        unsigned n_methods = 0, n_properties = 0;
         int r;
         const char *names = "";
         names_flags nf;
@@ -1974,6 +1976,49 @@ static int add_object_vtable_internal(
                 goto fail;
         }
 
+        /* Avoid repeatedly growing and rehashing the member sets while
+         * registering a vtable. The public vtable contract requires an END
+         * entry; the normal per-entry validation below remains unchanged. */
+        for (v = bus_vtable_next(vtable, vtable); v->type != _SD_BUS_VTABLE_END; v = bus_vtable_next(vtable, v)) {
+                switch (v->type) {
+                case _SD_BUS_VTABLE_METHOD:
+                        if (n_methods == UINT_MAX) {
+                                r = -EOVERFLOW;
+                                goto fail;
+                        }
+                        n_methods++;
+                        break;
+                case _SD_BUS_VTABLE_PROPERTY:
+                case _SD_BUS_VTABLE_WRITABLE_PROPERTY:
+                        if (n_properties == UINT_MAX) {
+                                r = -EOVERFLOW;
+                                goto fail;
+                        }
+                        n_properties++;
+                        break;
+                default:
+                        /* Leave validation to the registration pass, which reports the first error. */
+                        break;
+                }
+        }
+
+        if (n_methods > 0) {
+                r = set_ensure_allocated(&bus->vtable_methods, &vtable_member_hash_ops);
+                if (r < 0)
+                        goto fail;
+                r = set_reserve(bus->vtable_methods, n_methods);
+                if (r < 0)
+                        goto fail;
+        }
+        if (n_properties > 0) {
+                r = set_ensure_allocated(&bus->vtable_properties, &vtable_member_hash_ops);
+                if (r < 0)
+                        goto fail;
+                r = set_reserve(bus->vtable_properties, n_properties);
+                if (r < 0)
+                        goto fail;
+        }
+
         v = s->node_vtable.vtable;
         for (v = bus_vtable_next(vtable, v); v->type != _SD_BUS_VTABLE_END; v = bus_vtable_next(vtable, v)) {
 
@@ -1987,8 +2032,8 @@ static int add_object_vtable_internal(
                                 names = strempty(v->x.method.names);
 
                         if (!member_name_is_valid(v->x.method.member) ||
-                            !signature_is_valid(strempty(v->x.method.signature), false) ||
-                            !signature_is_valid(strempty(v->x.method.result), false) ||
+                            !signature_is_valid(strempty(v->x.method.signature), /* allow_dict_entry= */ false) ||
+                            !signature_is_valid(strempty(v->x.method.result), /* allow_dict_entry= */ false) ||
                             !names_are_valid(strempty(v->x.method.signature), &names, &nf) ||
                             !names_are_valid(strempty(v->x.method.result), &names, &nf) ||
                             !(v->x.method.handler || (isempty(v->x.method.signature) && isempty(v->x.method.result))) ||
@@ -2037,7 +2082,7 @@ static int add_object_vtable_internal(
                         BusVTableMember *m;
 
                         if (!member_name_is_valid(v->x.property.member) ||
-                            !signature_is_single(v->x.property.signature, false) ||
+                            !signature_is_single(v->x.property.signature, /* allow_dict_entry= */ false) ||
                             !(v->x.property.get || bus_type_is_basic(v->x.property.signature[0]) || streq(v->x.property.signature, "as")) ||
                             (v->flags & SD_BUS_VTABLE_METHOD_NO_REPLY) ||
                             (!!(v->flags & SD_BUS_VTABLE_PROPERTY_CONST) + !!(v->flags & SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE) + !!(v->flags & SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION)) > 1 ||
@@ -2077,7 +2122,7 @@ static int add_object_vtable_internal(
                                 names = strempty(v->x.signal.names);
 
                         if (!member_name_is_valid(v->x.signal.member) ||
-                            !signature_is_valid(strempty(v->x.signal.signature), false) ||
+                            !signature_is_valid(strempty(v->x.signal.signature), /* allow_dict_entry= */ false) ||
                             !names_are_valid(strempty(v->x.signal.signature), &names, &nf) ||
                             v->flags & SD_BUS_VTABLE_UNPRIVILEGED) {
                                 r = -EINVAL;
@@ -2153,7 +2198,7 @@ _public_ int sd_bus_add_object_vtable(
                 const sd_bus_vtable *vtable,
                 void *userdata) {
 
-        return add_object_vtable_internal(bus, ret_slot, path, interface, vtable, false, NULL, userdata);
+        return add_object_vtable_internal(bus, ret_slot, path, interface, vtable, /* fallback= */ false, /* find= */ NULL, userdata);
 }
 
 _public_ int sd_bus_add_fallback_vtable(
@@ -2165,7 +2210,7 @@ _public_ int sd_bus_add_fallback_vtable(
                 sd_bus_object_find_t find,
                 void *userdata) {
 
-        return add_object_vtable_internal(bus, ret_slot, prefix, interface, vtable, true, find, userdata);
+        return add_object_vtable_internal(bus, ret_slot, prefix, interface, vtable, /* fallback= */ true, find, userdata);
 }
 
 _public_ int sd_bus_add_node_enumerator(
@@ -2413,7 +2458,7 @@ static int emit_properties_changed_on_interface(
         if (r < 0)
                 return r;
 
-        r = sd_bus_send(bus, m, NULL);
+        r = sd_bus_send(bus, m, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -2458,14 +2503,14 @@ _public_ int sd_bus_emit_properties_changed_strv(
         do {
                 bus->nodes_modified = false;
 
-                r = emit_properties_changed_on_interface(bus, path, path, interface, false, &found_interface, names);
+                r = emit_properties_changed_on_interface(bus, path, path, interface, /* require_fallback= */ false, &found_interface, names);
                 if (r != 0)
                         return r;
                 if (bus->nodes_modified)
                         continue;
 
                 OBJECT_PATH_FOREACH_PREFIX(prefix, path) {
-                        r = emit_properties_changed_on_interface(bus, prefix, path, interface, true, &found_interface, names);
+                        r = emit_properties_changed_on_interface(bus, prefix, path, interface, /* require_fallback= */ true, &found_interface, names);
                         if (r != 0)
                                 return r;
                         if (bus->nodes_modified)
@@ -2643,7 +2688,7 @@ static int object_added_append_all(sd_bus *bus, sd_bus_message *m, const char *p
                         return r;
         }
 
-        r = object_added_append_all_prefix(bus, m, s, path, path, false);
+        r = object_added_append_all_prefix(bus, m, s, path, path, /* require_fallback= */ false);
         if (r < 0)
                 return r;
         if (bus->nodes_modified)
@@ -2656,7 +2701,7 @@ static int object_added_append_all(sd_bus *bus, sd_bus_message *m, const char *p
                 return -ENOMEM;
 
         OBJECT_PATH_FOREACH_PREFIX(prefix, path) {
-                r = object_added_append_all_prefix(bus, m, s, prefix, path, true);
+                r = object_added_append_all_prefix(bus, m, s, prefix, path, /* require_fallback= */ true);
                 if (r < 0)
                         return r;
                 if (bus->nodes_modified)
@@ -2728,7 +2773,7 @@ _public_ int sd_bus_emit_object_added(sd_bus *bus, const char *path) {
 
         } while (bus->nodes_modified);
 
-        return sd_bus_send(bus, m, NULL);
+        return sd_bus_send(bus, m, /* ret_cookie= */ NULL);
 }
 
 static int object_removed_append_all_prefix(
@@ -2823,7 +2868,7 @@ static int object_removed_append_all(sd_bus *bus, sd_bus_message *m, const char 
                         return r;
         }
 
-        r = object_removed_append_all_prefix(bus, m, s, path, path, false);
+        r = object_removed_append_all_prefix(bus, m, s, path, path, /* require_fallback= */ false);
         if (r < 0)
                 return r;
         if (bus->nodes_modified)
@@ -2836,7 +2881,7 @@ static int object_removed_append_all(sd_bus *bus, sd_bus_message *m, const char 
                 return -ENOMEM;
 
         OBJECT_PATH_FOREACH_PREFIX(prefix, path) {
-                r = object_removed_append_all_prefix(bus, m, s, prefix, path, true);
+                r = object_removed_append_all_prefix(bus, m, s, prefix, path, /* require_fallback= */ true);
                 if (r < 0)
                         return r;
                 if (bus->nodes_modified)
@@ -2908,7 +2953,7 @@ _public_ int sd_bus_emit_object_removed(sd_bus *bus, const char *path) {
 
         } while (bus->nodes_modified);
 
-        return sd_bus_send(bus, m, NULL);
+        return sd_bus_send(bus, m, /* ret_cookie= */ NULL);
 }
 
 static int interfaces_added_append_one_prefix(
@@ -2993,7 +3038,7 @@ static int interfaces_added_append_one(
         assert(path);
         assert(interface);
 
-        r = interfaces_added_append_one_prefix(bus, m, path, path, interface, false);
+        r = interfaces_added_append_one_prefix(bus, m, path, path, interface, /* require_fallback= */ false);
         if (r != 0)
                 return r;
         if (bus->nodes_modified)
@@ -3006,7 +3051,7 @@ static int interfaces_added_append_one(
                 return -ENOMEM;
 
         OBJECT_PATH_FOREACH_PREFIX(prefix, path) {
-                r = interfaces_added_append_one_prefix(bus, m, prefix, path, interface, true);
+                r = interfaces_added_append_one_prefix(bus, m, prefix, path, interface, /* require_fallback= */ true);
                 if (r != 0)
                         return r;
                 if (bus->nodes_modified)
@@ -3085,7 +3130,7 @@ _public_ int sd_bus_emit_interfaces_added_strv(sd_bus *bus, const char *path, ch
 
         } while (bus->nodes_modified);
 
-        return sd_bus_send(bus, m, NULL);
+        return sd_bus_send(bus, m, /* ret_cookie= */ NULL);
 }
 
 _public_ int sd_bus_emit_interfaces_added(sd_bus *bus, const char *path, const char *interface, ...) {
@@ -3146,7 +3191,7 @@ _public_ int sd_bus_emit_interfaces_removed_strv(sd_bus *bus, const char *path, 
         if (r < 0)
                 return r;
 
-        return sd_bus_send(bus, m, NULL);
+        return sd_bus_send(bus, m, /* ret_cookie= */ NULL);
 }
 
 _public_ int sd_bus_emit_interfaces_removed(sd_bus *bus, const char *path, const char *interface, ...) {
@@ -3186,7 +3231,7 @@ _public_ int sd_bus_add_object_manager(sd_bus *bus, sd_bus_slot **ret_slot, cons
         if (!n)
                 return -ENOMEM;
 
-        s = bus_slot_allocate(bus, !ret_slot, BUS_NODE_OBJECT_MANAGER, sizeof(BusNodeObjectManager), NULL);
+        s = bus_slot_allocate(bus, !ret_slot, BUS_NODE_OBJECT_MANAGER, sizeof(BusNodeObjectManager), /* userdata= */ NULL);
         if (!s) {
                 r = -ENOMEM;
                 goto fail;

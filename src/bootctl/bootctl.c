@@ -17,13 +17,13 @@
 #include "bootctl-status.h"
 #include "bootctl-uki.h"
 #include "bootctl-unlink.h"
-#include "bootctl-util.h"
 #include "bootspec-util.h"
 #include "build.h"
 #include "crypto-util.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
 #include "dlopen-note.h"
+#include "efi-api.h"
 #include "efi-loader.h"
 #include "efivars.h"
 #include "escape.h"
@@ -504,7 +504,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         if (streq(opts.arg, "auto"))  /* retained for backwards compatibility */
                                 arg_make_entry_directory = -1; /* yes if machine-id is permanent */
                         else {
-                                r = parse_boolean_argument("--make-entry-directory=", opts.arg, NULL);
+                                r = parse_boolean_argument("--make-entry-directory=", opts.arg, /* ret= */ NULL);
                                 if (r < 0)
                                         return r;
 
@@ -797,13 +797,12 @@ static int run(int argc, char *argv[]) {
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
 
+        COMPRESS_NOTE(suggested);
         LIBBLKID_NOTE(recommended);
         LIBCRYPTO_NOTE(recommended);
         LIBCRYPTSETUP_NOTE(suggested);
         LIBMOUNT_NOTE(recommended);
-        LIBTSS2_ESYS_NOTE(suggested);
-        LIBTSS2_MU_NOTE(suggested);
-        LIBTSS2_RC_NOTE(suggested);
+        TPM2_NOTE(suggested);
 
         log_setup();
 

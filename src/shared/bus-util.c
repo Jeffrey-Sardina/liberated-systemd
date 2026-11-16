@@ -42,7 +42,7 @@ static int name_owner_change_callback(sd_bus_message *m, void *userdata, sd_bus_
         assert(m);
 
         sd_bus_close(sd_bus_message_get_bus(m));
-        sd_event_exit(e, 0);
+        sd_event_exit(e, /* code= */ 0);
 
         return 1;
 }
@@ -97,11 +97,11 @@ int bus_async_unregister_and_exit(sd_event *e, sd_bus *bus, const char *name) {
                         "arg1='", unique, "',",
                         "arg2=''");
 
-        r = sd_bus_add_match_async(bus, NULL, match, name_owner_change_callback, NULL, e);
+        r = sd_bus_add_match_async(bus, /* ret_slot= */ NULL, match, name_owner_change_callback, /* install_callback= */ NULL, e);
         if (r < 0)
                 return r;
 
-        r = sd_bus_release_name_async(bus, NULL, name, NULL, NULL);
+        r = sd_bus_release_name_async(bus, /* ret_slot= */ NULL, name, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
@@ -161,7 +161,7 @@ int bus_event_loop_with_idle(
 
                         /* Inform the service manager that we are going down, so that it will queue all
                          * further start requests, instead of assuming we are still running. */
-                        (void) sd_notify(false, NOTIFY_STOPPING_MESSAGE);
+                        (void) sd_notify(/* unset_environment= */ false, NOTIFY_STOPPING_MESSAGE);
 
                         r = bus_async_unregister_and_exit(e, bus, name);
                         if (r < 0)
@@ -412,10 +412,13 @@ int bus_connect_user_systemd_by_uid(uid_t uid, const char *description, sd_bus *
         if (asprintf(&p, "/run/user/" UID_FMT "/systemd/private", uid) < 0)
                 return -ENOMEM;
 
-        /* The user owns /run/user/UID. Without fs.protected_hardlinks, the user can replace the socket with
-         * a hardlink to a socket of another user. pin_socket() refuses symlinks but not hardlinks. Our
-         * connection as root to such a socket can start a socket-activated service that the user cannot
-         * start. */
+        /* The user owns /run/user/UID and can replace the socket with a symlink, or with a hardlink to a
+         * socket of another user if fs.protected_hardlinks is off. A connection as root to the socket of
+         * another user can start a socket-activated service that the user cannot start. pin_socket()
+         * refuses symlinks. CHASE_SAFE makes pin_socket() fail with ENOLINK on the step from a directory
+         * that the user owns to a socket that another user owns. CHASE_SAFE accepts any file in a
+         * directory that root owns, such as /run/user/0. The owner check below refuses a socket of
+         * another user in that case. */
         inode_fd = pin_socket(p, &st);
         if (inode_fd < 0)
                 return inode_fd;
@@ -941,7 +944,7 @@ int bus_register_malloc_status(sd_bus *bus, const char *destination) {
                          "destination='", destination, "',",
                          "member='GetMallocInfo'");
 
-        r = sd_bus_add_match_async(bus, NULL, match, method_dump_memory_state_by_fd, dummy_install_callback, NULL);
+        r = sd_bus_add_match_async(bus, /* ret_slot= */ NULL, match, method_dump_memory_state_by_fd, dummy_install_callback, /* userdata= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to subscribe to GetMallocInfo() calls on MemoryAllocation1 interface: %m");
 

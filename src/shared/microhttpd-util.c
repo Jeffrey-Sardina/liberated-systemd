@@ -72,7 +72,7 @@ void microhttpd_logger(void *arg, const char *fmt, va_list ap) {
         f = strjoina("microhttpd: ", fmt);
 
         DISABLE_WARNING_FORMAT_NONLITERAL;
-        log_internalv(LOG_INFO, 0, NULL, 0, NULL, f, ap);
+        log_internalv(LOG_INFO, /* error= */ 0, /* file= */ NULL, /* line= */ 0, /* func= */ NULL, f, ap);
         REENABLE_WARNING;
 }
 
@@ -154,10 +154,18 @@ static void log_func_gnutls(int level, const char *message) {
 
         if (0 <= level && level < (int) ELEMENTSOF(gnutls_log_map)) {
                 if (gnutls_log_map[level].enabled)
-                        log_internal(gnutls_log_map[level].level, 0, NULL, 0, NULL, "gnutls %d/%s: %s", level, gnutls_log_map[level].names[1], message);
+                        log_internal(gnutls_log_map[level].level,
+                                     /* error= */ 0,
+                                     /* file= */ NULL,
+                                     /* line= */ 0,
+                                     /* func= */ NULL,
+                                     "gnutls %d/%s: %s",
+                                     level,
+                                     gnutls_log_map[level].names[1],
+                                     message);
         } else {
                 log_debug("Received GNUTLS message with unknown level %d.", level);
-                log_internal(LOG_DEBUG, 0, NULL, 0, NULL, "gnutls: %s", message);
+                log_internal(LOG_DEBUG, /* error= */ 0, /* file= */ NULL, /* line= */ 0, /* func= */ NULL, "gnutls: %s", message);
         }
 }
 
@@ -222,12 +230,12 @@ static int verify_cert_authorized(gnutls_session_t session) {
 
         r = sym_gnutls_certificate_verify_peers2(session, &status);
         if (r < 0)
-                return log_error_errno(r, "gnutls_certificate_verify_peers2 failed: %m");
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "gnutls_certificate_verify_peers2 failed: %s", sym_gnutls_strerror(r));
 
         type = sym_gnutls_certificate_type_get(session);
-        r = sym_gnutls_certificate_verification_status_print(status, type, &out, 0);
+        r = sym_gnutls_certificate_verification_status_print(status, type, &out, /* flags= */ 0);
         if (r < 0)
-                return log_error_errno(r, "gnutls_certificate_verification_status_print failed: %m");
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "gnutls_certificate_verification_status_print failed: %s", sym_gnutls_strerror(r));
 
         log_debug("Certificate status: %s", out.data);
         /* gnutls_free is declared as a function pointer variable (not a function), so sym_gnutls_free
@@ -277,7 +285,7 @@ static int get_auth_dn(gnutls_x509_crt_t client_cert, char **buf) {
         assert(buf);
         assert(*buf == NULL);
 
-        r = sym_gnutls_x509_crt_get_dn(client_cert, NULL, &len);
+        r = sym_gnutls_x509_crt_get_dn(client_cert, /* buf= */ NULL, &len);
         if (r != GNUTLS_E_SHORT_MEMORY_BUFFER) {
                 log_error("gnutls_x509_crt_get_dn failed");
                 return r;

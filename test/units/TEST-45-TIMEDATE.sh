@@ -224,9 +224,6 @@ assert_timedated_signal() {
 
     for _ in {0..9}; do
         if journalctl "${args[@]}" --grep .; then
-            # Make the found entry in the archived journal, to avoid the following failure:
-            # Journal file /run/log/journal/.../system.journal is truncated, ignoring file.
-            journalctl --rotate
             [[ "$(journalctl "${args[@]}" -o cat | jq -r '.payload.data[1].NTP.data')" == "$value" ]];
             return 0
         fi
@@ -320,9 +317,6 @@ assert_timesyncd_signal() {
 
     for _ in {0..9}; do
         if journalctl "${args[@]}" --grep .; then
-            # Make the found entry in the archived journal, to avoid the following failure:
-            # Journal file /run/log/journal/.../system.journal is truncated, ignoring file.
-            journalctl --rotate
             [[ "$(journalctl "${args[@]}" -o cat | jq -r ".payload.data[1].$property.data | join(\" \")")" == "$value" ]];
             return 0
         fi
@@ -423,7 +417,7 @@ EOF
 }
 
 teardown_timesyncd_resolve() {
-    set +eu
+    set +e
 
     systemctl start systemd-resolved-varlink.socket
     systemctl start systemd-resolved.service
@@ -431,6 +425,8 @@ teardown_timesyncd_resolve() {
     rm -rf /run/systemd/system/systemd-timesyncd.service.d
     systemctl daemon-reload
     systemctl stop systemd-timesyncd
+
+    set -e
 }
 
 testcase_timesyncd_resolve() {
@@ -481,12 +477,14 @@ EOF
 }
 
 teardown_timedated_alternate_paths() {
-    set +eu
+    set +e
 
     rm -rf /run/systemd/system/systemd-timedated.service.d
     rm -rf /run/alternate-path
     systemctl daemon-reload
     systemctl restart systemd-timedated
+
+    set -e
 }
 
 testcase_timedated_alternate_paths() {
@@ -536,6 +534,65 @@ LOCAL"
     if [[ -e /run/alternate-path/myadjtime ]]; then
         echo "/run/alternate-path/myadjtime still exists" >&2
         exit 1
+    fi
+}
+
+TIMEDATE_VARLINK_SOCKET='/run/systemd/io.systemd.Timedate'
+
+testcase_varlink_describe() {
+    local desc
+    desc="$(varlinkctl --json=short call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.Describe '{}')"
+    assert_in '"Timezone"' "$desc"
+    assert_in '"LocalRTC"' "$desc"
+    assert_in '"NTP"' "$desc"
+}
+
+testcase_varlink_list_timezones() {
+    varlinkctl --more --json=short call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.ListTimezones '{}' | grep >/dev/null '"UTC"'
+}
+
+testcase_varlink_set_timezone() {
+    local orig_tz
+    orig_tz="$(readlink /etc/localtime | sed 's#^.*zoneinfo/##')" || orig_tz=
+
+    varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetTimezone '{"timezone":"Europe/Kyiv"}'
+    assert_eq "$(readlink /etc/localtime | sed 's#^.*zoneinfo/##')" "Europe/Kyiv"
+    # Invalid time zones are rejected.
+    (! varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetTimezone '{"timezone":"Foo/Bar"}')
+    if [[ -n "$orig_tz" ]]; then
+        varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetTimezone "{\"timezone\":\"$orig_tz\"}"
+    fi
+}
+
+testcase_varlink_set_local_rtc() {
+    varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetLocalRTC '{"localRTC":true}'
+    assert_in "RTC in local TZ: yes" "$(timedatectl --no-pager)"
+    # An explicit null for the nullable adjustSystemClock field is accepted.
+    varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetLocalRTC '{"localRTC":false,"adjustSystemClock":null}'
+    assert_in "RTC in local TZ: no" "$(timedatectl --no-pager)"
+}
+
+testcase_varlink_set_time() {
+    # Validation happens before the NTP state is considered, so these do not depend on it and do
+    # not change the clock.
+    # A relative offset of zero is a no-op and succeeds.
+    varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetTime '{"timeUSec":0,"relative":true}'
+    # A non-positive absolute time is rejected.
+    (! varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetTime '{"timeUSec":0}')
+}
+
+testcase_varlink_set_ntp() {
+    local orig_ntp
+
+    if systemd-detect-virt -qc || [[ "$(timedatectl show -p CanNTP --value)" != "yes" ]]; then
+        return 0
+    fi
+
+    orig_ntp="$(timedatectl show -p NTP --value)"
+    varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetNTP '{"useNTP":false}'
+    assert_eq "$(timedatectl show -p NTP --value)" "no"
+    if [[ "$orig_ntp" == "yes" ]]; then
+        varlinkctl call "$TIMEDATE_VARLINK_SOCKET" io.systemd.Timedate.SetNTP '{"useNTP":true}'
     fi
 }
 
